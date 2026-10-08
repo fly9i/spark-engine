@@ -157,7 +157,7 @@ def fetch(src, pol, max_bytes):
     if u.scheme in ("http", "https"):
         _check_host(u.hostname or "", pol)
         opener = urllib.request.build_opener(_Redirect(pol))
-        req = urllib.request.Request(s, headers={"User-Agent": "glm53-engine/1.0"})
+        req = urllib.request.Request(s, headers={"User-Agent": "spark-engine/1.0"})
         try:
             with opener.open(req, timeout=pol.timeout) as r:
                 n = int(r.headers.get("Content-Length") or 0)

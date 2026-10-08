@@ -2567,7 +2567,7 @@ pub fn row_timing(model:&std::path::Path) {
     }
     // Real long context: the longest prompt+answer of the long-context drafter data (32K-100K tokens of source code and
     // the target's own thinking), GLM53_I1_TOKENS overrides the jsonl path.
-    let src=std::env::var("GLM53_I1_TOKENS").unwrap_or_else(|_|"bench/opd/think3/gen.jsonl".into());
+    let src=std::env::var("GLM53_I1_TOKENS").unwrap_or_else(|_|"corpus/gen.jsonl".into());
     let all:Vec<i64>=std::fs::read_to_string(&src).unwrap().lines().map(|l|{let v:serde_json::Value=serde_json::from_str(l).unwrap();
         v["prompt_ids"].as_array().unwrap().iter().chain(v["output_ids"].as_array().unwrap().iter()).map(|x|x.as_i64().unwrap()).collect::<Vec<i64>>()})
         .max_by_key(|t|t.len()).unwrap();

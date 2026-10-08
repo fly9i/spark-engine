@@ -1,10 +1,11 @@
-"""Token frequencies (Qwen tokenizer) over local text (GLM drafter corpora: prompts + decoded outputs) -> draft vocab."""
+"""Token frequencies (Qwen tokenizer) over local text (JSONL of {"prompt","output_ids"}) -> draft sub-vocabulary.
+Usage: draft_vocab.py <corpus-glob>   (e.g. a directory of gen.jsonl files produced by your own runs)."""
 import json, glob, collections, sys
 from tokenizers import Tokenizer
 qt = Tokenizer.from_file("models/qwen38fn-exl3-4.05bpw/tokenizer.json")
 gt = Tokenizer.from_file(glob.glob("models/hf/hub/models--brandonmusic--GLM-5.3-Flash-tr3-4bpw/snapshots/*/tokenizer.json")[0])
 cnt = collections.Counter(); held = collections.Counter()
-files = sorted(glob.glob("glm53-engine/bench/opd/think*/gen.jsonl"))
+files = sorted(glob.glob(sys.argv[1] if len(sys.argv) > 1 else "corpus/*.jsonl"))
 n = 0
 for f in files:
     for i, line in enumerate(open(f)):

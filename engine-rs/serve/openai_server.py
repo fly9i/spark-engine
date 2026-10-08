@@ -962,7 +962,7 @@ def main():
     p.add_argument("--canvas-dir", default="/dev/shm/glm53-mm")
     p.add_argument("--canvas-cache-mb", type=int, default=1024, help="LRU of decoded canvases (in-flight ones are always kept)")
     args = p.parse_args()
-    # listen backlog: socketserver default is 5; bursts of 8+ concurrent clients were reset (bench/r26)
+    # listen backlog: socketserver default is 5; bursts of 8+ concurrent clients were reset
     ThreadingHTTPServer.request_queue_size = 128
     server = ThreadingHTTPServer((args.host, args.port), make_handler(App(args)))
     server.daemon_threads = True

@@ -220,7 +220,7 @@ fn fin_fuse(r: i64) -> bool { r > BIG_ROWS && !fold_on() && std::env::var("QWEN_
 /// Whether rows r take exl3_multi (decode rows; QWEN_EXL3_MULTI=0 read per call)
 /// QWEN_MOE_ROUTE_SIDE=1 / QWEN_GDN_AB_SIDE=1 (off; read per call, i.e. at graph capture; L0, schedule only): in the
 /// decode multi path the small latency-bound F16 gemvs (MoE router + top-k, GDN a/b) run on a pool side stream forked
-/// right after the shared input transform, next to the bandwidth-bound EXL3 gemvs on the main stream (GLM r26's idea).
+/// right after the shared input transform, next to the bandwidth-bound EXL3 gemvs on the main stream.
 /// Only engine kernels run on the side stream (no cuBLAS: F16Lin takes its gemv for <= dec_rows rows).
 /// 2026-10-08 same-process A/B: outputs identical, round time unchanged within noise (bench/qwen/README.md), so off.
 fn side_on(var: &str) -> bool { std::env::var(var).as_deref() == Ok("1") }

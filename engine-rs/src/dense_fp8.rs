@@ -50,7 +50,7 @@ pub fn register(layers:&[crate::weights::LayerWeights]) {
             if let Some(w)=&layer.dense{for t in [&w.wg,&w.wu,&w.wd]{register_weight(t,"GLM53_DENSE_FP8");}}}
         // Item 4: EXL3 KDA layers never use FP8 copies of q/k/v/o.
         // GLM53_KDA_FP8=0: KDA q/k/v/o stay at source precision (Half of the BF16 checkpoint) while the dense MLP layers
-        // follow GLM53_DENSE_FP8 (report 10.29: KDA FP8 is nearly all of r11's drift from source precision).
+        // follow GLM53_DENSE_FP8 (KDA FP8 is nearly all of the drift from source precision).
         if let Some(w)=&layer.kda{if std::env::var("GLM53_KDA_FP8").as_deref()!=Ok("0"){for t in [&w.wq,&w.wk,&w.wv,&w.wo]{register_weight(t,"GLM53_DENSE_FP8");}}}
         if let Some(w)=&layer.moe{for t in [&w.sh_wg,&w.sh_wu,&w.sh_wd]{register_weight(t,"GLM53_FP8_SHARED");}}
         if let Some(w)=&layer.mla{for t in [&w.q_a,&w.q_b,&w.kv_a,&w.wo]{register_weight(t,"GLM53_FP8_MLA");}}

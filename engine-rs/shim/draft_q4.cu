@@ -5,7 +5,7 @@
 //      16 bytes at ((row*(K/128) + quad)*4 + lane_t)*16
 //   sm [N, K/128] float2 (scale, minimum): w = q*scale + minimum
 // Lane k-permutation, chunk order, split-K and reduction follow skinny_c12 (c12.cuh); X is BF16 [M,K].
-// Tiled copy (glm53_draft_q4t_*; the Qwen MTP draft head, GLM r25's Q8 tiling): per (16-row tile T, quad) 1024 contiguous
+// Tiled copy (glm53_draft_q4t_*; the Qwen MTP draft head's Q8-style tiling): per (16-row tile T, quad) 1024 contiguous
 // bytes, rows 0-7 of the tile then rows 8-15, lane (g, t) at lane*16, i.e. q at (((T*(K/128)+quad)*2+half)*32+lane)*16;
 // sm per (T, quad) 16 float2 in row order. A warp load is one contiguous 512 B (the row layout: 8 rows x 64 B); the decoded
 // operands, MMA order and reduction are unchanged (bitwise equal outputs).
