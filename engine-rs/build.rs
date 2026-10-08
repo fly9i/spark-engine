@@ -81,7 +81,7 @@ fn main() {
     let nvcc = format!("{cuda}/bin/nvcc");
     let kernels = ["mhc","kda","gemv","latent","fp8","dataflow","kda_conv_chain","kda_correction","dsa_index","draft_selector","draft_conv","shared_gu","rdma_ar","rdma_big","fp8_big","l2pf","c12","draft_head4","draft_q4","qwen_exl3","qwen_gdn","qwen_qsa","qwen_moe","qwen_hc","qwen_ple","qwen_f16","qwen_q8","glm_moe","ablate"];
     let mut jobs: Vec<(String, Vec<String>, String, String)> = Vec::new();
-    for src in ["shim/shim.cpp", "shim/lt.cpp"] {
+    for src in ["shim/shim.cpp", "shim/lt.cpp", "shim/host_pin.cpp"] {
         jobs.push(("c++".into(), cxx.clone(), src.into(), cached_object(src, &cxx, hh)));
     }
     for k in kernels {
@@ -90,9 +90,9 @@ fn main() {
         jobs.push((nvcc.clone(), nv.clone(), src, obj));
     }
     compile_all(&jobs);
-    cc::Build::new().object(&jobs[0].3).object(&jobs[1].3).compile("exl3shim");
+    cc::Build::new().object(&jobs[0].3).object(&jobs[1].3).object(&jobs[2].3).compile("exl3shim");
     for (i, k) in kernels.iter().enumerate() {
-        cc::Build::new().object(&jobs[2 + i].3).compile(&format!("{k}cuda"));
+        cc::Build::new().object(&jobs[3 + i].3).compile(&format!("{k}cuda"));
         println!("cargo:rerun-if-changed=shim/{k}.cu");
     }
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib:{exl3}");

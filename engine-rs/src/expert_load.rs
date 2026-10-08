@@ -126,8 +126,8 @@ impl AlignedBuf {
 pub(crate) struct HostBuf { ptr: *mut u8, len: usize, pinned: bool, _heap: Option<AlignedBuf> }
 unsafe impl Send for HostBuf {}
 extern "C" {
-    fn cudaHostAlloc(p: *mut *mut std::ffi::c_void, size: usize, flags: u32) -> i32;
-    fn cudaFreeHost(p: *mut std::ffi::c_void) -> i32;
+    fn glm53_host_pin_alloc(p: *mut *mut std::ffi::c_void, bytes: usize) -> i32;
+    fn glm53_host_pin_free(p: *mut std::ffi::c_void, bytes: usize);
     fn cudaStreamCreateWithFlags(s: *mut *mut std::ffi::c_void, flags: u32) -> i32;
     fn cudaStreamDestroy(s: *mut std::ffi::c_void) -> i32;
     fn cudaStreamSynchronize(s: *mut std::ffi::c_void) -> i32;
@@ -136,11 +136,13 @@ extern "C" {
 impl HostBuf {
     pub(crate) fn pinned(len: usize) -> Self {
         let mut p = std::ptr::null_mut();
-        // Mapped: the upload kernel reads it directly (rs_pinned_to_device).
-        if unsafe { cudaHostAlloc(&mut p, len, 3) } == 0 && !p.is_null() && p as usize % ALIGN == 0 {
+        // Mapped: the upload kernel reads it directly (rs_pinned_to_device). Anonymous mmap + cudaHostRegister
+        // (GLM53_HOST_REGISTER, default on) so kernel compaction never isolates these ~1.3 GB of pinned staging
+        // pages; GLM53_HOST_REGISTER=0 reverts to cudaHostAlloc (/dev/zero shmem, the old scattered behaviour).
+        if unsafe { glm53_host_pin_alloc(&mut p, len) } == 0 && !p.is_null() && p as usize % ALIGN == 0 {
             return Self { ptr: p.cast(), len, pinned: true, _heap: None };
         }
-        if !p.is_null() { unsafe { cudaFreeHost(p) }; }
+        if !p.is_null() { unsafe { glm53_host_pin_free(p, len) }; }
         Self::heap(len)
     }
     pub(crate) fn heap(len: usize) -> Self {
@@ -173,7 +175,7 @@ impl HostBuf {
     }
 }
 impl Drop for HostBuf {
-    fn drop(&mut self) { if self.pinned { unsafe { cudaFreeHost(self.ptr.cast()) }; } }
+    fn drop(&mut self) { if self.pinned { unsafe { glm53_host_pin_free(self.ptr.cast(), self.len) }; } }
 }
 
 /// Shards opened once; `true` = O_DIRECT (buffered fallback if the filesystem refuses it).

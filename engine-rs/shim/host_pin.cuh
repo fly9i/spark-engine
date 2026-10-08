@@ -5,8 +5,8 @@
 // rank0, ~2.3 s bursts over ~1 GB of the engine's pinned pages, during which decode rounds slow down (bench/w78b).
 // Anonymous private pages pinned with cudaHostRegister fail compaction's early check for pinned anonymous pages
 // (reference count above the map count) and are never isolated or unmapped.
-// GLM53_HOST_REGISTER=1 selects mmap + cudaHostRegister; otherwise cudaHostAlloc as before. Same flags semantics
-// (mapped + portable), page-aligned, zero-filled.
+// Default (GLM53_HOST_REGISTER unset or !=0) selects mmap + cudaHostRegister; GLM53_HOST_REGISTER=0 falls back to
+// cudaHostAlloc as before. Same flags semantics (mapped + portable), page-aligned, zero-filled.
 #pragma once
 #include <cuda_runtime.h>
 #include <sys/mman.h>
@@ -15,7 +15,7 @@
 #include <cstring>
 
 static inline bool glm53_host_register_enabled(){
-  const char* e=std::getenv("GLM53_HOST_REGISTER");return e&&!std::strcmp(e,"1");
+  const char* e=std::getenv("GLM53_HOST_REGISTER");return !(e&&!std::strcmp(e,"0"));
 }
 static inline cudaError_t glm53_host_alloc_mapped(void** p,size_t bytes){
   if(!glm53_host_register_enabled())return cudaHostAlloc(p,bytes,cudaHostAllocMapped|cudaHostAllocPortable);
@@ -26,4 +26,10 @@ static inline cudaError_t glm53_host_alloc_mapped(void** p,size_t bytes){
   const cudaError_t e=cudaHostRegister(m,len,cudaHostRegisterMapped|cudaHostRegisterPortable);
   if(e!=cudaSuccess){munmap(m,len);return e;}
   *p=m;return cudaSuccess;
+}
+static inline void glm53_host_free_mapped(void* p,size_t bytes){
+  if(!p)return;
+  if(!glm53_host_register_enabled()){cudaFreeHost(p);return;}
+  const size_t page=(size_t)sysconf(_SC_PAGESIZE);const size_t len=(bytes+page-1)/page*page;
+  cudaHostUnregister(p);munmap(p,len);
 }
