@@ -1,3 +1,5 @@
+![spark-engine](docs/assets/banner.png)
+
 # spark-engine
 
 [English](README.md)
