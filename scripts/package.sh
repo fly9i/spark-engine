@@ -13,7 +13,7 @@ cp "$root/third_party/exllamav3/lib/libexllamav3_ext.so" "$out/lib/"
 cp "$root/third_party/exllamav3/LICENSE" "$out/lib/LICENSE.exllamav3"
 cp -r "$root/engine-rs/serve" "$root/engine-rs/profiles" "$out/engine-rs/"
 find "$out/engine-rs/serve" -name __pycache__ -prune -exec rm -rf {} +
-cp "$root/scripts/env.sh" "$root/scripts/download-models.sh" "$out/scripts/"
+cp "$root/scripts/env.sh" "$root/scripts/fetch_ablit_transplant.py" "$root/scripts/download-models.sh" "$out/scripts/"
 cp -r "$root/assets" "$root/bench" "$root/docs" "$out/"
 cp "$root/README.md" "$root/README.zh-CN.md" "$root/LICENSE" "$root/THIRD_PARTY.md" "$root/spark.env.example" "$out/"
 sed -i "s|^SPARK_BIN=.*|SPARK_BIN=\$SPARK_HOME/bin/spark-engine|" "$out/spark.env.example"

@@ -109,6 +109,7 @@ GitHub Actions 在 arm64 runner 上构建每次推送，并为 tag 发布归档�
 | [docs/build.zh-CN.md](docs/build.zh-CN.md) | 从源码构建、依赖、CI |
 | [docs/features.zh-CN.md](docs/features.zh-CN.md) | 引擎工作原理：GLM 与 Qwen 路径、内核、投机解码、内存 |
 | [docs/configuration.zh-CN.md](docs/configuration.zh-CN.md) | `spark.env`、profile、最常用的引擎与前端开关 |
+| [docs/abliteration.zh-CN.md](docs/abliteration.zh-CN.md) | 可选的拒答移除（两种机制）：是什么、如何启用、风险 |
 | [docs/benchmarks.zh-CN.md](docs/benchmarks.zh-CN.md) | 如何测量速度、参考数据 |
 
 ## 模型与许可证

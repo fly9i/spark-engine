@@ -707,6 +707,7 @@ fn block_pend(l: &Layer, sts: &[&LayerState], x: &Tensor, rows: &[(i64, i64)], p
               apply: Option<(&Tensor, &Tensor)>) -> (GdnPending, PendApply) {
     let (pending, post, m_in) = block_attn_in(l, sts, x, rows, pos, commit, apply);
     let m = l.moe.fwd_in(m_in);
+    if let Some(i) = l.idx { crate::ablate::apply(i, &m); }
     (pending, Some((post, m)))
 }
 
@@ -722,6 +723,11 @@ fn block_attn_in(l: &Layer, sts: &[&LayerState], x: &Tensor, rows: &[(i64, i64)]
                  apply: Option<(&Tensor, &Tensor)>) -> (GdnPending, Tensor, MixIn) {
     let r = x.size()[0];
     let (post, a_in) = l.hca.mix_after_in(x, apply);
+    // refusal-direction extraction (crate::ablate): the block's mixed input, last row
+    let a_in = match (crate::ablate::capturing(), l.idx) {
+        (true, Some(i)) => { let m = a_in.ready(); crate::ablate::capture(i, &m); MixIn::Ready(m) }
+        _ => a_in,
+    };
     let multi = multi_on(r);
     let mut pending = None;
     let a = match &l.attn {
@@ -747,6 +753,7 @@ fn block_attn_in(l: &Layer, sts: &[&LayerState], x: &Tensor, rows: &[(i64, i64)]
                 }
                 ffi::gdn_conv_commit_h(&parts[0], &g.qkv.svh, &cs);
                 let o = g.o.fwd(&out);
+                if let Some(i) = l.idx { crate::ablate::apply(i, &o); }
                 let (post2, m_in) = l.hcm.mix_after_in(x, Some((post.as_ref().unwrap(), &o)));
                 return (None, post2.unwrap(), m_in);
             }
@@ -776,7 +783,9 @@ fn block_attn_in(l: &Layer, sts: &[&LayerState], x: &Tensor, rows: &[(i64, i64)]
             drop(a_in);
             ffi::gdn_recur_segs(&y, &ab, &z, &g.a_log, &g.dt_bias, &g.norm, &ss, None, Some(&out), commit);
             if commit { ffi::gdn_conv_commit_segs(&qkv, &cs, None); } else { pending = Some((qkv, y, ab, z)); }
-            g.o.fwd(&out)
+            let o = g.o.fwd(&out);
+            if let Some(i) = l.idx { crate::ablate::apply(i, &o); }
+            o
         }
         Attn::Qsa(q) => {
             // prefill: one input transform for the four, q_proj's finish inside qsa_prep (bitwise equal)
@@ -829,7 +838,9 @@ fn block_attn_in(l: &Layer, sts: &[&LayerState], x: &Tensor, rows: &[(i64, i64)]
                 let acc = emp(&[t * 24 * splits * 256], Kind::Float);
                 ffi::qsa_attn(&qq, t, &p0, Some((&sel, &cnt, SEL_LD)), kc, ks, vc, vs, &gate, &ml, &acc, splits, &n(&out));
             }
-            q.o.fwd(&out)
+            let o = q.o.fwd(&out);
+            if let Some(i) = l.idx { crate::ablate::apply(i, &o); }
+            o
         }
     };
     let (post, m_in) = l.hcm.mix_after_in(x, Some((post.as_ref().unwrap(), &a)));
@@ -869,6 +880,7 @@ fn layer_prefill(l: &Layer, st: &LayerState, ple: Option<(&Tensor, i64, &Tensor)
         }
         m_all
     };
+    if let Some(i) = l.idx { crate::ablate::apply(i, &m_all); }
     let out = Some((post_all, m_all));
     if apply_split() { flush_apply(x, out); None } else { out }
 }
@@ -885,6 +897,8 @@ fn layer_attn(l: &Layer, st: &LayerState, ple: Option<(&Tensor, i64, &Tensor)>, 
         while a < t {
             let n = sub.min(t - a);
             let nrm = p.apply(&x.narrow(0, a, n), &packed.narrow(0, a * rb, n * rb), &[(0, n)], &[win]);
+            // the PLE kernel adds into the residual streams directly: keep them orthogonal to an ablated direction
+            if let Some(i) = l.idx { crate::ablate::apply(i, &x.narrow(0, a, n)); }
             ffi::ple_commit(win, &nrm, n, None);
             a += n;
         }
@@ -946,13 +960,13 @@ impl Mtp {
         let key = "mtp.layers.0";
         Mtp { fc_e: Exl3::load(ck, "mtp.fc_embedding"), fc_h: Exl3::load(ck, "mtp.fc_hidden"),
               ne1: g1("mtp.pre_fc_norm_embedding.weight"), nh1: g1("mtp.pre_fc_norm_hidden.weight"),
-              layer: Layer { ple: None, hca: Hc::load(ck, &format!("{key}.attn_hyper_connection"), true),
+              layer: Layer { idx: None, ple: None, hca: Hc::load(ck, &format!("{key}.attn_hyper_connection"), true),
                              attn: Attn::Qsa(Qsa::load(ck, &format!("{key}.self_attn"))),
                              hcm: Hc::load(ck, &format!("{key}.mlp_hyper_connection"), true), moe: Moe::load(ck, &format!("{key}.mlp")) },
               mixer: Hc::load(ck, "mtp.hyper_connection_mixer", false) }
     }
 }
-pub struct Layer { ple: Option<Ple>, hca: Hc, attn: Attn, hcm: Hc, moe: Moe }
+pub struct Layer { ple: Option<Ple>, hca: Hc, attn: Attn, hcm: Hc, moe: Moe, idx: Option<usize> }
 
 /// Draft-side output head (L2: only the MTP drafts use it): the lm_head columns of a frequent sub-vocabulary
 /// (sorted token ids) as int8 + FP32 scale per 128 (GLM's Q8 GEMV) or, with q4, affine 4-bit + (scale, minimum)
@@ -1070,6 +1084,13 @@ pub struct Seq {
 }
 /// A prompt checkpoint (`Model::ckpt_save`): the prompt ids and copies of the state that is not per position.
 pub struct Ckpt { pub ids: Vec<i64>, t: Vec<Tensor> }
+impl Ckpt {
+    /// The checkpoint's state tensors, in the order ckpt_save writes and ckpt_restore reads them (per layer GDN s/conv
+    /// or QSA ring, then ple_win, then the pending MTP row). For the persistent cache (qwen::pcache).
+    pub fn tensors(&self) -> &[Tensor] { &self.t }
+    /// Rebuild a checkpoint from a persisted (ids, tensors) payload; the tensors must match this model's state shapes.
+    pub fn from_parts(ids: Vec<i64>, t: Vec<Tensor>) -> Self { Ckpt { ids, t } }
+}
 /// Inputs of the last uncommitted chain, replayed by `commit`.
 pub struct Pending { gdn: Vec<Option<(Tensor, Tensor, Tensor, Tensor)>>, ple_nrm: Option<Tensor>, ids: Vec<i64> }
 
@@ -1090,12 +1111,13 @@ impl Model {
             let attn = if types[i as usize] == "linear_attention" { Attn::Gdn(Gdn::load(&ck, &format!("{key}.linear_attn"))) }
                        else { Attn::Qsa(Qsa::load(&ck, &format!("{key}.self_attn"))) };
             let ple = ple_ids.contains(&(i + 1)).then(|| Ple::load(&ck, &format!("{key}.ple"), eos));
-            layers.push(Layer { ple, hca: Hc::load(&ck, &format!("{key}.attn_hyper_connection"), true), attn,
+            layers.push(Layer { idx: Some(i as usize), ple, hca: Hc::load(&ck, &format!("{key}.attn_hyper_connection"), true), attn,
                                 hcm: Hc::load(&ck, &format!("{key}.mlp_hyper_connection"), true), moe: Moe::load(&ck, &format!("{key}.mlp")) });
             ck.clear_cache();
             if i % 8 == 7 { eprintln!("[qwen] loaded {} layers", i + 1); }
         }
         let embed = ck.get(&format!("{P}embed_tokens.weight"));
+        let embed = match crate::ablate::get() { Some(a) => a.ortho_rows(0, &embed), None => embed };
         let vocab = embed.size()[0];
         let mixer = Hc::load(&ck, &format!("{P}hyper_connection_mixer"), false);
         let lm_head = Exl3::load(&ck, "lm_head");
@@ -1449,6 +1471,7 @@ impl Model {
                 flush_apply(&x, upd.take());
                 let wins: Vec<&Tensor> = seqs.iter().map(|s| &s.ple_win).collect();
                 let nrm = ple.apply(&x, packed.expect("PLE rings"), rows, &wins);
+                if let Some(i) = l.idx { crate::ablate::apply(i, &x); }
                 if commit { for (&(r0, t), w) in rows.iter().zip(&wins) { ffi::ple_commit(w, &nrm.narrow(0, r0, t), t, None); } }
                 else { pend.ple_nrm = Some(nrm); }
             }

@@ -63,6 +63,7 @@ mod mla;
 mod moe;
 mod moefast;
 mod moe_own;
+mod ablate;
 mod nibmap;
 mod safetensors;
 mod tp;
@@ -84,6 +85,9 @@ fn main() {
                                                          args[6].parse().unwrap(), &args[7]),
         Some("qwen-spec") => qwen::probe::spec(Path::new(&args[2]), Path::new(&args[3]),
             args.get(4).and_then(|s| s.parse().ok()).unwrap_or(128), args.get(5).and_then(|s| s.parse().ok()).unwrap_or(3)),
+        Some("glm-refusal-dir") => ablate::glm_refusal_dir(Path::new(&args[2]), Path::new(&args[3]), Path::new(&args[4]), Path::new(&args[5])),
+        Some("qwen-pcache-selftest") => qwen::probe::pcache_selftest(Path::new(&args[2])),
+        Some("qwen-refusal-dir") => qwen::probe::refusal_dir(Path::new(&args[2]), Path::new(&args[3]), Path::new(&args[4]), Path::new(&args[5])),
         Some("qwen-batch") => qwen::probe::batch(Path::new(&args[2]), &args[3],
             args.get(4).and_then(|s| s.parse().ok()).unwrap_or(60), args.get(5).and_then(|s| s.parse().ok()).unwrap_or(3)),
         Some("qwen-gen") => qwen::probe::gen(Path::new(&args[2]), Path::new(&args[3]),

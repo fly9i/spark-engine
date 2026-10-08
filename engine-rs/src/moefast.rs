@@ -230,12 +230,12 @@ impl MoeFast {
     /// Routed experts of decode / verify rows (moe_exl3.cuh): x [R, 4096] fp16, ids [R, 8], weights [R, 8] -> [R, 4096] FP32.
     pub fn expert_cooperative(&mut self,layer:usize,x:&Tensor,ids:&Tensor,weights:&Tensor)->Tensor {
         let out=Tensor::empty([x.size()[0],4096],(Kind::Float,x.device()));
-        crate::moe_own::run_into(&self.own_table(layer),x,ids,weights,&out,None,None);out
+        crate::moe_own::run_into(&self.own_table(layer),x,ids,weights,&out,None,None);crate::ablate::apply(layer,&out);out
     }
     /// expert_cooperative into a caller-provided contiguous FP32 [rows, 4096] (e.g. the first half of a packed
     /// collective buffer). The kernel assigns every output element, so `out` needs no initialization.
     pub fn expert_cooperative_into(&mut self,layer:usize,x:&Tensor,ids:&Tensor,weights:&Tensor,out:&Tensor) {
-        crate::moe_own::run_into(&self.own_table(layer),x,ids,weights,out,None,None)
+        crate::moe_own::run_into(&self.own_table(layer),x,ids,weights,out,None,None);crate::ablate::apply(layer,out);
     }
 
     /// Prefill-only expert grouping. Host routing transfer happens once per
@@ -264,6 +264,7 @@ impl MoeFast {
                 crate::moe_own::run_into(&tab,&x.narrow(0,r0,n),&ids.narrow(0,r0,n),&weights.narrow(0,r0,n),&out.narrow(0,r0,n),a.as_ref(),suh0.as_ref());
                 r0+=n;
             }
+            crate::ablate::apply(layer,&out);
             return out;
         }
         let host:Vec<i64>=Vec::try_from(&ids.reshape([-1]).to_device(Device::Cpu)).unwrap();

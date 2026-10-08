@@ -74,6 +74,7 @@ embeddings (PLE) from a 39 GB table, an MTP head, and a ViT vision tower.
   lm_head restricted to the 65,536 most frequent tokens (`assets/qwen38/draft_vocab_65536.json`, tiled layout), so a
   draft step reads 84 MB instead of the full head. Prompt-lookup drafts are used where the context repeats. Up to 8
   sequences are verified in one batched forward.
+- **Persistent prefix cache.** Optional NVMe prefix cache (`QWEN_PCACHE`), mirroring the GLM one: each boundary checkpoint is written to disk, and a later prompt that extends a cached prefix restores it instead of re-prefilling.
 - **Long context and multi-turn.** A 1M-token KV pool in 16K-token granules (LRU); YaRN scaling only for sequences that
   pass 262,144 tokens. Each sequence store keeps a checkpoint at the last message boundary of its prompt, so a follow-up
   turn re-prefills only the new message even when the client re-serializes earlier turns. `max_tokens` reserves at most

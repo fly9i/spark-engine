@@ -729,6 +729,7 @@ impl Engine {
                 let (r,p,z)=crate::mhc::mhc_post_pre(&m,&residual,&prev,&layer.hc.attn_fn,&layer.hc.attn_scale,&layer.hc.attn_base,&layer.hc.in_ln);
                 residual=r;(p,z)
             } else {mhc_pre(&residual, &layer.hc.attn_fn, &layer.hc.attn_scale, &layer.hc.attn_base, &layer.hc.in_ln)};
+            if crate::ablate::capturing() {crate::ablate::capture(i,&z);}
             crate::deep_probe::before_attention(i,&z,None);stamp(i,"input-mhc");
             let old=prior.as_mut().map(|p|p.next().unwrap());
             let (a, ls) = if let Some(kw) = &layer.kda {
@@ -859,6 +860,7 @@ impl Engine {
                 residual = mhc_post(&m, &residual, &pre);
             }
             let (pre, z) = mhc_pre(&residual, &layer.hc.attn_fn, &layer.hc.attn_scale, &layer.hc.attn_base, &layer.hc.in_ln);
+            if crate::ablate::capturing() {crate::ablate::capture(i,&z);}
             if prof { sync(dev0); t_hc += tm.elapsed().as_secs_f64(); tm = std::time::Instant::now(); }
             crate::deep_probe::before_attention(i,&z,Some(&ds.0[i]));
             let a = match &mut ds.0[i] {

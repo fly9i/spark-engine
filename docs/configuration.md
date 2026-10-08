@@ -31,6 +31,9 @@ Three layers of settings:
 | `GLM53_RDMA_AR_DEV`, `GLM53_RDMA_AR_DEV1`, `GLM53_RDMA_AR_GID` | `rocep1s0f0`, `roceP2p1s0f0`, `3` | Devices and GID of the engine's own RDMA all-reduce (defaults match DGX Spark). |
 | `QWEN_MODEL` | `/models/Qwen3.8-Flash-Next-exl3` | Qwen3.8-Flash-Next EXL3 checkpoint directory. |
 | `QWEN_ASSETS` | `$SPARK_HOME/assets/qwen38` | Directory with `draft_vocab_65536.json` (MTP draft head vocabulary). |
+| `GLM53_ABLIT`, `GLM53_ABLIT_DIR`, `GLM53_ABLIT_LAYERS` | off, —, `15-44` | GLM o_proj transplant ([abliteration.md](abliteration.md)). |
+| `SPARK_ABLATE`, `SPARK_ABLATE_MODE` | off, `single` | Direction ablation for either model ([abliteration.md](abliteration.md)); `single` / `per-layer` / `subspace:a-b:k`. |
+| `QWEN_PCACHE`, `QWEN_PCACHE_DIR` | off, `/tmp/qwen38-prefix-cache` | Qwen persistent prefix cache on NVMe (mirrors `GLM53_PCACHE`): a prompt extending a cached boundary checkpoint restores it from disk instead of re-prefilling. |
 | `QWEN_VISION` | `1` | Load the vision tower (about 0.5 GB) and accept images/videos; `0` = text only. |
 | `QWEN_MEMGUARD_GIB` | `8` | The Qwen launcher stops the engine if `MemAvailable` drops below this many GiB. |
 | `SPARK_COMPACT` | `1` | Compact host memory once after GLM starts (avoids page-migration stalls on unified memory). |

@@ -52,6 +52,7 @@ prompts or between two builds that round differently.
 - DFlash2 drafter with tree/chain verification, KDA (linear attention) state correction replay, MLA shared base states,
   DSA sparse-attention selection and confidence-based truncation; copy (prompt-lookup) drafts.
 - Persistent prefix cache on NVMe (`GLM53_PCACHE`).
+- Optional abliteration, off by default ([docs/abliteration.md](docs/abliteration.md)): o_proj transplant (`GLM53_ABLIT`) and direction ablation (`SPARK_ABLATE`).
 
 **Qwen3.8-Flash-Next (one node)**
 - The full hybrid architecture: gated DeltaNet linear attention, sparse attention with an indexer, a 512-expert top-10
@@ -115,6 +116,7 @@ GitHub Actions builds every push on an arm64 runner and publishes release archiv
 | [docs/features.md](docs/features.md) | How the engine works: GLM and Qwen paths, kernels, speculative decoding, memory |
 | [docs/configuration.md](docs/configuration.md) | `spark.env`, profiles, the most useful engine and front-end switches |
 | [docs/benchmarks.md](docs/benchmarks.md) | How to measure speed, reference numbers |
+| [docs/abliteration.md](docs/abliteration.md) | Optional refusal-removal (both mechanisms): what it is, how to enable, risks |
 
 ## Models and licenses
 

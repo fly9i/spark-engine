@@ -156,6 +156,7 @@ pub fn serve(dir: &Path, socket: &Path) {
     let t0 = Instant::now();
     let m = Model::load(dir);
     let pool = m.new_kv_pool(total);
+    if super::pcache::requested() { super::pcache::init(dir); }
     eprintln!("[qwen-serve] loaded in {:.1}s; KV pool {} tokens ({} stores of {} at start), {} concurrent, drafts {:?}", t0.elapsed().as_secs_f64(),
               total, n_stores, share, max_seqs, pol);
     let mut stores: Vec<Store> = (0..n_stores).map(|i| Store { seq: Some(m.new_seq_in(&pool, i as i64 * share, share)), history: vec![], pend_h: None,
@@ -212,13 +213,14 @@ pub fn serve(dir: &Path, socket: &Path) {
     let mut tick: u64 = 0;
     let mut turn = 0usize;
     loop {
+        super::pcache::poll();
         // ---- requests
         loop {
             let line = if active.is_empty() && queue.is_empty() {
                 match rx.recv() { Ok(l) => l, Err(_) => return }
             } else { match rx.try_recv() { Ok(l) => l, Err(mpsc::TryRecvError::Empty) => break, Err(_) => return } };
             let v: Value = match serde_json::from_str(line.trim()) { Ok(v) => v, Err(e) => { write_line(&mut conn, &json!({"done": true, "error": format!("bad json: {e}")})); continue; } };
-            if v.get("shutdown").is_some() { return; }
+            if v.get("shutdown").is_some() { super::pcache::shutdown(10); return; }
             // a new front end (or the current one gone): its predecessor's requests have no client any more
             let gone = v.get("connected").is_some()
                 || v.get("disconnected").and_then(|g| g.as_u64()) == Some(conn_gen.load(std::sync::atomic::Ordering::SeqCst) as u64);
@@ -241,7 +243,7 @@ pub fn serve(dir: &Path, socket: &Path) {
                 write_line(&mut conn, &json!({"id": v["id"], "stats": {"active": active.len(), "queued": queue.len(), "running": active.len(),
                     "waiting": queue.len(), "decoding": decoding, "max_seqs": max_seqs, "stores": stores.iter().filter(|s| s.len > 0).count(),
                     "max_stores": n_stores, "capacity": cap, "kv_pool_tokens": total, "kv_budget_tokens": total,
-                    "kv_allocated_tokens": held(false), "kv_active_tokens": held(true), "batch": graphs_on}}));
+                    "kv_allocated_tokens": held(false), "kv_active_tokens": held(true), "batch": graphs_on, "pcache": super::pcache::stats()}}));
                 continue;
             }
             let ids: Vec<i64> = v["prompt_ids"].as_array().map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default();
@@ -302,7 +304,9 @@ pub fn serve(dir: &Path, socket: &Path) {
                 free.iter().copied().filter(|&i| stores[i].len >= need && super::model::yarn_for(stores[i].len - 16) == mode)
                     .min_by_key(|&i| (!captured(i), stores[i].used))
             });
-            let via = best.map_or(0, |b| b.2);
+            // no in-memory prefix: the longest cached checkpoint on disk that extends into this prompt (QWEN_PCACHE)
+            let disk = (best.is_none() && super::pcache::enabled()).then(|| super::pcache::lookup(&queue[0].1, 0, ckpt_min())).flatten();
+            let via = best.map_or(if disk.is_some() { 3 } else { 0 }, |b| b.2);
             let si = match pick {
                 Some(i) => i,
                 None => {
@@ -319,6 +323,7 @@ pub fn serve(dir: &Path, socket: &Path) {
                     }
                     let Some(base) = gap else { break };
                     tch::Cuda::synchronize(0);
+                    for &j in give.iter().chain([&s]) { super::pcache::fence(j as u64); }
                     for &j in give.iter().chain([&s]) {
                         batch_graphs.retain(|k, _| !k.contains(&j));
                         graph_use.retain(|k, _| !k.contains(&j));
@@ -350,6 +355,21 @@ pub fn serve(dir: &Path, socket: &Path) {
             } else if via == 1 && !st.history.is_empty() && st.history.len() < prompt.len() && prompt[..st.history.len()] == st.history[..] {
                 hit = st.history.len();
                 mtp_pend = st.pend_h.take().map(|h| (h, st.history.len() as i64 - 1));
+            } else if via == 3 {
+                // make sure no pending write is still reading this store's old checkpoint before we overwrite its state
+                super::pcache::fence(si as u64);
+                match disk.and_then(|(idx, _)| super::pcache::restore(idx, &prompt, Device::Cuda(0))) {
+                    Some((ids, t)) => {
+                        let c = Ckpt::from_parts(ids, t);
+                        let h = m.ckpt_restore(st.seq_mut(), &c);
+                        hit = c.ids.len();
+                        mtp_pend = Some((h, hit as i64 - 1));
+                        st.history = c.ids.clone();
+                        st.pend_h = None;
+                        st.ckpt = Some(c);
+                    }
+                    None => { m.reset(st.seq_mut()); st.history.clear(); st.pend_h = None; st.drop_ckpt(); }
+                }
             } else {
                 m.reset(st.seq_mut());
                 st.history.clear();
@@ -459,7 +479,11 @@ fn prefill_step(m: &Model, pol: &Policy, a: &mut Active, st: &mut Store) {
     *mtp_pend = Some((x.narrow(0, n - 1, 1).contiguous(), p0 + n - 1));
     *last = Some(lg);
     *done = end;
-    if at_ckpt { let mut c = st.ckpt.take(); m.ckpt_save(st.seq(), &mtp_pend.as_ref().unwrap().0, &mut c); st.ckpt = c; }
+    if at_ckpt {
+        let mut c = st.ckpt.take(); m.ckpt_save(st.seq(), &mtp_pend.as_ref().unwrap().0, &mut c);
+        if let Some(cp) = &c { if super::pcache::enabled() { super::pcache::save(&cp.ids, cp.tensors(), a.store as u64); } }
+        st.ckpt = c;
+    }
     if end == a.prompt.len() {
         let next = sample_rows(last.as_ref().unwrap(), a.temp, a.seed, st.seq().pos)[0];
         let (h, pos) = mtp_pend.take().unwrap();

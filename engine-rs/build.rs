@@ -79,7 +79,7 @@ fn main() {
     let nv: Vec<String> = ["-O3", "-std=c++17", "-Xcompiler", "-fPIC", "--fmad=false"].iter().map(|s| s.to_string())
         .chain([format!("-gencode=arch=compute_{arch},code=sm_{arch}")]).collect();
     let nvcc = format!("{cuda}/bin/nvcc");
-    let kernels = ["mhc","kda","gemv","latent","fp8","dataflow","kda_conv_chain","kda_correction","dsa_index","draft_selector","draft_conv","shared_gu","rdma_ar","rdma_big","fp8_big","l2pf","c12","draft_head4","draft_q4","qwen_exl3","qwen_gdn","qwen_qsa","qwen_moe","qwen_hc","qwen_ple","qwen_f16","qwen_q8","glm_moe"];
+    let kernels = ["mhc","kda","gemv","latent","fp8","dataflow","kda_conv_chain","kda_correction","dsa_index","draft_selector","draft_conv","shared_gu","rdma_ar","rdma_big","fp8_big","l2pf","c12","draft_head4","draft_q4","qwen_exl3","qwen_gdn","qwen_qsa","qwen_moe","qwen_hc","qwen_ple","qwen_f16","qwen_q8","glm_moe","ablate"];
     let mut jobs: Vec<(String, Vec<String>, String, String)> = Vec::new();
     for src in ["shim/shim.cpp", "shim/lt.cpp"] {
         jobs.push(("c++".into(), cxx.clone(), src.into(), cached_object(src, &cxx, hh)));

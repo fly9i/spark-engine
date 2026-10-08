@@ -31,6 +31,9 @@
 | `GLM53_RDMA_AR_DEV`、`GLM53_RDMA_AR_DEV1`、`GLM53_RDMA_AR_GID` | `rocep1s0f0`、`roceP2p1s0f0`、`3` | 引擎自带 RDMA all-reduce 使用的设备和 GID（默认值与 DGX Spark 匹配）。 |
 | `QWEN_MODEL` | `/models/Qwen3.8-Flash-Next-exl3` | Qwen3.8-Flash-Next EXL3 checkpoint 目录。 |
 | `QWEN_ASSETS` | `$SPARK_HOME/assets/qwen38` | 包含 `draft_vocab_65536.json`（MTP 草稿头词表）的目录。 |
+| `GLM53_ABLIT`、`GLM53_ABLIT_DIR`、`GLM53_ABLIT_LAYERS` | 关、—、`15-44` | GLM o_proj 移植（[abliteration.zh-CN.md](abliteration.zh-CN.md)）。 |
+| `SPARK_ABLATE`、`SPARK_ABLATE_MODE` | 关、`single` | 方向消融，两个模型通用（[abliteration.zh-CN.md](abliteration.zh-CN.md)）；`single` / `per-layer` / `subspace:a-b:k`。 |
+| `QWEN_PCACHE`、`QWEN_PCACHE_DIR` | 关、`/tmp/qwen38-prefix-cache` | Qwen NVMe 持久前缀缓存（镜像 `GLM53_PCACHE`）：prompt 命中盘上已缓存的边界检查点时从盘恢复，省去重新 prefill。 |
 | `QWEN_VISION` | `1` | 加载视觉塔（约 0.5 GB）并接受图像/视频；`0` = 仅文本。 |
 | `QWEN_MEMGUARD_GIB` | `8` | 当 `MemAvailable` 低于该 GiB 数时，Qwen 启动脚本会停止引擎。 |
 | `SPARK_COMPACT` | `1` | GLM 启动后执行一次主机内存规整（避免统一内存上的页迁移卡顿）。 |

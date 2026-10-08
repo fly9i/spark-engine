@@ -7,4 +7,5 @@ pub mod spec;
 pub mod serve;
 pub mod graph;
 pub mod lookup;
+pub mod pcache;
 pub mod vision;

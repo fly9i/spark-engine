@@ -298,6 +298,10 @@ fn ablit_take(layer:usize)->Option<AblitRead> {
     let h=ABLIT_READS.lock().unwrap().as_mut()?.remove(&layer)?;
     Some(h.join().expect("GLM53_ABLIT prefetch thread"))
 }
+/// SPARK_ABLATE (crate::ablate): a projection writing into the residual stream, orthogonalized for layer `layer`.
+fn ablate_out(layer:usize,w:Tensor)->Tensor {
+    match crate::ablate::get() {Some(a) if a.covers(layer)=>a.ortho_out(layer,&w),_=>w}
+}
 fn ablit_wo(layer:usize,stock:Tensor)->Tensor {
     let t0=std::time::Instant::now();let t=ablit_wo_timed(layer,stock);load_ns(1,t0);t
 }
@@ -514,6 +518,7 @@ impl ModelWeights {
         });
         let p = "model.language_model";
         let embed = load(&mut idx, &format!("{p}.embed_tokens.weight"), dev);
+        let embed = match crate::ablate::get() { Some(a) => a.ortho_rows(0, &embed), None => embed };
         let final_norm = load(&mut idx, &format!("{p}.norm.weight"), dev);
         let lm_head = load_h(&mut idx, "lm_head.weight", dev);
         let mut layers = Vec::with_capacity(n_layers);
@@ -538,7 +543,7 @@ impl ModelWeights {
                         wq: load_h(&mut idx, &format!("{sa}.q_proj.weight"), dev),
                         wk: load_h(&mut idx, &format!("{sa}.k_proj.weight"), dev),
                         wv: load_h(&mut idx, &format!("{sa}.v_proj.weight"), dev),
-                        wo: ablit_wo(i, load_h(&mut idx, &format!("{sa}.o_proj.weight"), dev)),
+                        wo: ablate_out(i, ablit_wo(i, load_h(&mut idx, &format!("{sa}.o_proj.weight"), dev))),
                         wb: load(&mut idx, &format!("{sa}.b_proj.weight"), dev),
                         fa: load_h(&mut idx, &format!("{sa}.f_a_proj.weight"), dev),
                         fb: load_h(&mut idx, &format!("{sa}.f_b_proj.weight"), dev),
@@ -575,7 +580,7 @@ impl ModelWeights {
                         q_b: load_h(&mut idx, &format!("{qp}.q_b_proj.weight"), dev),
                         kv_a: load_h(&mut idx, &format!("{qp}.kv_a_proj_with_mqa.weight"), dev),
                         kv_b: load_h(&mut idx, &format!("{qp}.kv_b_proj.weight"), dev),
-                        wo: ablit_wo(i, load_h(&mut idx, &format!("{qp}.o_proj.weight"), dev)),
+                        wo: ablate_out(i, ablit_wo(i, load_h(&mut idx, &format!("{qp}.o_proj.weight"), dev))),
                         q_a_ln: load(&mut idx, &format!("{qp}.q_a_layernorm.weight"), dev),
                         kv_a_ln: load(&mut idx, &format!("{qp}.kv_a_layernorm.weight"), dev),
                     }),
@@ -587,7 +592,7 @@ impl ModelWeights {
                     Some(DenseMlp {
                         wg: load_h(&mut idx, &format!("{m}.gate_proj.weight"), dev),
                         wu: load_h(&mut idx, &format!("{m}.up_proj.weight"), dev),
-                        wd: load_h(&mut idx, &format!("{m}.down_proj.weight"), dev),
+                        wd: ablate_out(i, load_h(&mut idx, &format!("{m}.down_proj.weight"), dev)),
                     }),
                     None,
                 )
@@ -600,7 +605,7 @@ impl ModelWeights {
                         bias: load(&mut idx, &format!("{m}.gate.e_score_correction_bias"), dev),
                         sh_wg: load_h(&mut idx, &format!("{m}.shared_experts.gate_proj.weight"), dev),
                         sh_wu: load_h(&mut idx, &format!("{m}.shared_experts.up_proj.weight"), dev),
-                        sh_wd: load_h(&mut idx, &format!("{m}.shared_experts.down_proj.weight"), dev),
+                        sh_wd: ablate_out(i, load_h(&mut idx, &format!("{m}.shared_experts.down_proj.weight"), dev)),
                     }),
                 )
             };

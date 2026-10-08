@@ -270,3 +270,74 @@ fn batch_arm(m: &Model, prompts: &[Vec<i64>], rounds: usize, arm: &str, mut log:
     let outs: Vec<&[i64]> = seqs.iter().zip(prompts).map(|(s, p)| &s.ids[p.len()..]).collect();
     println!("BATCH_OUT {} {}", arm, serde_json::to_string(&outs).unwrap());
 }
+
+
+/// `qwen-refusal-dir <model_dir> <harmful.json> <harmless.json> <out.safetensors>`: refusal directions for SPARK_ABLATE
+/// (docs/abliteration.md). Each JSON file is a list of prompts as token ids (chat template applied, generation prompt
+/// included; scripts/refusal_prompts.py). Every prompt is prefilled alone; each layer's mixed block input at the last
+/// row is recorded. Per layer: d = mean(harmful) - mean(harmless), normalized. Writes `directions` [layers, hidden],
+/// `scores` [layers] (|mean difference| / mean activation norm) and `direction` (the best-scoring layer in the middle
+/// half of the stack, or SPARK_ABLATE_FROM_LAYER).
+pub fn refusal_dir(dir: &Path, harmful: &Path, harmless: &Path, out: &Path) {
+    let _guard = tch::no_grad_guard();
+    let m = Model::load(dir);
+    let load = |p: &Path| -> Vec<Vec<i64>> { serde_json::from_reader(std::fs::File::open(p).expect("prompt ids json")).expect("prompt ids") };
+    let run = |set: Vec<Vec<i64>>, name: &str| -> Vec<Vec<Tensor>> {
+        let t0 = Instant::now();
+        let n = set.len();
+        let r = set.iter().map(|ids| {
+            let mut seq = m.new_seq(ids.len() as i64 + 64);
+            crate::ablate::capture_start();
+            let _ = m.prefill(&mut seq, ids);
+            tch::Cuda::synchronize(0);
+            crate::ablate::capture_take()
+        }).collect();
+        eprintln!("[refusal-dir] {name}: {n} prompts in {:.1}s", t0.elapsed().as_secs_f64());
+        r
+    };
+    let (h, n) = (run(load(harmful), "harmful"), run(load(harmless), "harmless"));
+    crate::ablate::save_directions(&h, &n, out);
+}
+
+
+/// `qwen-pcache-selftest <model_dir>`: prove the SSD prefix cache round-trips a checkpoint losslessly, with no network.
+/// Prefill a prefix, take an in-memory checkpoint, write it to disk, read it back, and compare the token ids and every
+/// state tensor (including the pending hidden row, which ckpt_save stores) bit for bit. Identical tensors mean the disk
+/// checkpoint restores to exactly the in-memory one, so decoding from either is identical by construction. Uses a
+/// private QWEN_PCACHE_DIR, so it never touches a serving cache.
+pub fn pcache_selftest(dir: &Path) {
+    use super::model::Ckpt;
+    let _guard = tch::no_grad_guard();
+    std::env::set_var("QWEN_PCACHE", "1");
+    let tmp = std::env::var("QWEN_PCACHE_SELFTEST_DIR").unwrap_or_else(|_| format!("/tmp/qpc-selftest-{}", std::process::id()));
+    std::env::set_var("QWEN_PCACHE_DIR", &tmp);
+    std::env::set_var("QWEN_PCACHE_MIN", "16");
+    let m = Model::load(dir);
+    super::pcache::init(dir);
+    let prefix: Vec<i64> = (0..2048i64).map(|i| (i.wrapping_mul(2654435761) & 0x7fff) % 150000 + 10).collect();
+    let n = prefix.len() as i64;
+    let mut seq = m.new_seq(n + 64);
+    let (_lg, x) = m.prefill_lm(&mut seq, &prefix);
+    let pend = x.narrow(0, n - 1, 1).contiguous();
+    let mut slot: Option<Ckpt> = None;
+    m.ckpt_save(&seq, &pend, &mut slot);
+    let c_mem = slot.unwrap();
+    super::pcache::save(&c_mem.ids, c_mem.tensors(), 0);
+    super::pcache::fence(0);
+    let (idx, len) = super::pcache::lookup(&prefix, 0, 16).expect("selftest: entry not found on disk");
+    assert_eq!(len, prefix.len(), "selftest: cached length");
+    let (ids, t) = super::pcache::restore(idx, &prefix, Device::Cuda(0)).expect("selftest: restore failed");
+    assert_eq!(ids, c_mem.ids, "selftest: ids differ");
+    let mem = c_mem.tensors();
+    assert_eq!(mem.len(), t.len(), "selftest: tensor count {} vs {}", mem.len(), t.len());
+    let mut bad = 0;
+    for (i, (a, b)) in mem.iter().zip(&t).enumerate() {
+        assert_eq!(a.size(), b.size(), "selftest: tensor {i} shape {:?} vs {:?}", a.size(), b.size());
+        if !a.equal(b) { bad += 1;
+            let d = (a.to_kind(tch::Kind::Float) - b.to_kind(tch::Kind::Float)).abs().max().double_value(&[]);
+            eprintln!("[selftest] tensor {i} {:?} DIFFERS (max abs {d})", a.size()); }
+    }
+    assert_eq!(bad, 0, "selftest: {bad} of {} state tensors differ", mem.len());
+    let _ = std::fs::remove_dir_all(&tmp);
+    println!("PCACHE-SELFTEST OK: {} tokens, ids + {} state tensors bitwise identical disk<->memory", prefix.len(), mem.len());
+}
