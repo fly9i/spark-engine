@@ -73,4 +73,5 @@ top-10 MoE，4 流 hyper-connection，来自 39 GB 表的逐层 n-gram 嵌入（
 ## GB10 上的内存
 
 GPU 和 CPU 共享 128 GB。引擎在加载后根据 `MemAvailable` 确定 KV 池大小，释放 checkpoint 分片占用的页缓存，保持主机端
-暂存缓冲区小且锁页，启动脚本在启动完成后执行一次内存规整。推荐的主机设置见 [deploy.zh-CN.md](deploy.zh-CN.md)。
+暂存缓冲区小且锁页（用 `cudaHostRegister` 注册的匿名页，内核内存规整从不隔离），启动脚本在启动完成后执行一次内存规整。
+推荐的主机设置见 [deploy.zh-CN.md](deploy.zh-CN.md)。

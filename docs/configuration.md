@@ -37,6 +37,7 @@ Three layers of settings:
 | `QWEN_VISION` | `1` | Load the vision tower (about 0.5 GB) and accept images/videos; `0` = text only. |
 | `QWEN_MEMGUARD_GIB` | `8` | The Qwen launcher stops the engine if `MemAvailable` drops below this many GiB. |
 | `SPARK_COMPACT` | `1` | Compact host memory once after GLM starts (avoids page-migration stalls on unified memory). |
+| `GLM53_HOST_REGISTER` | `1` | Pinned host staging buffers as anonymous pages + `cudaHostRegister` (kernel compaction never isolates them); `0` = `cudaHostAlloc`. Both models. |
 | `SPARK_MIN_FREE_GIB` | `100` | When switching models, `start.sh` waits until this much memory is free. |
 
 ## Most useful engine switches

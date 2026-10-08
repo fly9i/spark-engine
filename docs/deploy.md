@@ -13,12 +13,19 @@ Both models use most of the 128 GB: run one model at a time per machine, and not
 KV cache from free memory at start-up; keep at least 8 GB `MemAvailable` while serving (GB10 memory is shared with the
 CPU, and exhausting it can hang the machine). The Qwen launcher includes a memory guard (`QWEN_MEMGUARD_GIB`, default 8).
 
-Recommended host setting (both nodes): disable proactive memory compaction, which otherwise migrates pages in bursts and
-slows decoding for seconds at a time on unified memory:
+Recommended host settings (all nodes): disable proactive compaction and watermark boosting. Both make `kcompactd`
+scan memory in bursts on a fragmented node; on unified memory that stalls decoding for seconds at a time (with
+watermark boosting on, a node that had been up for days scanned ~8 M pages every 6 s even with proactive compaction
+off):
 
 ```bash
-echo 'vm.compaction_proactiveness = 0' | sudo tee /etc/sysctl.d/90-spark-engine.conf && sudo sysctl --system
+printf 'vm.compaction_proactiveness = 0\nvm.watermark_boost_factor = 0\n' | sudo tee /etc/sysctl.d/90-spark-engine.conf
+sudo sysctl --system
 ```
+
+The engine itself keeps its pinned host buffers out of compaction's way: they are anonymous pages registered with
+`cudaHostRegister`, which compaction never isolates (`cudaHostAlloc` memory is shared-memory backed and is). Set
+`GLM53_HOST_REGISTER=0` to go back to `cudaHostAlloc`.
 
 ## 2. Networking for GLM (two nodes)
 

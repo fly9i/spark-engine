@@ -37,6 +37,7 @@
 | `QWEN_VISION` | `1` | 加载视觉塔（约 0.5 GB）并接受图像/视频；`0` = 仅文本。 |
 | `QWEN_MEMGUARD_GIB` | `8` | 当 `MemAvailable` 低于该 GiB 数时，Qwen 启动脚本会停止引擎。 |
 | `SPARK_COMPACT` | `1` | GLM 启动后执行一次主机内存规整（避免统一内存上的页迁移卡顿）。 |
+| `GLM53_HOST_REGISTER` | `1` | pinned 主机暂存缓冲使用匿名页 + `cudaHostRegister`（内核内存规整从不隔离）；`0` = `cudaHostAlloc`。两个模型通用。 |
 | `SPARK_MIN_FREE_GIB` | `100` | 切换模型时，`start.sh` 会等到空闲内存达到该值。 |
 
 ## 最常用的引擎开关

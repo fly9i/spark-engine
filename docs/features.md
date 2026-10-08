@@ -86,5 +86,6 @@ embeddings (PLE) from a 39 GB table, an MTP head, and a ViT vision tower.
 ## Memory on GB10
 
 GPU and CPU share 128 GB. The engine sizes the KV pool from `MemAvailable` after loading, releases the page cache of
-the checkpoint shards, keeps host staging buffers small and pinned, and the launch scripts compact memory once after
-start-up. See [deploy.md](deploy.md) for the recommended host setting.
+the checkpoint shards, keeps host staging buffers small and pinned (anonymous pages registered with `cudaHostRegister`,
+which kernel compaction never isolates), and the launch scripts compact memory once after start-up. See
+[deploy.md](deploy.md) for the recommended host settings.

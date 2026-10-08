@@ -28,7 +28,8 @@ GLM53_ABLIT_DIR=/models/glm53-ablit-transplant
 ```
 
 Each layer logs `[ablit] layer N o_proj ... transplanted (sha256 ok)`; any missing file, size, dtype, shape or checksum
-mismatch aborts the load (never a silent fallback to a different model). Performance is unchanged.
+mismatch aborts the load (never a silent fallback to a different model). The transplanted weights have the original
+shape and dtype, so a decode step costs the same; see [Performance](#performance) for its effect on speculative decoding.
 
 ## 2. Direction ablation (`SPARK_ABLATE`, GLM and Qwen)
 
@@ -67,6 +68,23 @@ SPARK_ABLATE=/path/dirs.safetensors          # set in spark.env or the start scr
 A single direction is often weak; a small subspace (e.g. `subspace:16-40:8`) is usually needed to drop the refusal rate
 substantially without hurting ordinary answers. Validate the effect yourself and check answer quality, not just refusal
 rate.
+
+## Performance
+
+GLM-5.3-Flash, 1 stream, greedy, 400-token English technical prose, same binary, `SPARK_ABLATE_MODE=subspace:16-40:8`:
+
+| Setting | Decode tok/s | Tokens per decode step | Step time |
+| --- | --- | --- | --- |
+| No ablation | 46.9 | 2.88 | 61.4 ms |
+| `SPARK_ABLATE` | 47.4 | 2.88 | 60.7 ms |
+| `SPARK_ABLATE` + `GLM53_ABLIT=1` | 45.7 | 2.76 | 60.4 ms |
+
+- `SPARK_ABLATE` removes all k directions of a residual write in one kernel (each row read once), so its run-time cost is
+  within measurement noise; on ordinary prompts it leaves the output, and therefore the draft acceptance, unchanged.
+- `GLM53_ABLIT` adds no compute, but the transplanted `o_proj` also changes ordinary outputs, so the DFlash2 drafter
+  (trained on the original model) is accepted less often: about 4% fewer tokens per step, about 2.6% lower decode speed.
+
+Recommended: `SPARK_ABLATE` alone, adding `GLM53_ABLIT` only if your own evaluation shows you need its extra effect.
 
 ## Risks and responsibility
 

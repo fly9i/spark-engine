@@ -23,7 +23,7 @@ GLM53_ABLIT_DIR=/models/glm53-ablit-transplant
 # GLM53_ABLIT_LAYERS=15-44   (default)
 ```
 
-每一层都会记录 `[ablit] layer N o_proj ... transplanted (sha256 ok)`；任何缺失的文件、尺寸、dtype、形状或校验和不匹配都会中止加载（绝不会静默回退到不同的模型）。性能不变。
+每一层都会记录 `[ablit] layer N o_proj ... transplanted (sha256 ok)`；任何缺失的文件、尺寸、dtype、形状或校验和不匹配都会中止加载（绝不会静默回退到不同的模型）。移植后的权重与原权重形状、dtype 相同，每个 decode 步的计算量不变；它对投机解码的影响见[性能](#性能)。
 
 ## 2. 方向消融（`SPARK_ABLATE`，GLM 和 Qwen）
 
@@ -55,6 +55,21 @@ SPARK_ABLATE=/path/dirs.safetensors          # set in spark.env or the start scr
 ```
 
 单个方向往往较弱；通常需要一个小的子空间（例如 `subspace:16-40:8`）才能大幅降低拒绝率而不损害普通回答。请自行验证效果，并检查回答质量，而不仅仅是拒绝率。
+
+## 性能
+
+GLM-5.3-Flash，单流、贪心、400 token 英文技术长文，同一二进制，`SPARK_ABLATE_MODE=subspace:16-40:8`：
+
+| 配置 | decode tok/s | 每个 decode 步的 token 数 | 步长 |
+| --- | --- | --- | --- |
+| 不消融 | 46.9 | 2.88 | 61.4 ms |
+| `SPARK_ABLATE` | 47.4 | 2.88 | 60.7 ms |
+| `SPARK_ABLATE` + `GLM53_ABLIT=1` | 45.7 | 2.76 | 60.4 ms |
+
+- `SPARK_ABLATE` 在一个 kernel 里移除一次残差写入的全部 k 个方向（每行只读一次），运行时开销在测量噪声以内；对普通提示它不改变输出，因此草稿接受率也不变。
+- `GLM53_ABLIT` 不增加计算，但移植的 `o_proj` 也会改变普通输出，DFlash2 草稿器（按原模型训练）的接受率随之下降：每步 token 数约少 4%，decode 速度约低 2.6%。
+
+推荐只用 `SPARK_ABLATE`；只有你自己的评估表明需要额外效果时，再加 `GLM53_ABLIT`。
 
 ## 风险与责任
 

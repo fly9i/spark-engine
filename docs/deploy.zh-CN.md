@@ -12,12 +12,17 @@
 两个模型都会占用 128 GB 中的大部分：每台机器同一时间只运行一个模型，GPU 上不要运行其他任务。引擎在启动时根据空闲内存确定
 KV 缓存大小；服务期间请保持至少 8 GB `MemAvailable`（GB10 的内存与 CPU 共享，耗尽可能导致机器卡死）。Qwen 启动脚本内置内存保护（`QWEN_MEMGUARD_GIB`，默认 8）。
 
-推荐的主机设置（两个节点）：关闭主动内存规整（proactive compaction）。否则它会成批迁移内存页，在统一内存上导致 decode
-一次变慢数秒：
+推荐的主机设置（所有节点）：关闭主动内存规整（proactive compaction）和水位线提升（watermark boosting）。两者都会让
+`kcompactd` 在内存碎片化的节点上成批扫描内存，在统一内存上导致 decode 一次变慢数秒（开着 watermark boosting 时，一台运行了
+几天的节点即使关了主动规整，仍然每 6 秒扫描约 800 万页）：
 
 ```bash
-echo 'vm.compaction_proactiveness = 0' | sudo tee /etc/sysctl.d/90-spark-engine.conf && sudo sysctl --system
+printf 'vm.compaction_proactiveness = 0\nvm.watermark_boost_factor = 0\n' | sudo tee /etc/sysctl.d/90-spark-engine.conf
+sudo sysctl --system
 ```
+
+引擎自身的 pinned 主机缓冲也避开了内存规整：它们是用 `cudaHostRegister` 注册的匿名页，内存规整从不隔离这类页（而
+`cudaHostAlloc` 的内存由共享内存支撑，会被隔离）。设 `GLM53_HOST_REGISTER=0` 可退回 `cudaHostAlloc`。
 
 ## 2. GLM 的网络配置（双节点）
 
