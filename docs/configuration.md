@@ -29,7 +29,6 @@ Three layers of settings:
 | `NCCL_SOCKET_IFNAME` | `enp1s0f0np0` | Interface for NCCL's bootstrap traffic. |
 | `NCCL_IB_GID_INDEX` | `3` | RoCE v2 GID index. |
 | `GLM53_RDMA_AR_DEV`, `GLM53_RDMA_AR_DEV1`, `GLM53_RDMA_AR_GID` | `rocep1s0f0`, `roceP2p1s0f0`, `3` | Devices and GID of the engine's own RDMA all-reduce (defaults match DGX Spark). |
-| `GLM53_ABLIT`, `GLM53_ABLIT_DIR`, `GLM53_ABLIT_LAYERS` | off, —, `15-44` | Optional o_proj transplant ([abliteration.md](abliteration.md)). |
 | `QWEN_MODEL` | `/models/Qwen3.8-Flash-Next-exl3` | Qwen3.8-Flash-Next EXL3 checkpoint directory. |
 | `QWEN_ASSETS` | `$SPARK_HOME/assets/qwen38` | Directory with `draft_vocab_65536.json` (MTP draft head vocabulary). |
 | `QWEN_VISION` | `1` | Load the vision tower (about 0.5 GB) and accept images/videos; `0` = text only. |

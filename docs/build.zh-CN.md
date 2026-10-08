@@ -63,7 +63,7 @@ cd engine-rs && cargo build --release
 | `engine-rs/shim` | CUDA / C++ 内核和 libtorch 桥接；`moe_exl3.cuh`（两个模型共用的 EXL3 MoE）、`qwen_*.cu`、`glm_moe.cu`、`c12*`、`q8.cuh`、`rdma_*.cu` 等 |
 | `engine-rs/serve` | OpenAI 兼容前端（`openai_server.py`、`qwen_server.py`、媒体处理）和启动/停止脚本 |
 | `engine-rs/profiles` | `glm-tp2.env`：GLM 服务 profile（[开关说明](glm-switches.zh-CN.md)） |
-| `scripts` | 依赖拉取 / 构建、运行时环境、打包、模型下载、abliteration 供体拉取 |
+| `scripts` | 依赖拉取 / 构建、运行时环境、打包、模型下载 |
 | `patches` | 应用到拉取的 `torch-sys` 上的补丁 |
 | `bench` | 速度和文本一致性工具 |
 | `reference` | 用于验证内核的 Python 参考实现（开发者工具；需要额外的包） |

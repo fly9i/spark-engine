@@ -64,7 +64,7 @@ only that object.
 | `engine-rs/shim` | CUDA / C++ kernels and the libtorch bridge; `moe_exl3.cuh` (EXL3 MoE shared by both models), `qwen_*.cu`, `glm_moe.cu`, `c12*`, `q8.cuh`, `rdma_*.cu`, ... |
 | `engine-rs/serve` | OpenAI-compatible front ends (`openai_server.py`, `qwen_server.py`, media handling) and start/stop scripts |
 | `engine-rs/profiles` | `glm-tp2.env`: the GLM serving profile ([switch reference](glm-switches.md)) |
-| `scripts` | dependency fetch / build, runtime environment, packaging, model download, abliteration donor fetch |
+| `scripts` | dependency fetch / build, runtime environment, packaging, model download |
 | `patches` | patch applied to the fetched `torch-sys` |
 | `bench` | speed and text-consistency tools |
 | `reference` | Python reference implementations used to validate the kernels (developer tools; need extra packages) |

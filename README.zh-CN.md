@@ -48,7 +48,6 @@
 - DFlash2 草稿模型，支持树/链验证、KDA（线性注意力）状态修正重放、MLA 共享基础状态、DSA 稀疏注意力选择和基于置信度的截断；
   支持复制（prompt-lookup）草稿。
 - NVMe 上的持久化前缀缓存（`GLM53_PCACHE`）。
-- 可选的 o_proj 移植（来自 abliterated 供体 checkpoint），默认关闭（[docs/abliteration.zh-CN.md](docs/abliteration.zh-CN.md)）。
 
 **Qwen3.8-Flash-Next（单节点）**
 - 完整的混合架构：门控 DeltaNet 线性注意力、带索引器的稀疏注意力、512 专家 top-10 MoE、4 流 hyper-connection
@@ -111,7 +110,6 @@ GitHub Actions 在 arm64 runner 上构建每次推送，并为 tag 发布归档�
 | [docs/features.zh-CN.md](docs/features.zh-CN.md) | 引擎工作原理：GLM 与 Qwen 路径、内核、投机解码、内存 |
 | [docs/configuration.zh-CN.md](docs/configuration.zh-CN.md) | `spark.env`、profile、最常用的引擎与前端开关 |
 | [docs/benchmarks.zh-CN.md](docs/benchmarks.zh-CN.md) | 如何测量速度、参考数据 |
-| [docs/abliteration.zh-CN.md](docs/abliteration.zh-CN.md) | 可选的拒答移除移植：是什么、如何启用、风险 |
 
 ## 模型与许可证
 

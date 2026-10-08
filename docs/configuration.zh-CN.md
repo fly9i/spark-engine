@@ -29,7 +29,6 @@
 | `NCCL_SOCKET_IFNAME` | `enp1s0f0np0` | NCCL 引导流量使用的接口。 |
 | `NCCL_IB_GID_INDEX` | `3` | RoCE v2 GID 索引。 |
 | `GLM53_RDMA_AR_DEV`、`GLM53_RDMA_AR_DEV1`、`GLM53_RDMA_AR_GID` | `rocep1s0f0`、`roceP2p1s0f0`、`3` | 引擎自带 RDMA all-reduce 使用的设备和 GID（默认值与 DGX Spark 匹配）。 |
-| `GLM53_ABLIT`、`GLM53_ABLIT_DIR`、`GLM53_ABLIT_LAYERS` | 关闭、—、`15-44` | 可选的 o_proj 移植（[abliteration.zh-CN.md](abliteration.zh-CN.md)）。 |
 | `QWEN_MODEL` | `/models/Qwen3.8-Flash-Next-exl3` | Qwen3.8-Flash-Next EXL3 checkpoint 目录。 |
 | `QWEN_ASSETS` | `$SPARK_HOME/assets/qwen38` | 包含 `draft_vocab_65536.json`（MTP 草稿头词表）的目录。 |
 | `QWEN_VISION` | `1` | 加载视觉塔（约 0.5 GB）并接受图像/视频；`0` = 仅文本。 |
