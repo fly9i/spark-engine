@@ -2,30 +2,73 @@
 
 [English](README.md)
 
-一个面向 **NVIDIA DGX Spark（GB10）** 的推理引擎，通过 OpenAI 兼容 API 服务两个大型 MoE 模型：
+一个为 **NVIDIA DGX Spark（GB10，aarch64，CUDA 13 / sm_121）** 从零写的推理引擎，用一套 OpenAI 兼容接口服务两个大型
+混合 MoE 模型，EXL3 4-bit 量化、带投机解码、支持 1M token 上下文：
 
-- **GLM-5.3-Flash**（EXL3 4 bpw），运行在**两台 DGX Spark** 上（通过 ConnectX-7 RoCE 链路做张量并行），使用 DFlash2
-  投机解码；
-- **Qwen3.8-Flash-Next**（EXL3 4.05 bpw），运行在**一台 DGX Spark** 上，使用其原生 MTP 投机解码，支持图像和视频输入以及
-  1M token 上下文。
+- **GLM-5.3-Flash**：**两台 DGX Spark**（经 ConnectX-7 RoCE 做张量并行），配 DFlash2 草稿器；
+- **Qwen3.8-Flash-Next**：**单台 DGX Spark**，原生 MTP 草稿、图片/视频输入、完整混合架构。
 
-引擎由 Rust 和 CUDA 编写（张量相关的底层管理使用 PyTorch 的 C++ 库，稠密 prefill GEMM 使用 cuBLAS）。两个模型的 EXL3
-内核、MoE 流水线、投机解码状态管理、RDMA all-reduce 以及服务前端都包含在本仓库中。同一个二进制可运行任一模型，由
-`start.sh glm|qwen` 选择。
+所有影响性能的部分都是本项目自研代码——EXL3 的 GEMM/MoE 内核、GDN/KDA 线性注意力与稀疏注意力内核、投机解码状态机、
+RDMA all-reduce、FP8 KV、NVMe 前缀缓存、服务前端。只链接 PyTorch 的 libtorch（张量胶水、cuBLAS、NCCL）和 EXL3 反量化
+内核。一个二进制跑两个模型，`start.sh glm|qwen` 选一个。
 
-## 性能
+## 概览
 
-于 2026-10-08 使用本版本的二进制和默认设置测得，测量工具为 [bench/decode_bench.py](bench/decode_bench.py)
-和 [bench/prefill_bench.py](bench/prefill_bench.py)：贪心解码，关闭思考，输出 400 个 token，取 3 次运行的中位数，
-1–4 个并发流的总 tok/s；TTFT 为短提示词的首 token 时延。测量方法和更多数据见 [docs/benchmarks.zh-CN.md](docs/benchmarks.zh-CN.md)。
+2026-10-08 用本发布版二进制、默认配置、贪心、关思考实测（方法与更多数据见 [docs/benchmarks.zh-CN.md](docs/benchmarks.zh-CN.md)）。
 
-| 模型 | 硬件 | 散文，1 / 2 / 3 / 4 流 | 结构化，1 / 2 / 3 / 4 流 | Prefill | TTFT |
-| --- | --- | --- | --- | --- | --- |
-| GLM-5.3-Flash | 2× DGX Spark | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 1,520–1,560 tok/s（10K 和 55K 提示词） | ~370 ms |
-| Qwen3.8-Flash-Next | 1× DGX Spark | 64.1 / 85.5 / 105.0 / 119.5 tok/s | 149.8 / 192.9 / 232.6 / 217.4 tok/s | 1,870–1,920 tok/s（13K 和 77K 提示词） | ~150 ms |
+| | **GLM-5.3-Flash** | **Qwen3.8-Flash-Next** |
+| --- | --- | --- |
+| 硬件 | 2× DGX Spark（TP2，RoCE） | 1× DGX Spark |
+| 架构 | 45 层：KDA 线性注意力 + MLA/DSA 稀疏注意力，288 专家 MoE | 48 层：门控 DeltaNet + QSA 稀疏注意力，512 专家 top-10 MoE，逐层 n-gram |
+| **解码 — prose**（1/2/3/4 路） | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 64.1 / 85.5 / 105.0 / 119.5 tok/s |
+| **解码 — structured**（1/2/3/4 路） | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 149.8 / 192.9 / 232.6 / 226.5 tok/s |
+| **prefill** | ~1,560 tok/s（10K–55K 提示） | ~1,900 tok/s（13K–77K 提示） |
+| **TTFT**（短提示） | ~370 ms | ~150 ms |
+| **启动**（加载→可服务） | ~33 s | ~54 s |
+| 投机解码 | DFlash2 草稿器，树/链验证 | 原生 MTP + prompt-lookup |
 
-“散文”要求输出一段长篇解释（草稿接受率较低）；“结构化”要求从 1 数到 200（高度可预测）。
-投机解码使单流速度依赖于生成的文本：同一构建在不同提示词之间，或舍入方式不同的两个构建之间，可能相差几个百分点。
+"prose" = 长篇解释（草稿接受率低）；"structured" = 从 1 数到 200（接受率高）。聚合是各路相加；因为有投机，解码速度和文本相关。
+
+### 量化与运行时精度
+
+| 部件 | GLM-5.3-Flash | Qwen3.8-Flash-Next |
+| --- | --- | --- |
+| 路由专家（权重） | EXL3 **4 bpw**，mcg 码本 | EXL3 **4.05 bpw**（头 6、MTP 4），mul1 码本 |
+| 稠密权重 — prefill | 原精度（FP16），cuBLAS | 原精度 |
+| 稠密权重 — decode | **Q8**（int8 + 每 128 一个 FP32 scale，约 0.67% RMS；可选无损 12-bit C12） | FP16（可选 int8 副本） |
+| 注意力计算 | MLA/DSA 用 FP32/TF32；DSA indexer 稀疏 | QSA FP32 累加；学习式稀疏选择 |
+| **KV cache** | **FP8**（e4m3） | **FP8**（e4m3） |
+| 输出头 | FP16 | 6 bpw |
+
+全程用的精度分级：**L0** 逐位相同、**L1** 舍入级（不劣于 FP32 参考）、**L2** 仅草稿侧、**L3** 有意的有损。有损项（L3）
+是 FP8 KV cache 和 GLM 的 Q8 decode 稠密权重，二者都实测与参考等价；路由专家保留检查点自带的 EXL3 量化。
+
+### 上下文长度与并发
+
+| | GLM-5.3-Flash | Qwen3.8-Flash-Next |
+| --- | --- | --- |
+| 最大上下文（KV 预算） | **1,048,576 token** | **1,048,576 token** |
+| 该预算下 KV 显存 | ~7.05 GiB / 节点（11 个 MLA 层，7,216 B/token） | ~14.0 GiB（12 个稀疏注意力 + MTP，14,364 B/token） |
+| 默认并发序列 | 4 | 8 |
+| 批量投机验证 | 是（多序列共用一次前向） | 是（最多 8） |
+| 前缀复用 | 内存存储 + NVMe 持久缓存（`GLM53_PCACHE`） | 多轮 prompt 检查点 + NVMe 缓存（`QWEN_PCACHE`） |
+| 超长上下文 > 262K | — | YaRN 缩放 |
+
+两个模型都是混合架构：大多数层是线性/门控注意力，状态大小固定（不随上下文增长），所以 1M token 窗口只花 7–14 GiB KV——
+GB10 的 128 GB 统一内存其余部分放权重。
+
+## 本项目的特点
+
+- **专为 GB10 编写**：内核按 sm_121 的共享内存/占用率限制设计；decode 权重重排成每条 warp 加载正好连续 512 B（贴近
+  ~230–250 GB/s 流式读上限）；每个 decode 形状都捕获 CUDA 图；内存按统一地址空间上的 `MemAvailable` 分配。
+- **两节点经 RoCE 做张量并行**，配自研的小消息 RDMA all-reduce（固定求和顺序、与 NCCL 逐位相同、12–50 µs），并融进消费它的
+  hyper-connection 更新里。
+- **确定性、图捕获的投机解码**，保持精确贪心语义：KDA 状态修正回放、MLA 共享基态、DSA 逐行选择、置信度截断的草稿树、
+  prompt-lookup（copy）草稿。
+- **自研 MoE**：一套模板化 EXL3 MoE 内核两个模型共用（融合式持久 decode；分组张量核 prefill），不依赖任何外部 MoE 库。
+- **完整的多模态与长上下文服务**：图片/视频走模型自带视觉塔，1M token KV 池按 16K 粒度 LRU、KV 区间原地增长、NVMe 持久
+  前缀缓存。
+- **一个 OpenAI 兼容二进制**服务两个模型，带 Prometheus 指标和针对 GB10 统一内存的内存护栏。
 
 ## 功能
 

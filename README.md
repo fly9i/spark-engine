@@ -2,31 +2,79 @@
 
 [中文](README.zh-CN.md)
 
-An inference engine for **NVIDIA DGX Spark (GB10)** that serves two large MoE models through an OpenAI-compatible API:
+A from-scratch inference engine for **NVIDIA DGX Spark (GB10, aarch64, CUDA 13 / sm_121)** that serves two large hybrid-MoE
+models through one OpenAI-compatible API, at EXL3 4-bit, with speculative decoding and 1M-token context:
 
-- **GLM-5.3-Flash** (EXL3 4 bpw) across **two DGX Sparks** (tensor parallel over the ConnectX-7 RoCE link), with DFlash2
-  speculative decoding;
-- **Qwen3.8-Flash-Next** (EXL3 4.05 bpw) on **one DGX Spark**, with its native MTP speculative decoding, image and video
-  input and a 1M-token context.
+- **GLM-5.3-Flash** across **two DGX Sparks** (tensor parallel over the ConnectX-7 RoCE link), with the DFlash2 drafter;
+- **Qwen3.8-Flash-Next** on **one DGX Spark**, with native MTP drafting, image/video input and the full hybrid stack.
 
-The engine is written in Rust and CUDA (PyTorch's C++ library for tensor plumbing, cuBLAS for dense prefill GEMMs). The
-EXL3 kernels for both models, the MoE pipeline, the speculative-decoding state machinery, the RDMA all-reduce and the
-serving front end are part of this repository. One binary runs either model; `start.sh glm|qwen` picks one.
+Everything that matters for performance is the project's own code — the EXL3 GEMM/MoE kernels, the GDN/KDA linear-attention
+and sparse-attention kernels, the speculative-decoding state machine, the RDMA all-reduce, FP8 KV, the NVMe prefix cache
+and the serving front end. It links only PyTorch's libtorch (tensor plumbing, cuBLAS, NCCL) and the EXL3 dequant kernels.
+One binary runs either model; `start.sh glm|qwen` picks one.
 
-## Performance
+## At a glance
 
-Measured on 2026-10-08 with this release's binary and default settings, using [bench/decode_bench.py](bench/decode_bench.py)
-and [bench/prefill_bench.py](bench/prefill_bench.py): greedy decoding, thinking off, 400 output tokens, median of 3 runs,
-aggregate tok/s over 1–4 concurrent streams; TTFT of a short prompt. See [docs/benchmarks.md](docs/benchmarks.md) for the method and more numbers.
+Measured on 2026-10-08 with this release's binary, default settings, greedy, thinking off (method and more numbers:
+[docs/benchmarks.md](docs/benchmarks.md)).
 
-| Model | Hardware | Prose, 1 / 2 / 3 / 4 streams | Structured, 1 / 2 / 3 / 4 streams | Prefill | TTFT |
-| --- | --- | --- | --- | --- | --- |
-| GLM-5.3-Flash | 2× DGX Spark | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 1,520–1,560 tok/s (10K and 55K prompts) | ~370 ms |
-| Qwen3.8-Flash-Next | 1× DGX Spark | 64.1 / 85.5 / 105.0 / 119.5 tok/s | 149.8 / 192.9 / 232.6 / 217.4 tok/s | 1,870–1,920 tok/s (13K and 77K prompts) | ~150 ms |
+| | **GLM-5.3-Flash** | **Qwen3.8-Flash-Next** |
+| --- | --- | --- |
+| Hardware | 2× DGX Spark (TP2, RoCE) | 1× DGX Spark |
+| Architecture | 45 layers: KDA linear-attn + MLA/DSA sparse-attn, 288-expert MoE | 48 layers: gated-DeltaNet + QSA sparse-attn, 512-expert top-10 MoE, per-layer n-gram |
+| **Decode — prose** (1/2/3/4 streams) | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 64.1 / 85.5 / 105.0 / 119.5 tok/s |
+| **Decode — structured** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 149.8 / 192.9 / 232.6 / 226.5 tok/s |
+| **Prefill** | ~1,560 tok/s (10K–55K prompts) | ~1,900 tok/s (13K–77K prompts) |
+| **TTFT** (short prompt) | ~370 ms | ~150 ms |
+| **Startup** (load → serving) | ~33 s | ~54 s |
+| Speculative decoding | DFlash2 drafter, tree/chain verify | native MTP + prompt-lookup |
 
-"Prose" asks for a long explanation (lower draft acceptance); "structured" asks to count to 200 (highly predictable).
-Speculative decoding makes single-stream speed depend on the text: the same build can differ by a few percent between
-prompts or between two builds that round differently.
+"Prose" = a long explanation (lower draft acceptance); "structured" = counting 1–200 (high acceptance). Aggregate is the
+sum over streams; decode speed depends on the text because of speculation.
+
+### Quantization & runtime precision
+
+| Component | GLM-5.3-Flash | Qwen3.8-Flash-Next |
+| --- | --- | --- |
+| Routed experts (weights) | EXL3 **4 bpw**, mcg codebook | EXL3 **4.05 bpw** (head 6, MTP 4), mul1 codebook |
+| Dense weights — prefill | source precision (FP16), cuBLAS | source precision |
+| Dense weights — decode | **Q8** (int8 + FP32 scale / 128, ~0.67% RMS; lossless 12-bit C12 optional) | FP16 (int8 copies optional) |
+| Attention compute | MLA/DSA in FP32/TF32; DSA indexer sparse | QSA FP32 accumulate; learned sparse selection |
+| **KV cache** | **FP8** (e4m3) | **FP8** (e4m3) |
+| Output head | FP16 | 6 bpw |
+
+Precision classes used throughout: **L0** bitwise-identical, **L1** rounding-level (not worse than FP32 ref), **L2**
+drafter-only, **L3** lossy by design. The lossy choices (L3) are the FP8 KV cache and GLM's Q8 dense-decode weights;
+both are measured equivalent to the reference. Routed experts keep the checkpoint's EXL3 quantization.
+
+### Context length & concurrency
+
+| | GLM-5.3-Flash | Qwen3.8-Flash-Next |
+| --- | --- | --- |
+| Max context (KV budget) | **1,048,576 tokens** | **1,048,576 tokens** |
+| KV-cache memory at that budget | ~7.05 GiB / node (11 MLA layers, 7,216 B/token) | ~14.0 GiB (12 sparse-attn + MTP, 14,364 B/token) |
+| Concurrent sequences (default) | 4 | 8 |
+| Batched speculative verify | yes (sequences share one forward) | yes (up to 8) |
+| Prefix reuse | in-memory stores + NVMe persistent cache (`GLM53_PCACHE`) | multi-turn prompt checkpoints + NVMe cache (`QWEN_PCACHE`) |
+| Long context > 262K | — | YaRN scaling |
+
+Both models are hybrid: most layers are linear/gated attention whose state is fixed-size (does not grow with context),
+so a 1M-token window costs only 7–14 GiB of KV — the rest of GB10's 128 GB unified memory holds the weights.
+
+## What this project is
+
+- **Written for GB10 specifically.** Kernels target sm_121's shared-memory and occupancy limits; decode weights are
+  tiled so each warp load is one contiguous 512 B (near the ~230–250 GB/s streaming ceiling); CUDA graphs capture every
+  decode shape; memory is sized against `MemAvailable` on the shared CPU/GPU address space.
+- **Two-node tensor parallelism over RoCE** with the engine's own small-message RDMA all-reduce (fixed summation order,
+  bitwise identical to NCCL, 12–50 µs), fused into the hyper-connection update that consumes it.
+- **Deterministic, graph-captured speculative decoding** with exact greedy semantics: KDA state-correction replay, MLA
+  shared base states, DSA per-row selection, confidence-truncated draft trees, and prompt-lookup ("copy") drafts.
+- **Self-contained MoE**: one templated EXL3 MoE kernel shared by both models (fused persistent decode; grouped
+  tensor-core GEMM prefill); no external MoE library.
+- **Full multimodal and long-context serving**: image/video through the model's own vision tower, 1M-token KV pool in
+  16K granules with LRU, grow-in-place KV ranges, and a persistent NVMe prefix cache.
+- **One OpenAI-compatible binary** for both models, with Prometheus metrics and a memory guard for GB10's unified memory.
 
 ## Features
 
