@@ -8,7 +8,7 @@ py=${PYTHON:-python3}
 src=$root/third_party/exllamav3-src
 out=$root/third_party/exllamav3/lib
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
-export PATH=$CUDA_HOME/bin:$PATH
+export PATH=$CUDA_HOME/bin:$(dirname "$(command -v "$py")"):$PATH   # nvcc; ninja from the Python environment (parallel build)
 export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-12.1}
 export MAX_JOBS=${MAX_JOBS:-$(nproc)}
 if [[ ! -d $src/.git ]]; then
