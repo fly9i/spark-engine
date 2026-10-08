@@ -1,0 +1,24 @@
+[package]
+name = "spark-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Inference engine for GLM-5.3-Flash (TP2) and Qwen3.8-Flash-Next on NVIDIA DGX Spark (GB10)"
+license = "MIT"
+repository = "https://github.com/fly9i/spark-engine"
+
+[dependencies]
+serde_json = "1"
+memmap2 = "0.9"
+half = "2"
+sha2 = "0.10"
+rayon = "1"
+tch = "0.20"
+
+[profile.release]
+debug = true
+
+[patch.crates-io]
+torch-sys = { path = "../third_party/torch-sys-0.20.0" }
+
+[build-dependencies]
+cc = "1"

@@ -1,0 +1,32 @@
+--- a/libtch/torch_api_generated.cpp
++++ b/libtch/torch_api_generated.cpp
+@@ -4136,22 +4136,20 @@
+ 
+ void atg_align_as(tensor *out__, tensor self, tensor other) {
+   PROTECT(
+-    auto outputs__ = self->align_as(*other);
+-    out__[0] = new torch::Tensor(outputs__);
++    // libtorch 2.13 removed align_as: identity (unused by the engine)
++    out__[0] = new torch::Tensor(*self);
+   )
+ }
+ 
+ tensor *atg_align_tensors(tensor *tensors_data, int tensors_len) {
+   PROTECT(
+-    auto outputs__ = torch::align_tensors(of_carray_tensor(tensors_data, tensors_len));
+-    int sz = outputs__.size();
+-    torch::Tensor **out__ = (torch::Tensor**)malloc((sz + 1) * sizeof(torch::Tensor*));
+-    for (int i = 0; i < sz; ++i)
+-      out__[i] = new torch::Tensor(outputs__[i]);
+-    out__[sz] = nullptr;
++    // libtorch 2.13 removed align_tensors: element-wise copies (unused by the engine)
++    torch::Tensor **out__ = (torch::Tensor**)malloc((tensors_len + 1) * sizeof(torch::Tensor*));
++    for (int i = 0; i < tensors_len; ++i)
++      out__[i] = new torch::Tensor(*tensors_data[i]);
++    out__[tensors_len] = nullptr;
+     return out__;
+   )
+-  return nullptr;
+ }
+ 
+ void atg_all(tensor *out__, tensor self) {

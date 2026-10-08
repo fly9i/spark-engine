@@ -1,0 +1,86 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # DGX Spark (GB10) is aarch64 + CUDA sm_121: build on GitHub's arm64 runner (no GPU needed to compile)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    env:
+      CUDA_HOME: /usr/local/cuda-13.0
+      TORCH_CUDA_ARCH_LIST: "12.1"
+      SPARK_CUDA_ARCH: "121"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: CUDA 13.0 toolkit and system libraries
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends cuda-toolkit-13-0 libibverbs-dev python3.12-dev python3.12-venv
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+
+      - name: Python environment with PyTorch 2.13 (cu130)
+        run: |
+          python3.12 -m venv .venv
+          .venv/bin/pip install -q --upgrade pip setuptools wheel ninja
+          .venv/bin/pip install -q torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+          .venv/bin/python -c "import torch; print(torch.__version__, torch.version.cuda)"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache the exllamav3 library
+        uses: actions/cache@v4
+        with:
+          path: third_party/exllamav3
+          key: exllamav3-v1.4.9-sm121-torch2.13-${{ hashFiles('scripts/build-exllamav3.sh', 'scripts/exllamav3_min_setup.py', 'patches/exllamav3-*') }}
+
+      - name: Build the exllamav3 library (EXL3 GEMM kernels, MIT)
+        run: |
+          if [ ! -f third_party/exllamav3/lib/libexllamav3_ext.so ]; then
+            PYTHON=$PWD/.venv/bin/python MAX_JOBS=3 scripts/build-exllamav3.sh
+          fi
+
+      - name: Fetch pinned third-party sources
+        run: scripts/fetch-deps.sh
+
+      - name: Build the engine
+        run: |
+          export LIBTORCH=$(.venv/bin/python -c 'import torch, os; print(os.path.dirname(torch.__file__))')
+          cd engine-rs && BUILD_JOBS=3 cargo build --release
+          ls -la target/release/spark-engine
+
+      - name: Package
+        id: pkg
+        run: |
+          ver=${GITHUB_REF_NAME//\//-}
+          [[ $GITHUB_REF == refs/tags/* ]] || ver=${GITHUB_SHA::8}
+          echo "tarball=$(scripts/package.sh "$ver")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spark-engine-linux-aarch64
+          path: dist/*.tar.gz*
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file docs/release-notes.md
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
