@@ -75,16 +75,17 @@ impl Ablation {
     }
     /// In place: y [..., hidden] fp32 (rows with stride, contiguous columns) loses its components along the rows of D.
     pub fn apply(&self, layer: usize, y: &Tensor) {
-        extern "C" { fn spark_ablate_rows(y: *mut std::ffi::c_void, ld: i64, r: i32, d: *const std::ffi::c_void, dim: i32, st: *mut std::ffi::c_void) -> i32;
+        extern "C" { fn spark_ablate_rows_k(y: *mut std::ffi::c_void, ld: i64, r: i32, d: *const std::ffi::c_void, dim: i32, k: i32, st: *mut std::ffi::c_void) -> i32;
                      fn rs_current_stream() -> *mut std::ffi::c_void; }
         assert_eq!(y.kind(), Kind::Float);
         let s = y.size();
         let (r, dim) = (s[..s.len() - 1].iter().product::<i64>(), s[s.len() - 1]);
         assert_eq!(y.stride()[y.dim() - 1], 1);
-        let d = self.rows(layer);
-        for k in 0..d.size()[0] {   // orthonormal rows: sequential projections equal the joint one
-            assert_eq!(unsafe { spark_ablate_rows(y.data_ptr(), y.stride()[y.dim() - 2], r as i32, d.get(k).data_ptr(), dim as i32, rs_current_stream()) }, 0, "ablate rows");
-        }
+        let d = self.rows(layer).contiguous();   // [k, dim], orthonormal unit rows
+        let k = d.size()[0];
+        if r == 0 || k == 0 { return; }
+        // One launch removes all k directions (read each row once); orthonormal D => equals sequential projection.
+        assert_eq!(unsafe { spark_ablate_rows_k(y.data_ptr(), y.stride()[y.dim() - 2], r as i32, d.data_ptr(), dim as i32, k as i32, rs_current_stream()) }, 0, "ablate rows");
     }
 }
 
