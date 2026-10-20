@@ -101,6 +101,25 @@ extern "C" int glm53_q8t_pack_cuda(const void*,const float*,int,int,void*,cudaSt
 extern "C" int rs_q8t_pack(const void* q,const float* s,int n,int k,void* t){return glm53_q8t_pack_cuda(q,s,n,k,t,at::cuda::getCurrentCUDAStream());}
 extern "C" int glm53_q8t_gemm_cuda(const void*,const void*,int,int,void*,int,int,int,int,cudaStream_t);
 extern "C" int rs_q8t_gemm(const void* x,const void* t,int n,int k,void* y,int m,int out,int ks,int xhalf){return glm53_q8t_gemm_cuda(x,t,n,k,y,m,out,ks,xhalf,at::cuda::getCurrentCUDAStream());}
+// SPX1 (spx.cu, src/spx.rs)
+extern "C" int glm53_spx_gemv_cuda(const void*,const void*,int,int,int,void*,int,int,int,cudaStream_t);
+extern "C" int rs_spx_gemv(const void* x,const void* t,int n,int k,int bits,void* y,int m,int out,int ks){return glm53_spx_gemv_cuda(x,t,n,k,bits,y,m,out,ks,at::cuda::getCurrentCUDAStream());}
+extern "C" int glm53_spx_dequant_cuda(const void*,int,int,int,void*,long long,int,cudaStream_t);
+extern "C" int rs_spx_dequant(const void* t,int n,int k,int bits,void* w,long long ldw,int f32){return glm53_spx_dequant_cuda(t,n,k,bits,w,ldw,f32,at::cuda::getCurrentCUDAStream());}
+extern "C" int glm53_spx_pack_cuda(const void*,long long,long long,const void*,int,int,int,void*,cudaStream_t);
+extern "C" int rs_spx_pack(const void* src,long long rs,long long k0,const void* sc,int n,int k,int bits,void* out){return glm53_spx_pack_cuda(src,rs,k0,sc,n,k,bits,out,at::cuda::getCurrentCUDAStream());}
+extern "C" int glm53_spx_rot8_cuda(const void*,long long,int,const void*,int,int,int,void*,void*,cudaStream_t);
+extern "C" int glm53_spx_swiglu_rot_cuda(const void*,int,int,float,const void*,int,void*,void*,cudaStream_t);
+extern "C" int glm53_spx_kda_onorm_rot_cuda(const void*,const void*,int,const void*,void*,int,int,const void*,int,void*,cudaStream_t);
+extern "C" int rs_spx_kda_onorm_rot(const void* o,const void* on,int onl,const void* sg2,void* out,int rows,int heads,const void* sign,int bk,void* xr){return glm53_spx_kda_onorm_rot_cuda(o,on,onl,sg2,out,rows,heads,sign,bk,xr,at::cuda::getCurrentCUDAStream());}
+extern "C" int rs_spx_swiglu_rot(const void* y,int m,int n,float limit,const void* sign,int bk,void* act,void* xr){return glm53_spx_swiglu_rot_cuda(y,m,n,limit,sign,bk,act,xr,at::cuda::getCurrentCUDAStream());}
+extern "C" int rs_spx_rot8(const void* x,long long ldx,int in_kind,const void* sign,int m,int k,int bk,void* q,void* sx){return glm53_spx_rot8_cuda(x,ldx,in_kind,sign,m,k,bk,q,sx,at::cuda::getCurrentCUDAStream());}
+extern "C" int glm53_spx_quant8_cuda(const void*,int,int,void*,void*,void*,cudaStream_t);
+extern "C" int glm53_spx_mm8_cuda(const void*,const void*,const void*,const void*,int,int,int,int,void*,long long,int,cudaStream_t);
+extern "C" int rs_spx_quant8(const void* x,int m,int k,void* q,void* sx,void* sumx){return glm53_spx_quant8_cuda(x,m,k,q,sx,sumx,at::cuda::getCurrentCUDAStream());}
+extern "C" int rs_spx_mm8(const void* q,const void* sx,const void* sumx,const void* t,int m,int n,int k,int bits,void* y,long long ldy,int out){return glm53_spx_mm8_cuda(q,sx,sumx,t,m,n,k,bits,y,ldy,out,at::cuda::getCurrentCUDAStream());}
+extern "C" int glm53_spx_rot_cuda(const void*,long long,int,const void*,int,int,int,void*,long long,int,int,cudaStream_t);
+extern "C" int rs_spx_rot(const void* x,long long ldx,int in_kind,const void* sign,int m,int k,int bk,void* y,long long ldy,int out_kind,int sign_first){return glm53_spx_rot_cuda(x,ldx,in_kind,sign,m,k,bk,y,ldy,out_kind,sign_first,at::cuda::getCurrentCUDAStream());}
 extern "C" int glm53_latent_c12_bmm_cuda(const float*,long long,long long,const void*,const void*,const void*,const int*,const int*,const void*,int,int,int,float*,int,cudaStream_t);
 extern "C" int rs_latent_c12_bmm(const float* x,int64_t xh,int64_t xm,const void* m8,const void* e4,const void* eb,const int* ptr,const int* col,const void* val,int heads,int n,int k,float* y,int m){
     return glm53_latent_c12_bmm_cuda(x,xh,xm,m8,e4,eb,ptr,col,val,heads,n,k,y,m,at::cuda::getCurrentCUDAStream());
@@ -151,9 +170,11 @@ extern "C" int glm53_kda_onorm_gate_sig_cuda(const float*,const float*,int,const
 extern "C" int rs_kda_onorm_gate_sig(const float* o,const float* onorm,int onorm_len,const float* g2,float* out,int groups){
     return glm53_kda_onorm_gate_sig_cuda(o,onorm,onorm_len,g2,out,groups,at::cuda::getCurrentCUDAStream());
 }
-extern "C" int glm53_mhc_pre_fused_cuda(const float*,const void*,int,const float*,const float*,const float*,float*,float*,float*,float*,int,int,cudaStream_t);
-extern "C" int rs_mhc_pre_fused(const float* residual,const void* fn,int fn_bf16,const float* scale,const float* base,const float* ln,float* partial,float* z,float* post,float* comb,int rows,int h){
-    return glm53_mhc_pre_fused_cuda(residual,fn,fn_bf16,scale,base,ln,partial,z,post,comb,rows,h,at::cuda::getCurrentCUDAStream());
+struct SparkClamp;   // shim/ablate_clamp.cuh (opaque here; crate::ablate::ClampArgs on the Rust side)
+extern "C" int glm53_mhc_pre_fused_cuda(const float*,const void*,int,const float*,const float*,const float*,float*,float*,float*,float*,int,int,const int8_t*,int,__half*,const SparkClamp*,cudaStream_t);
+extern "C" int rs_mhc_pre_fused(const float* residual,const void* fn,int fn_bf16,const float* scale,const float* base,const float* ln,float* partial,float* z,float* post,float* comb,int rows,int h,
+    const void* rsign,int rbk,void* zr,const void* clamp){
+    return glm53_mhc_pre_fused_cuda(residual,fn,fn_bf16,scale,base,ln,partial,z,post,comb,rows,h,(const int8_t*)rsign,rbk,(__half*)zr,(const SparkClamp*)clamp,at::cuda::getCurrentCUDAStream());
 }
 extern "C" int rs_mhc_sinkhorn(const float* input, float* output, int rows) {
     return glm53_sinkhorn_cuda(input, output, rows, at::cuda::getCurrentCUDAStream());
@@ -528,6 +549,16 @@ extern "C" int rs_stream_sync() { return cudaStreamSynchronize(at::cuda::getCurr
 
 // Return unused cached blocks to the driver (load-time temporaries, e.g. C12 encoding); live tensors stay valid.
 extern "C" void rs_empty_cache() {c10::cuda::CUDACachingAllocator::emptyCache();}
+// Caps the caching allocator of device 0 at `fraction` of the device memory (allocations beyond fail with a CUDA OOM
+// error instead of taking the unified memory the OS needs); total device memory in *total.
+extern "C" int rs_cuda_set_memory_fraction(double fraction, int64_t* total) {
+    size_t free = 0, tot = 0;
+    auto rc = cudaMemGetInfo(&free, &tot);
+    if (rc != cudaSuccess) return int(rc);
+    *total = (int64_t)tot;
+    c10::cuda::CUDACachingAllocator::setMemoryFraction(fraction, 0);
+    return 0;
+}
 static int graph_begin_in(c10::MempoolId_t pool);
 extern "C" int rs_graph_begin() { return graph_begin_in(c10::MempoolId_t{0, 0}); }
 // Capture into a memory pool shared by every graph captured with the same key (Qwen decode graphs: they replay one
@@ -667,6 +698,28 @@ static bool rdma_big_on(){const char* on=std::getenv("GLM53_RDMA_BIG");return g_
 extern "C" size_t glm53_rdma_ar_max_bytes();
 extern "C" int glm53_rdma_ar_cuda(float*,long long,cudaStream_t);
 static bool g_rdma_ready = false;
+// N-way lean RDMA allreduce (rdma_arn.cu, GLM53_RDMA_ARN_INIT=1): its link exchange goes through the process group's
+// TCPStore, wrapped here so the .cu file needs no c10d headers.
+extern "C" int glm53_rdma_arn_init(int,int,int(*)(const char*,const void*,size_t),int(*)(const char*,void*,size_t));
+extern "C" size_t glm53_rdma_arn_max_bytes();
+extern "C" int glm53_rdma_arn_cuda(float*,long long,cudaStream_t);
+extern "C" int glm53_rdma_arn_big_cuda(float*,long long,cudaStream_t);
+extern "C" int glm53_rdma_arn_big_bf16_cuda(float*,long long,cudaStream_t);
+extern "C" int glm53_rdma_arn_send_cuda(float*,long long,cudaStream_t);
+extern "C" int glm53_rdma_arn_materialize_cuda(float*,long long,int,cudaStream_t);
+extern "C" int glm53_rdma_arn_rows_cuda(const void*,void*,long long,int,cudaStream_t);
+static bool g_rdma_arn_ready = false;
+static int g_world = 1;
+static c10::intrusive_ptr<c10d::Store> g_store;
+static int store_set(const char* k, const void* v, size_t n) {
+    try { const auto* b = static_cast<const uint8_t*>(v); g_store->set(k, std::vector<uint8_t>(b, b + n)); return 0; }
+    catch (const std::exception& e) { fprintf(stderr, "[shim] store set %s: %s\n", k, e.what()); return 1; }
+}
+static int store_get(const char* k, void* v, size_t n) {
+    try { auto b = g_store->get(k); std::memcpy(v, b.data(), std::min(n, b.size())); return 0; }
+    catch (const std::exception& e) { fprintf(stderr, "[shim] store get %s: %s\n", k, e.what()); return 1; }
+}
+static bool rdma_arn_on() { const char* on = std::getenv("GLM53_RDMA_AR"); return g_rdma_arn_ready && on && std::strcmp(on, "1") == 0; }
 extern "C" int rs_pg_init(int rank, int world, const char* master_addr, int port) {
     try {
         c10d::TCPStoreOptions so;
@@ -675,6 +728,8 @@ extern "C" int rs_pg_init(int rank, int world, const char* master_addr, int port
         so.numWorkers = world;
         so.waitWorkers = true;
         auto store = c10::make_intrusive<c10d::TCPStore>(std::string(master_addr), so);
+        g_store = store;
+        g_world = world;
         auto opts = c10d::ProcessGroupNCCL::Options::create();
         opts->timeout = std::chrono::seconds(std::getenv("GLM53_NCCL_TIMEOUT_S")?std::atoi(std::getenv("GLM53_NCCL_TIMEOUT_S")):180);
         g_pg = c10::make_intrusive<c10d::ProcessGroupNCCL>(store, rank, world, opts);
@@ -703,6 +758,13 @@ extern "C" int rs_pg_init(int rank, int world, const char* master_addr, int port
             TORCH_CHECK(world == 2, "lean RDMA allreduce is TP2 only");
             TORCH_CHECK(glm53_rdma_ar_init(rank) == 0, "lean RDMA allreduce init failed");
             g_rdma_ready = true;
+        }
+        const char* arn_init = std::getenv("GLM53_RDMA_ARN_INIT");
+        if (arn_init && std::strcmp(arn_init, "1") == 0) {
+            TORCH_CHECK(!g_rdma_ready, "GLM53_RDMA_AR_INIT and GLM53_RDMA_ARN_INIT are exclusive");
+            const int rc = glm53_rdma_arn_init(rank, world, store_set, store_get);
+            TORCH_CHECK(rc == 0, "N-way RDMA allreduce init failed rc=", rc);
+            g_rdma_arn_ready = true;
         }
         const char* big_init = std::getenv("GLM53_RDMA_BIG_INIT");
         if (big_init && std::strcmp(big_init, "1") == 0) {
@@ -733,9 +795,79 @@ extern "C" int rs_runtime_shutdown() {
     }
 }
 
+// In-place FP32 sum whose transport carries BF16 (TP3 RDMA path; prefill-size layer outputs): the result is the
+// BF16-rounded rank-ordered sum of the BF16-rounded partials, identical on every rank. 1 when unavailable.
+// Communication stream (DS41 prefill compute/communication overlap): with rs_comm_mode(1) every all-reduce runs on
+// one dedicated stream in issue order (the RDMA all-reduce kernels keep a device-side sequence: two streams issuing
+// them concurrently would interleave), forked from and (synchronous calls) joined back to the current stream;
+// rs_allreduce_bf16t_async leaves it running and returns an event handle for rs_ar_wait.
+static cudaStream_t g_comm = nullptr;
+static bool g_comm_mode = false;
+static cudaEvent_t g_comm_ev[64];
+static int g_comm_next = 0;
+static int comm_init() {
+    if (g_comm) return 0;
+    if (cudaStreamCreateWithFlags(&g_comm, cudaStreamNonBlocking) != cudaSuccess) return 1;
+    for (auto& e : g_comm_ev) if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) return 1;
+    return 0;
+}
+static int comm_fork(cudaStream_t cur) {
+    cudaEvent_t e = g_comm_ev[g_comm_next]; g_comm_next = (g_comm_next + 1) % 64;
+    if (cudaEventRecord(e, cur) != cudaSuccess) return 1;
+    return cudaStreamWaitEvent(g_comm, e, 0) == cudaSuccess ? 0 : 1;
+}
+static int comm_done() {   // event after the work issued so far on the comm stream: its handle
+    const int h = g_comm_next; g_comm_next = (g_comm_next + 1) % 64;
+    return cudaEventRecord(g_comm_ev[h], g_comm) == cudaSuccess ? h : -1;
+}
+extern "C" int rs_comm_mode(int on) {
+    if (on && comm_init()) return 1;
+    if (!on && g_comm_mode) {   // leaving: the current stream waits for everything on the comm stream
+        const int h = comm_done(); if (h < 0) return 1;
+        if (cudaStreamWaitEvent(at::cuda::getCurrentCUDAStream().stream(), g_comm_ev[h], 0) != cudaSuccess) return 1;
+    }
+    g_comm_mode = on != 0;
+    return 0;
+}
+extern "C" int rs_ar_wait(int h) {
+    if (h < 0 || h >= 64) return 1;
+    return cudaStreamWaitEvent(at::cuda::getCurrentCUDAStream().stream(), g_comm_ev[h], 0) == cudaSuccess ? 0 : 1;
+}
+// in comm mode: run `f(stream)` on the comm stream, joined back (sync) or not (returns the handle)
+extern "C++" template <class F> inline int on_comm(F f, bool join) {
+    cudaStream_t cur = at::cuda::getCurrentCUDAStream().stream();
+    if (comm_fork(cur)) return -2;
+    const int rc = f(g_comm);
+    if (rc) return -3;
+    const int h = comm_done(); if (h < 0) return -4;
+    if (join) return cudaStreamWaitEvent(cur, g_comm_ev[h], 0) == cudaSuccess ? 0 : -5;
+    return h;
+}
+extern "C" int rs_allreduce_bf16t(void* p, int64_t numel) {
+    if (!rdma_arn_on()) return 1;
+    if (g_comm_mode) { const int r = on_comm([&](cudaStream_t s) { return glm53_rdma_arn_big_bf16_cuda(static_cast<float*>(p), numel, s); }, true); return r == 0 ? 0 : 2; }
+    return glm53_rdma_arn_big_bf16_cuda(static_cast<float*>(p), numel, at::cuda::getCurrentCUDAStream());
+}
+// >= 0: handle for rs_ar_wait; < 0: not started (caller reduces synchronously)
+extern "C" int rs_allreduce_bf16t_async(void* p, int64_t numel) {
+    if (!rdma_arn_on() || !g_comm_mode) return -1;
+    return on_comm([&](cudaStream_t s) { return glm53_rdma_arn_big_bf16_cuda(static_cast<float*>(p), numel, s); }, false);
+}
 // 原地 allreduce(SUM);wait() 只挂流依赖,不阻塞 host。
 extern "C" int rs_allreduce(void* p, int64_t numel, int dtype) {
     try {
+        if (rdma_arn_on() && dtype == 2) {
+            // N-way: every FP32 size goes over RDMA, larger buffers as a sequence of slot-sized calls (each a complete
+            // rank-ordered sum, same order on all ranks), so TP3 never depends on NCCL's transport for data.
+            const int64_t maxn = (int64_t)(glm53_rdma_arn_max_bytes() / 4);
+            if (g_comm_mode) {
+                const int r = on_comm([&](cudaStream_t s) { return numel > maxn ? glm53_rdma_arn_big_cuda(static_cast<float*>(p), numel, s)
+                                                                                 : glm53_rdma_arn_cuda(static_cast<float*>(p), numel, s); }, true);
+                return r == 0 ? 0 : 2;
+            }
+            if (numel > maxn) return glm53_rdma_arn_big_cuda(static_cast<float*>(p), numel, at::cuda::getCurrentCUDAStream());
+            return glm53_rdma_arn_cuda(static_cast<float*>(p), numel, at::cuda::getCurrentCUDAStream());
+        }
         if (g_rdma_ready && dtype == 2 && (size_t)numel * 4 <= glm53_rdma_ar_max_bytes()) {
             const char* on = std::getenv("GLM53_RDMA_AR");
             if (on && std::strcmp(on, "1") == 0)
@@ -759,9 +891,14 @@ extern "C" int rs_allreduce(void* p, int64_t numel, int dtype) {
 extern "C" int glm53_rdma_ar_send_cuda(float*,long long,cudaStream_t);
 extern "C" int glm53_rdma_ar_materialize_cuda(float*,long long,int,cudaStream_t);
 extern "C" int rs_ar_materialize(float* p, int64_t numel, int round_half) {
+    if (g_rdma_arn_ready) return glm53_rdma_arn_materialize_cuda(p, numel, round_half, at::cuda::getCurrentCUDAStream());
     return glm53_rdma_ar_materialize_cuda(p, numel, round_half, at::cuda::getCurrentCUDAStream());
 }
 extern "C" int rs_allreduce_send(void* p, int64_t numel) {
+    if (rdma_arn_on()) {
+        if ((size_t)numel * 4 > glm53_rdma_arn_max_bytes()) return 1;
+        return glm53_rdma_arn_send_cuda(static_cast<float*>(p), numel, at::cuda::getCurrentCUDAStream()) == 0 ? 0 : 2;
+    }
     const char* on = std::getenv("GLM53_RDMA_AR");
     if (!g_rdma_ready || !on || std::strcmp(on, "1") != 0 || (size_t)numel * 4 > glm53_rdma_ar_max_bytes()) return 1;
     const int rc = glm53_rdma_ar_send_cuda(static_cast<float*>(p), numel, at::cuda::getCurrentCUDAStream());
@@ -775,7 +912,10 @@ extern "C" int rs_reduce_scatter(void* in, void* out, int64_t numel_out, int dty
         // P5: FP32 over both RoCE ports (bitwise equal: 2-rank sum x0+x1).
         if (rdma_big_on() && dtype == 2 && (unsigned long long)numel_out * 4 <= glm53_rdma_big_max_bytes() && ((unsigned long long)numel_out * 4) % 16 == 0)
             return glm53_rdma_big_reduce_scatter(in, out, (unsigned long long)numel_out * 4, at::cuda::getCurrentCUDAStream());
-        auto i = blob(in, {numel_out * 2}, dtype);auto o = blob(out, {numel_out}, dtype);
+        // TP3: row blocks over the N-way RDMA (NCCL is socket-only there)
+        if (rdma_arn_on() && dtype == 2 && (numel_out * 4) % 16 == 0)
+            return glm53_rdma_arn_rows_cuda(in, out, numel_out * 4, 0, at::cuda::getCurrentCUDAStream());
+        auto i = blob(in, {numel_out * g_world}, dtype);auto o = blob(out, {numel_out}, dtype);
         c10d::ReduceScatterOptions opts;opts.reduceOp=c10d::ReduceOp::SUM;
         g_pg->_reduce_scatter_base(o, i, opts)->wait();return 0;
     } catch (const std::exception& e) {fprintf(stderr, "[shim] reduce_scatter: %s\n", e.what());return 1;}
@@ -786,7 +926,7 @@ extern "C" int rs_reduce_scatter(void* in, void* out, int64_t numel_out, int dty
 static thread_local std::vector<c10::intrusive_ptr<c10d::Work>> g_works;static thread_local int g_works_open=0;
 extern "C" int rs_reduce_scatter_async(void* in, void* out, int64_t numel_out, int dtype) {
     try {
-        auto i = blob(in, {numel_out * 2}, dtype);auto o = blob(out, {numel_out}, dtype);
+        auto i = blob(in, {numel_out * g_world}, dtype);auto o = blob(out, {numel_out}, dtype);
         c10d::ReduceScatterOptions opts;opts.reduceOp=c10d::ReduceOp::SUM;
         g_works.push_back(g_pg->_reduce_scatter_base(o, i, opts));g_works_open++;return (int)g_works.size()-1;
     } catch (const std::exception& e) {fprintf(stderr, "[shim] reduce_scatter_async: %s\n", e.what());return -1;}
@@ -801,7 +941,7 @@ extern "C" int rs_work_wait(int h) {
 // so kernels launched in between overlap it (same bytes as rs_all_gather).
 extern "C" int rs_all_gather_async(void* in, void* out, int64_t numel_in, int dtype) {
     try {
-        auto i = blob(in, {numel_in}, dtype);auto o = blob(out, {numel_in * 2}, dtype);
+        auto i = blob(in, {numel_in}, dtype);auto o = blob(out, {numel_in * g_world}, dtype);
         g_works.push_back(g_pg->_allgather_base(o, i));g_works_open++;return (int)g_works.size()-1;
     } catch (const std::exception& e) {fprintf(stderr, "[shim] all_gather_async: %s\n", e.what());return -1;}
 }
@@ -810,7 +950,9 @@ extern "C" int rs_all_gather(void* in, void* out, int64_t numel_in, int dtype) {
         const int64_t esize = dtype == 2 ? 4 : (dtype == 3 ? 8 : 2);
         if (rdma_big_on() && (unsigned long long)(numel_in * esize) <= glm53_rdma_big_max_bytes() && (numel_in * esize) % 16 == 0)
             return glm53_rdma_big_all_gather(in, out, (unsigned long long)(numel_in * esize), at::cuda::getCurrentCUDAStream());
-        auto i = blob(in, {numel_in}, dtype);auto o = blob(out, {numel_in * 2}, dtype);
+        if (rdma_arn_on() && (numel_in * esize) % 16 == 0)
+            return glm53_rdma_arn_rows_cuda(in, out, numel_in * esize, 1, at::cuda::getCurrentCUDAStream());
+        auto i = blob(in, {numel_in}, dtype);auto o = blob(out, {numel_in * g_world}, dtype);
         g_pg->_allgather_base(o, i)->wait();return 0;
     } catch (const std::exception& e) {fprintf(stderr, "[shim] all_gather: %s\n", e.what());return 1;}
 }
@@ -837,6 +979,11 @@ extern "C" int rs_shared_latent(const float* q,const void* latent,const int64_t*
 void reconstruct(at::Tensor,at::Tensor,int,bool,bool);
 void had_r_128(at::Tensor const&,at::Tensor const&,std::optional<at::Tensor> const&,std::optional<at::Tensor> const&,float);
 // Decoded EXL3 weights (mcg codebook, 4 bits) of one expert projection: inner [k, n] fp16 (glm-moe-ab reference).
+// Any trellis width K (mixed-K experts; glm-moe-ab reference): tr [k/16, n/16, 16 K].
+extern "C" int rs_exl3_inner_k(const void* tr_p,void* inner_p,int64_t k,int64_t n,int64_t bits){
+    try{reconstruct(blob(inner_p,{k,n},0),blob(tr_p,{k/16,n/16,16*bits},1),bits,true,false);return 0;}
+    catch(const std::exception& e){fprintf(stderr,"[exl3-inner] %s\n",e.what());return -1;}
+}
 extern "C" int rs_exl3_inner(const void* tr_p,void* inner_p,int64_t k,int64_t n){
     try{reconstruct(blob(inner_p,{k,n},0),blob(tr_p,{k/16,n/16,64},1),4,true,false);return 0;}
     catch(const std::exception& e){fprintf(stderr,"[exl3-inner] %s\n",e.what());return -1;}
@@ -1051,12 +1198,17 @@ extern "C" int glm53_kda_conv_silu_l2_cuda(const float*,const float*,const float
 extern "C" int rs_kda_conv_silu_l2(const float* base,const float* projected,const float* wall,float* q,float* k,float* v,int t,int h,float scale){
     return glm53_kda_conv_silu_l2_cuda(base,projected,wall,q,k,v,t,h,scale,at::cuda::getCurrentCUDAStream());
 }
-extern "C" int glm53_mhc_post_pre_fused_cuda(const float*,const float*,const float*,const float*,float*,const void*,int,const float*,const float*,const float*,float*,float*,float*,float*,int,int,cudaStream_t);
-extern "C" int rs_mhc_post_pre_fused(const float* x,const float* residual,const float* comb,const float* post,float* out,const void* fn,int fn_bf16,const float* scale,const float* base,const float* ln,float* partial,float* z,float* post_next,float* comb_next,int rows,int h){
-    return glm53_mhc_post_pre_fused_cuda(x,residual,comb,post,out,fn,fn_bf16,scale,base,ln,partial,z,post_next,comb_next,rows,h,at::cuda::getCurrentCUDAStream());
+extern "C" int glm53_mhc_post_pre_fused_cuda(const float*,const float*,const float*,const float*,float*,const void*,int,const float*,const float*,const float*,float*,float*,float*,float*,int,int,const int8_t*,int,__half*,const SparkClamp*,cudaStream_t);
+extern "C" int rs_mhc_post_pre_fused(const float* x,const float* residual,const float* comb,const float* post,float* out,const void* fn,int fn_bf16,const float* scale,const float* base,const float* ln,float* partial,float* z,float* post_next,float* comb_next,int rows,int h,
+    const void* rsign,int rbk,void* zr,const void* clamp){
+    return glm53_mhc_post_pre_fused_cuda(x,residual,comb,post,out,fn,fn_bf16,scale,base,ln,partial,z,post_next,comb_next,rows,h,(const int8_t*)rsign,rbk,(__half*)zr,(const SparkClamp*)clamp,at::cuda::getCurrentCUDAStream());
 }
 
 extern "C" int glm53_latent_attention_fp8_cuda(const float*,const void*,const long long*,float*,float*,int,int,int,int,int,cudaStream_t);
+extern "C" int glm53_latent_attention_fp8_tc_cuda(const float*,const void*,const long long*,float*,float*,int,int,int,int,int,cudaStream_t);
+extern "C" int rs_latent_attention_fp8_tc(const float* q,const void* latent,const int64_t* ids,float* out,float* scratch,int heads,int queries,int slots,int stride,int splits){
+    return glm53_latent_attention_fp8_tc_cuda(q,latent,reinterpret_cast<const long long*>(ids),out,scratch,heads,queries,slots,stride,splits,at::cuda::getCurrentCUDAStream());
+}
 extern "C" int rs_latent_attention_fp8(const float* q,const void* latent,const int64_t* ids,float* out,float* scratch,int heads,int queries,int slots,int stride,int splits){
     return glm53_latent_attention_fp8_cuda(q,latent,reinterpret_cast<const long long*>(ids),out,scratch,heads,queries,slots,stride,splits,at::cuda::getCurrentCUDAStream());
 }

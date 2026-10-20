@@ -5,12 +5,13 @@ into the residual stream along a "refusal direction". It changes the model's beh
 requests the original model declines, **including harmful ones**. Everything here is **off by default** and nothing in
 the engine enables it implicitly.
 
-The engine has two independent mechanisms, usable alone or together, both opt-in via environment variables:
+The engine has three independent mechanisms, usable alone or together, both opt-in via environment variables:
 
 | Mechanism | Switch | Models | What it does |
 | --- | --- | --- | --- |
 | o_proj transplant | `GLM53_ABLIT` | GLM-5.3-Flash | Loads layers 15–44's attention `o_proj` from an abliterated donor checkpoint of the same model (byte copy, verified) instead of the originals. |
 | Direction ablation | `SPARK_ABLATE` | GLM, Qwen | Removes one or more refusal directions (computed by the engine from your own prompt sets) from everything each layer writes into the residual stream. |
+| Conditional clamp | `SPARK_ABLATE_CLAMP` (DeepSeek: `DS41_ABLATE_CLAMP`) | GLM, DeepSeek-V4.1-Flash | Clips the component of each sublayer input along a few refusal directions into the range ordinary text occupies; text inside the range is left bitwise unchanged. |
 
 ## 1. o_proj transplant (GLM-5.3-Flash)
 
@@ -68,6 +69,34 @@ SPARK_ABLATE=/path/dirs.safetensors          # set in spark.env or the start scr
 A single direction is often weak; a small subspace (e.g. `subspace:16-40:8`) is usually needed to drop the refusal rate
 substantially without hurting ordinary answers. Validate the effect yourself and check answer quality, not just refusal
 rate.
+
+## 3. Conditional clamp (`SPARK_ABLATE_CLAMP`, GLM and DeepSeek-V4.1-Flash)
+
+Instead of removing directions everywhere, the clamp edits only what falls outside the range of ordinary text: for each
+sublayer input (attention and MLP, the mHC pre output) and the final hidden state, the component `c` along each
+direction is clipped into `[tau_lo, tau]` (or moved to an optional `target`, e.g. the harmless median). Ordinary text
+stays inside the thresholds and is not changed; the residual streams and the drafter's features are never edited. A
+count gate (`SPARK_ABLATE_CLAMP_MIN=m`) edits a token only once `m` sites have triggered for it in the same forward
+pass, so isolated threshold crossings in ordinary text pass through. The edit is fused into the mHC pre kernel.
+
+The calibration file is a safetensors with `directions` [k, hidden] (orthonormal rows), `tau` / `tau_lo` [layers, 2, k],
+`tau_final` / `tau_final_lo` [k] and optionally `target` / `target_final` (format details in `engine-rs/src/ablate.rs`).
+`SPARK_ABLATE_CLAMP_STATS=<dir>` records the raw projections of a prefill for calibration (high quantiles of ordinary
+text's projections). No calibration file is distributed with this project.
+
+```bash
+# DeepSeek-V4.1-Flash (spark.env, same file on all three nodes; the file at the same path on every node)
+DS41_ABLATE_CLAMP=/models/ds41-clamp.safetensors
+DS41_ABLATE_MIN=12            # count gate (default 12)
+# GLM-5.3-Flash
+SPARK_ABLATE_CLAMP=/models/glm-clamp.safetensors
+SPARK_ABLATE_CLAMP_MIN=8
+```
+
+The project's own measurement on DeepSeek-V4.1-Flash-1017 (TP3, m = 12, 64 harmful and 64 harmless prompts): harmful
+prompts refused 3/64, harmless prompts refused 2/64 (unablated, on the original V4.1 release: 62/64 and 1/64); single-stream decode 51.8 / 96.1 / 88.4 tok/s
+(prose / structured / code), within the unablated range; draft acceptance not reduced. The clamp settings are part of
+the prefix-cache identity, so ablated and unablated runs never share cached prefixes.
 
 ## Performance
 

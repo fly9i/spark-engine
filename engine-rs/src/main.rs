@@ -3,11 +3,15 @@
 //! parity / kda-probe / shim-smoke / greedy。
 //! (main.rs 于 2026-09-21 从补丁堆积中整体重写;核心模块未动。)
 
+mod pcache_golden;
 mod host_memory;
 mod qwen;
+mod ds41;
 mod pcache;
+mod pcache_core;
 mod expert_load;
 mod kv_pool;
+mod mm_canvas;
 mod acceptance;
 mod sampling;
 mod benchmark;
@@ -64,6 +68,9 @@ mod moe;
 mod moefast;
 mod moe_own;
 mod ablate;
+mod spx_hess;
+mod spx_dhess;
+mod spx;
 mod nibmap;
 mod safetensors;
 mod tp;
@@ -85,6 +92,12 @@ fn main() {
                                                          args[6].parse().unwrap(), &args[7]),
         Some("qwen-spec") => qwen::probe::spec(Path::new(&args[2]), Path::new(&args[3]),
             args.get(4).and_then(|s| s.parse().ok()).unwrap_or(128), args.get(5).and_then(|s| s.parse().ok()).unwrap_or(3)),
+        Some("spx-hessian") => spx_hess::run(Path::new(&args[2])),
+        Some("spx-selftest") => spx::selftest(args.get(2).map(Path::new)),
+        Some("spx-mm8-test") => spx::mm8_test(),
+        Some("expert-load-test") => expert_load::load_test(Path::new(args.get(2).expect("expert-load-test DIR [N_LAYERS]")),args.get(3).map_or(8,|v|v.parse().unwrap())),
+        Some("spx-swiglu-test") => spx::swiglu_test(),
+        Some("mla-tc-test") => mla_latent::tc_test(),
         Some("glm-refusal-dir") => ablate::glm_refusal_dir(Path::new(&args[2]), Path::new(&args[3]), Path::new(&args[4]), Path::new(&args[5])),
         Some("qwen-pcache-selftest") => qwen::probe::pcache_selftest(Path::new(&args[2])),
         Some("qwen-refusal-dir") => qwen::probe::refusal_dir(Path::new(&args[2]), Path::new(&args[3]), Path::new(&args[4]), Path::new(&args[5])),
@@ -186,8 +199,30 @@ fn main() {
         Some("tp-pack-probe") => moe::tp_pack_probe(Path::new(&args[2]),Path::new(&args[3])),
         Some("tp-pack-full") => kernel_bench::tp_pack_full(Path::new(&args[2]),Path::new(&args[3])),
         Some("allreduce-latency") => tp::allreduce_latency_probe(Path::new(&args[2])),
+        Some("pcache-golden") => pcache_golden::run(Path::new(&args[2])),
+        Some("ds41-ckpt-test") => ds41::probe::ckpt_test(Path::new(&args[2]),&args[3],args[4].parse().expect("p"),args.get(5).map_or(4096,|v|v.parse().expect("len"))),
+        Some("ds41-golden") => ds41::probe::golden(Path::new(&args[2]),Path::new(&args[3]),&args[4],Path::new(&args[5]),args.get(6).map_or(4,|v|v.parse().expect("decode_tail"))),
+        Some("ds41-serve") => ds41::serve::serve(Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4])),
+        Some("ds41-shard") => ds41::shard::shard(Path::new(&args[2]),Path::new(&args[3]),args[4].parse().unwrap(),args[5].parse().unwrap()),
+        Some("ds41-bench") => ds41::probe::bench(Path::new(&args[2]),&args[3],args[4].parse().expect("prompt_len"),args[5].parse().expect("decode_n"),args.get(6).map_or(2048,|v|v.parse().expect("chunk"))),
+        Some("ds41-shard-mtp") => ds41::shard::shard_mtp(Path::new(&args[2]),Path::new(&args[3]),args[4].parse().expect("rank"),args[5].parse().expect("world")),
+        Some("ds41-dspark-golden") => ds41::probe::dspark_golden(Path::new(&args[2]),&args[3],Path::new(&args[4])),
+        Some("ds41-shard-pack") => ds41::shard::shard_pack(Path::new(&args[2])),
+        Some("ds41-spec") => ds41::probe::spec(Path::new(&args[2]),&args[3],Path::new(&args[4]),args[5].parse().expect("n_new"),args.get(6).map_or(0.0,|v|v.parse().expect("temperature"))),
+        Some("ds41-ar-bench") => ds41::probe::ar_bench(),
+        Some("ds41-gemv-bench") => ds41::kern::gemv_bench(),
+        Some("ds41-kernel-test") => ds41::kern::test(Path::new(&args[2])),
+        Some("tp-rsag-probe") => tp::rsag_probe(Path::new(&args[2]),args.get(3).map_or(4096,|v|v.parse().unwrap()),args.get(4).map_or(4096,|v|v.parse().unwrap())),
+        Some("ds41-vision-probe") => ds41::vision::probe(&args),
+        Some("ds41-hash-check") => ds41::probe::hash_check(Path::new(&args[2])),
+        Some("ds41-refusal-dir") => ds41::probe::refusal_dir(Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4]),Path::new(&args[5]),Path::new(&args[6])),
+        Some("ds41-clamp-test") => ds41::probe::clamp_norm_test(),
+        Some("ds41-feed") => ds41::probe::feed(Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4])),
+        Some("tp-arn-probe") => tp::arn_probe(Path::new(&args[2]),args.get(3).map_or(5120,|v|v.parse().expect("dim"))),
         Some("ar-fused-probe") => mhc::ar_fused_probe(Path::new(&args[2])),
         Some("draft-head-probe") => dflash::head_probe(),
+        Some("draft-head32-test") => dflash::head32_test(),
+        Some("clamp-test") => ablate::clamp_test(),
         Some("tp-network-probe") => tp::network_probe(Path::new(&args[2])),
         Some("vocab-probe") => vocab_probe::run(Path::new(&args[2]),Path::new(&args[3])),
         Some("spec-decode") => {

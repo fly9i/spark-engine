@@ -72,14 +72,22 @@ pub fn cuda_snapshot(reset_peak:bool)->Value {
 /// ~20 GB of duplicate weight bytes that kswapd must otherwise reclaim under pressure.
 pub fn release_file_cache(dirs:&[&std::path::Path]) {
     if std::env::var("GLM53_RELEASE_FILE_CACHE").as_deref()!=Ok("1"){return;}
+    let roots:Vec<std::path::PathBuf>=dirs.iter().filter_map(|d|std::fs::canonicalize(d).ok()).collect();
+    let mut files=Vec::new();
+    for root in &roots {if let Ok(rd)=std::fs::read_dir(root){for e in rd.flatten(){let p=e.path();
+        if p.extension().map_or(false,|e|e=="safetensors"){files.push(p);}}}}
+    release_files(&files);
+}
+
+/// release_file_cache for an explicit list of files (DS41: the source checkpoint without the engram tables, which
+/// decode still reads through the mapping). Same switch (GLM53_RELEASE_FILE_CACHE=1).
+pub fn release_files(paths:&[std::path::PathBuf]) {
+    if std::env::var("GLM53_RELEASE_FILE_CACHE").as_deref()!=Ok("1"){return;}
     extern "C" {fn madvise(addr:*mut std::ffi::c_void,len:usize,advice:i32)->i32;fn posix_fadvise(fd:i32,offset:i64,len:i64,advice:i32)->i32;}
     const MADV_DONTNEED:i32=4;const POSIX_FADV_DONTNEED:i32=4;
     let before=snapshot();let now=std::time::Instant::now();
-    let roots:Vec<std::path::PathBuf>=dirs.iter().filter_map(|d|std::fs::canonicalize(d).ok()).collect();
     // HF snapshots are symlinks into blobs/: match mappings by the resolved file path.
-    let mut files=std::collections::BTreeSet::new();
-    for root in &roots {if let Ok(rd)=std::fs::read_dir(root){for e in rd.flatten(){let p=e.path();
-        if p.extension().map_or(false,|e|e=="safetensors"){if let Ok(c)=std::fs::canonicalize(&p){files.insert(c);}}}}}
+    let files:std::collections::BTreeSet<std::path::PathBuf>=paths.iter().filter_map(|p|std::fs::canonicalize(p).ok()).collect();
     let maps=std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
     let (mut ranges,mut bytes)=(0usize,0usize);
     for line in maps.lines() {

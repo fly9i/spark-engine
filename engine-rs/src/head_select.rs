@@ -1,7 +1,8 @@
 //! Exact vocabulary-sharded verifier top-1, without a full-vocabulary SUM.
 //! MaxOps and ArgMaxOps use the same GreaterOrNan rule in ATen: NaNs win,
 //! then the larger value, and the lowest index wins ties (including +/-0).
-//! Equal, contiguous shards ordered by rank make a rank tie the global-ID tie.
+//! Contiguous shards ordered by rank (crate::weights::vocab_part: TP2 halves, TP3 51712/51584/51584) make a rank tie the
+//! global-ID tie.
 use tch::{Kind,Tensor};
 
 pub(crate) fn enabled()->bool {
@@ -12,8 +13,7 @@ fn check_layout(local:&Tensor,start:i64,total:i64,rank:usize,world:usize) {
     assert_eq!(local.kind(),Kind::Float,"top1 packet must preserve FP32 head values");
     assert_eq!(local.dim(),2);assert!(local.size()[0]>0&&local.size()[1]>0);
     assert!(world>0&&rank<world);assert!(total>0&&total<(1i64<<24),"FP32 packet IDs must be exact");
-    assert_eq!(total,local.size()[1]*world as i64,"requires equal vocabulary shards");
-    assert_eq!(start,local.size()[1]*rank as i64,"requires contiguous rank-ordered shards");
+    assert_eq!((start,local.size()[1]),crate::weights::vocab_part(total,rank,world).range(total),"requires the contiguous rank-ordered vocab_part shards");
 }
 
 fn packet(local:&Tensor,start:i64,total:i64,rank:usize,world:usize)->Tensor {

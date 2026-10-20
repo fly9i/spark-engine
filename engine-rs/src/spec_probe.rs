@@ -507,6 +507,13 @@ fn copy_settings()->Option<(usize,usize)> {
 /// after it, else after the earliest occurrence (the most tokens); empty when the suffix never occurred before.
 /// The context is prompt ++ generated ++ [anchor].
 fn copy_proposal(prompt:&[i64],generated:&[i64],anchor:i64,m:usize,room:usize)->Vec<i64> {
+    // Salted media placeholders (crate::vision::MM_BASE..) are prompt-only ids with no embedding row: a proposal ends
+    // before the first one (copying them into the verifier tripped the embedding bounds check, 2026-10-14 18:36).
+    let mut v=copy_proposal_raw(prompt,generated,anchor,m,room);
+    if let Some(i)=v.iter().position(|&t|t>=crate::vision::MM_BASE) {v.truncate(i);}
+    v
+}
+fn copy_proposal_raw(prompt:&[i64],generated:&[i64],anchor:i64,m:usize,room:usize)->Vec<i64> {
     let (p,g)=(prompt.len(),generated.len());let l=p+g+1;
     if room==0 || l<=m {return Vec::new();}
     let at=|i:usize|->i64 {if i<p {prompt[i]} else if i<p+g {generated[i-p]} else {anchor}};
@@ -1493,15 +1500,19 @@ fn pcache_save(st:&mut Store,which:usize) {
 struct Seq {id:serde_json::Value,store:usize,prompt:Vec<i64>,consumed:usize,max_new:usize,anchor:i64,decoding:bool,
     generated:Vec<i64>,emitted:usize,deferred:Option<Tensor>,hit:usize,rounds:usize,accepted:usize,
     queued_ms:f64,prefill_ms:f64,started:Instant,decode_started:Option<Instant>,stop_ids:Vec<i64>,cancel:bool,temp:f32,seed:u64,drafted:usize,boundary:usize,
+    /// Fork checkpoint position (GLM53_SERVE_FORK_CKPT; 0: none): where the prompt diverges from a cached sequence, chosen by rank0.
+    fork:usize,
     /// Prefix cache restore from disk: admission to installed (ms, 0 otherwise), and the background load while it runs.
     disk_ms:f64,load:Option<(u64,crate::pcache::Loading)>,
     /// rank0: media items of this prompt and their encoded segments (salted placeholders, crate::vision).
     mm:Option<crate::vision::MmState>,
     /// Copy drafts (GLM53_COPY_DRAFTS): rounds that verified a copied chain, its drafts, and how many were accepted.
-    copy:(usize,usize,usize)}
+    copy:(usize,usize,usize),
+    /// GLM53_DEPTH_ONLINE: this request's online calibration of the rate depth table.
+    online:crate::spec_policy::Online}
 const SERVE_EOS:[i64;3]=[154820,154827,154829];
 // Broadcast opcodes (header = 8 f32: [op, a..g]).
-const OP_BEAT:i32=0;const OP_EVICT:i32=1;const OP_ADMIT:i32=2;const OP_PREFILL:i32=3;const OP_ROUND:i32=4;const OP_SHUTDOWN:i32=5;const OP_CANCEL:i32=6;const OP_MULTI:i32=7;const OP_LOADED:i32=8;
+const OP_BEAT:i32=0;const OP_EVICT:i32=1;const OP_ADMIT:i32=2;const OP_PREFILL:i32=3;const OP_ROUND:i32=4;const OP_SHUTDOWN:i32=5;const OP_CANCEL:i32=6;const OP_MULTI:i32=7;const OP_LOADED:i32=8;const OP_PREWARM:i32=9;const OP_GROW:i32=10;
 
 /// M2 checkpoint library (GLM53_SERVE_CKPT_LIB_MB, e.g. 4096; default 0 = off until qualified): prompt/boundary checkpoints of
 /// stores that are evicted or reset are kept, together with the latent rows and complete DSA pool rows below
@@ -1692,6 +1703,7 @@ fn serve_prefill(eng:&mut Engine,draft:&Drafter,st:&mut Store,seq:&mut Seq,chunk
     let t0=Instant::now();let begin=seq.consumed;
     let mut end=(seq.consumed+chunk).min(seq.prompt.len());
     if seq.boundary>seq.consumed && seq.boundary<end {end=seq.boundary;}   // stop at the boundary checkpoint
+    if seq.fork>seq.consumed && seq.fork<end {end=seq.fork;}               // and at the fork checkpoint
     let input=Tensor::from_slice(&seq.prompt[seq.consumed..end]).to_device(eng.w.device);
     // Salted media placeholders in this chunk: every rank zeroes those embedding rows, rank0 fills them with the
     // vision rows (encoded now, only the segments this chunk touches) before the embedding allreduce.
@@ -1713,7 +1725,10 @@ fn serve_prefill(eng:&mut Engine,draft:&Drafter,st:&mut Store,seq:&mut Seq,chunk
     let done=seq.consumed==seq.prompt.len();
     if done {let last=l.get(l.size()[0]-1);seq.anchor=crate::sampling::sample_full(&last,seq.temp,crate::sampling::key(seq.seed,0));
         seq.decoding=true;seq.decode_started=Some(Instant::now());st.ckpt[0]=Some(ckpt_save(st,&seq.prompt,&last));pcache_save(st,0);}
-    else if seq.consumed==seq.boundary {st.ckpt[1]=Some(ckpt_save(st,&seq.prompt[..seq.boundary],&Tensor::zeros([1],(Kind::Float,eng.w.device))));pcache_save(st,1);}
+    else if seq.consumed==seq.boundary||seq.consumed==seq.fork {
+        // Prefix checkpoint (slot 1): before the last user turn, or where the prompt forks from a cached sequence. A fork
+        // before the boundary is replaced in memory by the boundary checkpoint; its disk copy stays for later requests.
+        st.ckpt[1]=Some(ckpt_save(st,&seq.prompt[..seq.consumed],&Tensor::zeros([1],(Kind::Float,eng.w.device))));pcache_save(st,1);}
     else {tch::Cuda::synchronize(0);}
     seq.prefill_ms+=t0.elapsed().as_secs_f64()*1000.;
     if std::env::var("GLM53_SERVE_LOG").as_deref()==Ok("1") {
@@ -1741,6 +1756,40 @@ fn ctrl_read(d:&mut std::net::TcpStream)->Option<(Vec<f32>,Vec<i64>)> {
     let mut pb=vec![0u8;n*8];d.read_exact(&mut pb).ok()?;
     Some((h,(0..n).map(|i|i64::from_le_bytes(pb[i*8..i*8+8].try_into().unwrap())).collect()))
 }
+/// GLM53_SERVE_DRAFT_SYNC (default on): every rank adopts rank0's draft decision (chain depth + drafted tokens) of
+/// each sequence in this round. Both ranks run the drafter; its confidences / paths are assumed bitwise equal across
+/// ranks, but 10-11 a GPTQ drafter gave depth 2 on rank0 and 3 on rank1 (round 215 of a spec run): the verify row
+/// counts diverged and the collectives deadlocked ~100 rounds later (rank0 spinning, rank1 idle). Rank0's outputs are
+/// unchanged; rank1 follows rank0 whenever they differ (logged). One FP32 allreduce per round: rank0 writes its lane,
+/// the other lane is zero, so the sum is exact (token ids < 2^24).
+fn draft_sync_enabled()->bool {std::env::var("GLM53_SERVE_DRAFT_SYNC").as_deref()!=Ok("0")}
+thread_local!{static DRAFT_SYNC_DIFFS:std::cell::Cell<u64>=const{std::cell::Cell::new(0)};}
+fn sync_drafts(items:&mut [(usize,Vec<i64>)]) {
+    let tp=crate::tp::world();
+    if !draft_sync_enabled() || tp.world<2 || items.is_empty() {return;}
+    const W:usize=16;   // depth + up to 15 tokens (GLM53_COPY_MAX <= 15, drafter depth <= 7)
+    let n=items.len();let mut host=vec![0f32;tp.world*n*W];
+    for (i,(d,p)) in items.iter().enumerate() {
+        assert!(*d<W && p.len()>=*d,"draft sync: depth {d} path {}",p.len());
+        let o=(tp.rank*n+i)*W;host[o]=*d as f32;
+        for (j,t) in p[..*d].iter().enumerate() {assert!((0..1<<24).contains(t));host[o+1+j]=*t as f32;}
+    }
+    // Only rank0's lane carries data in the sum; the other lanes are cleared before the reduction.
+    for r in 1..tp.world {for v in &mut host[r*n*W..(r+1)*n*W] {*v=0.;}}
+    if tp.rank!=0 {for v in &mut host[..] {*v=0.;}}
+    let t=Tensor::from_slice(&host).to_device(Device::Cuda(0));
+    crate::tp::allreduce(&t);
+    let got=Vec::<f32>::try_from(t.to_device(Device::Cpu)).unwrap();
+    for (i,item) in items.iter_mut().enumerate() {
+        let o=i*W;let d=got[o] as usize;let p:Vec<i64>=got[o+1..o+1+d].iter().map(|&v|v as i64).collect();
+        if (d,&p[..])!=(item.0,&item.1[..item.0]) {
+            assert!(tp.rank!=0,"draft sync: rank0 decision changed by the reduction");
+            let k=DRAFT_SYNC_DIFFS.with(|c|{c.set(c.get()+1);c.get()});
+            if k<=50 || k.is_power_of_two() {eprintln!("[draft-sync] rank{} adopted rank0's draft (#{k}): own depth {} path {:?} -> depth {d} path {:?}",tp.rank,item.0,&item.1[..item.0],p);}
+        }
+        *item=(d,p);
+    }
+}
 fn serve_round(eng:&mut Engine,draft:&Drafter,st:&mut Store,seq:&mut Seq)->bool {
     let n=seq.max_new;let anchor=seq.anchor;
     let log=std::env::var("GLM53_SERVE_LOG").as_deref()==Ok("1");let t0=Instant::now();
@@ -1758,9 +1807,10 @@ fn serve_round(eng:&mut Engine,draft:&Drafter,st:&mut Store,seq:&mut Seq)->bool 
     let c=copied.is_empty().then(||draft.propose(st.context.as_ref().unwrap(),anchor,&eng.w));
     crate::sampling::clear_draft_rows();
     let path=if let Some(c)=c.as_ref() {
-        if let (Some(tau),Some(conf))=(crate::dflash::conf_tau(),c.conf.as_ref()) {depth=crate::spec_policy::chain_depth(conf,depth,tau);}
+        if let (Some(tau),Some(conf))=(crate::dflash::conf_tau(),c.conf.as_ref()) {depth=crate::spec_policy::chain_depth_online(conf,depth,tau,Some(&seq.online));}
         c.path[..depth].to_vec()
     } else {depth=copied.len();copied};
+    let path={let mut it=[(depth,path)];sync_drafts(&mut it);let [(d,p)]=it;depth=d;p};
     let all=with_anchor(anchor,crate::speculative::chain(&path));
     seq.drafted+=depth;
     let g=seq.generated.len() as u64;
@@ -1779,6 +1829,7 @@ fn serve_round(eng:&mut Engine,draft:&Drafter,st:&mut Store,seq:&mut Seq)->bool 
             "ids":ids,"ids_shape":c.ids.size(),"unary":f(&c.unary),"edges":f(&c.edges),"edges_shape":c.edges.size(),"conf":c.conf,"rows":all.len(),"routes":routes});
         use std::io::Write;let mut o=std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();writeln!(o,"{line}").unwrap();}}
     seq.rounds+=1;seq.accepted+=verified.tokens.len()-1;
+    if let Some(conf)=c.as_ref().and_then(|c|c.conf.as_ref()) {if crate::spec_policy::online_enabled() {seq.online.observe(conf,depth,verified.tokens.len()-1);}}
     if c.is_none() {seq.copy.0+=1;seq.copy.1+=depth;seq.copy.2+=verified.tokens.len()-1;}
     seq.generated.extend(verified.tokens);st.state=verified.state;seq.anchor=verified.next;
     let finished=seq.generated.len()>=n || seq.generated.last().map_or(false,|t|SERVE_EOS.contains(t));
@@ -1847,6 +1898,7 @@ fn serve_round_multi(eng:&mut Engine,draft:&Drafter,stores:&mut Vec<Option<Store
     }
     tmark("draft_batch",&mut tt);
     settle_side_commit();   // previous round's side-stream commits (GLM53_MULTI_COMMIT_SIDE) before reading target state
+    let mut decided:Vec<(usize,i64,usize,Vec<i64>)>=Vec::new();   // (slot index, anchor, depth, drafted tokens)
     for (k,&slot) in slots.iter().enumerate() {
         let seq=active[slot].as_mut().unwrap();let n=seq.max_new;let anchor=seq.anchor;
         if seq.generated.len()+1==n || SERVE_EOS.contains(&anchor) {seq.generated.push(anchor);finished[k]=true;continue;}
@@ -1859,7 +1911,14 @@ fn serve_round_multi(eng:&mut Engine,draft:&Drafter,stores:&mut Vec<Option<Store
         else if let (Some(tau),Some(conf))=(crate::dflash::conf_tau(),c.conf.as_ref()) {let mut d=0;while d<depth && (conf[d] as f64)>=tau {d+=1;}depth=d.max(1).min(depth);}
         // Quantize the chain length to the allowed row counts (fewer distinct graphs); round up.
         if graphs {let max_depth=(remaining-1).min(cap);if let Some(r)=allowed.iter().copied().filter(|&r|r>=depth+1&&r-1<=max_depth).min(){depth=r-1;}}
-        let nodes=with_anchor(anchor,crate::speculative::chain(&c.path[..depth]));
+        decided.push((k,anchor,depth,c.path[..depth].to_vec()));
+    }
+    // Rank0's decisions on every rank (sync_drafts), then the verify plan.
+    let mut items:Vec<(usize,Vec<i64>)>=decided.iter().map(|(_,_,d,p)|(*d,p.clone())).collect();
+    sync_drafts(&mut items);
+    for ((k,anchor,_,_),(depth,path)) in decided.into_iter().zip(items) {
+        let seq=active[slots[k]].as_mut().unwrap();let st=stores[seq.store].as_ref().unwrap();
+        let nodes=with_anchor(anchor,crate::speculative::chain(&path));
         seq.drafted+=depth;
         let selection=ChainGraph::selection(&st.state,&nodes);
         plan.push((k,nodes,depth,selection,seq.store));
@@ -2000,7 +2059,7 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
     let expert_reader={let c=crate::config::load(&model.join("config.json")).unwrap();
         let weights_read=crate::weights::start_early_prefetch(model,c.num_hidden_layers,draft_dir);
         crate::expert_load::ExpertReader::start(model,c.num_hidden_layers,c.n_routed_experts,crate::tp::env_tp(),Device::Cuda(0),weights_read)};
-    tch::set_num_threads(4);let _guard=tch::no_grad_guard();let tp=crate::tp::init_from_env();assert_eq!(tp.world,2);
+    tch::set_num_threads(4);let _guard=tch::no_grad_guard();let tp=crate::tp::init_from_env();assert!(tp.world>=2,"serve runs under TP (GLM53_TP_WORLD 2 or 3)");
     crate::host_memory::stage("tp init");
     for flag in ["GLM53_MHC_FUSED","GLM53_KDA_FUSED","GLM53_MLA_LATENT"]{std::env::set_var(flag,"1");}
     std::env::set_var("GLM53_PREFILL_BATCH","1");
@@ -2016,6 +2075,12 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
     // Boundary checkpoint before the last user turn (GLM53_SERVE_BOUNDARY_CKPT = min boundary length in
     // tokens; 0 disables). It costs one extra prefill chunk split, so only long shared prefixes qualify.
     let boundary_min=env_num("GLM53_SERVE_BOUNDARY_CKPT",1024).max(0) as usize;
+    // Fork checkpoint (GLM53_SERVE_FORK_CKPT = min fork length in tokens, default 0 = off; GLM53_SERVE_FORK_GAIN = min
+    // tokens past the planned reuse, default 512): see the admission loop.
+    let fork_min=env_num("GLM53_SERVE_FORK_CKPT",0).max(0) as usize;
+    let fork_gain=env_num("GLM53_SERVE_FORK_GAIN",512).max(1) as usize;
+    // GLM53_KV_VMM: extra rows (percent of the need) a new or grown store gets, so a growing session grows rarely.
+    let headroom=env_num("GLM53_KV_HEADROOM_PCT",25).clamp(0,400);
     // Test-only (GLM53_SERVE_CKPT_REUSE=0): never restore/clone prompt checkpoints (boundary splits still
     // happen), so a run gives the cold reference with the very same chunk boundaries.
     let ckpt_reuse=std::env::var("GLM53_SERVE_CKPT_REUSE").as_deref()!=Ok("0");
@@ -2044,7 +2109,7 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
     // GLM53_KV_POOL: size the KV pool from memory (GLM53_MEM_UTIL of MemTotal as the whole machine's hard use, minus
     // what is in use now and GLM53_MEM_RESERVE_GIB for what serving adds outside the pool: every store's verifier
     // graphs, KDA state and drafter window, the prefill workspaces), allocate it now, and let it set the KV budget.
-    // Both ranks take the smaller size so they carve identical ranges.
+    // Every rank takes the smallest size so they carve identical ranges.
     if crate::kv_pool::enabled() {
         let layers=eng.kv_pool_layers();let per=crate::kv_pool::KvPool::bytes_per_token(&layers);
         let util=std::env::var("GLM53_MEM_UTIL").ok().and_then(|v|v.parse::<f64>().ok()).unwrap_or(0.90);
@@ -2054,12 +2119,12 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
         let bytes=(util*total as f64) as i64-(total-avail)-reserve;
         let cap_rows=budget.min(crate::mla_latent::capacity())/granule*granule;
         let mine=((bytes.max(0)/per)/granule*granule).min(cap_rows);
-        let t=Tensor::zeros([2],(Kind::Float,dev));let _=t.get(tp.rank as i64).fill_((mine/granule) as f64);crate::tp::allreduce(&t);
+        let t=Tensor::zeros([tp.world as i64],(Kind::Float,dev));let _=t.get(tp.rank as i64).fill_((mine/granule) as f64);crate::tp::allreduce(&t);
         let units=Vec::<f32>::try_from(t.to_device(Device::Cpu)).unwrap();
         let rows=units.iter().fold(f32::MAX,|a,&b|a.min(b)) as i64*granule;
         let need=max_seqs as i64*granule.max(chunk as i64+128);
         assert!(rows>=need,"KV pool: GLM53_MEM_UTIL {util} leaves {} tokens on the smaller rank ({:?} granules), below the {need} the warm-up stores need; lower GLM53_MEM_RESERVE_GIB or raise GLM53_MEM_UTIL",rows,units);
-        let pool=crate::kv_pool::KvPool::new(dev,&layers,rows,granule);crate::kv_pool::KvPool::install(pool);budget=rows;
+        let pool=crate::kv_pool::KvPool::new(dev,&layers,rows,granule,max_stores);crate::kv_pool::KvPool::install(pool);budget=rows;
         eprintln!("[kv-pool] rank{} util {util:.2}: MemTotal {:.1} GiB, in use {:.1} GiB, reserve {:.1} GiB -> {} tokens ({:.2} GiB, {per} B/token, {} MLA layers; ranks {:?} granules of {granule})",
             tp.rank,total as f64/(1u64<<30) as f64,(total-avail) as f64/(1u64<<30) as f64,reserve as f64/(1u64<<30) as f64,rows,(rows*per) as f64/(1u64<<30) as f64,layers.len(),units);
         crate::host_memory::stage_mem("kv pool");
@@ -2085,7 +2150,7 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
             OP_EVICT=>{let i=op[1] as usize;multi_purge(i);if let Some(st)=stores[i].as_ref(){lib_save(st,None);crate::pcache::fence(st.generation);}stores[i]=None;None}
             OP_ADMIT=>{
                 let (slot,store,action,cap,max_new,qms)=(op[1] as usize,op[2] as usize,op[3] as i32,op[4] as i64,op[5] as usize,op[6] as f64);
-                let mut payload=payload;let which=payload.pop().unwrap() as usize;let src=payload.pop().unwrap();let seed=payload.pop().unwrap() as u64;let temp=payload.pop().unwrap() as f32/1e4;
+                let mut payload=payload;let fork=payload.pop().unwrap() as usize;let which=payload.pop().unwrap() as usize;let src=payload.pop().unwrap();let seed=payload.pop().unwrap() as u64;let temp=payload.pop().unwrap() as f32/1e4;
                 let n_stop=payload.pop().unwrap() as usize;let stop_ids=payload.split_off(payload.len()-n_stop);
                 let (hit,anchor,load)=serve_admit(eng,&draft,stores,store,action,cap,temp,seed,src,which);
                 // Boundary checkpoint: prefix up to (excluding) the last <|user|> turn marker, so later
@@ -2097,7 +2162,7 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
                 // silently drops the suffix (the model continues the older prompt).
                 let anchor=anchor.filter(|_|hit==payload.len());
                 active[slot]=Some(Seq{id:serde_json::Value::Null,store,prompt:payload,consumed:hit,max_new,anchor:anchor.unwrap_or(0),decoding:anchor.is_some(),generated:Vec::new(),emitted:0,
-                    deferred:None,hit,rounds:0,accepted:0,queued_ms:qms,prefill_ms:0.,started:Instant::now(),decode_started:if anchor.is_some(){Some(Instant::now())}else{None},stop_ids,cancel:false,temp,seed,drafted:0,boundary,disk_ms:0.,load,mm:None,copy:(0,0,0)});
+                    deferred:None,hit,rounds:0,accepted:0,queued_ms:qms,prefill_ms:0.,started:Instant::now(),decode_started:if anchor.is_some(){Some(Instant::now())}else{None},stop_ids,cancel:false,temp,seed,drafted:0,boundary,fork,disk_ms:0.,load,mm:None,copy:(0,0,0),online:Default::default()});
                 None}
             OP_PREFILL=>{let slot=op[1] as usize;let seq=active[slot].as_mut().unwrap();let st=stores[seq.store].as_mut().unwrap();
                 // op[2]: chunk chosen by rank0 for this unit (0 = default), so both ranks split identically.
@@ -2115,6 +2180,14 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
                 let c=*clock;serve_finish(&draft,st,seq,c);Some((slot,true))}
             OP_LOADED=>{let slot=op[1] as usize;let seq=active[slot].as_mut().unwrap();let st=stores[seq.store].as_mut().unwrap();
                 serve_loaded(eng,&draft,st,seq,boundary_min);None}
+            // GLM53_KV_VMM: grow store op[1] in place to op[2] rows (both ranks). Rows, length and checkpoints stay; graphs
+            // sized by the old capacity (chain verifier, batched verify) are dropped and captured again on next use.
+            OP_GROW=>{let (i,cap)=(op[1] as usize,op[2] as i64);let pool=crate::kv_pool::installed().expect("OP_GROW without a KV pool");
+                let st=stores[i].as_mut().unwrap();let old=st.capacity;
+                assert!(pool.grow(st.lease.as_mut().unwrap(),cap),"KV pool: grow store {i} {old} -> {cap}");
+                eng.grow_states_pooled(&mut st.state,&pool,st.lease.as_ref().unwrap());
+                st.capacity=cap;st.chain=None;multi_purge(i);
+                eprintln!("[serve] rank{} store {i} grown in place {old} -> {cap} rows",crate::tp::world().rank);None}
             _=>None,
         }
     };
@@ -2146,60 +2219,82 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
     //  - (M3) stores 1..max_seqs-1 prebuilt and decoded briefly so each has its common chain-depth graphs
     //    captured: concurrent requests 2..N no longer capture on first use.
     // GLM53_SERVE_PREWARM=0 keeps only the original single short warm-up.
-    {
-        let prewarm=std::env::var("GLM53_SERVE_PREWARM").as_deref()!=Ok("0");
-        let t0=Instant::now();
-        let short:Vec<i64>=(0..96).map(|i|(1000+i*37) as i64).collect();
-        let long:Vec<i64>=(0..(chunk as i64+64)).map(|i|(1000+(i*37)%150000) as i64).collect();
-        let cap=granule.max(chunk as i64+64+64);
-        let mut runs:Vec<(usize,f32,&Vec<i64>)>=vec![(0,2.,&short),(0,1.,&short)];
-        if prewarm {
-            runs[1]=(0,1.,&long);
-            for st in 1..max_seqs {runs.push((st,2.,&short));}
-        }
-        // GLM53_SERVE_PREWARM_NEW: tokens decoded by every warm-up run after the first (default 4; was 48). The first
-        // run initializes the decode path; the graph prewarm below captures every store's chain/append graphs itself.
-        // bench/load1 warmtest: first, 4-way concurrent and steady requests after a restart unchanged with 4 (~3 s saved).
-        let prewarm_new=env_num("GLM53_SERVE_PREWARM_NEW",4).clamp(1,48) as f32;
-        for (i,(store,action,prompt)) in runs.into_iter().enumerate() {
-            let tr=Instant::now();
-            // ADMIT payload layout: prompt ids, stop ids, stop-id count, temp*1e4, seed, src, which (no stop ids here).
-            let hdr=[OP_ADMIT as f32,0.,store as f32,action,cap as f32,if i==0 {48.} else {prewarm_new},0.,(prompt.len()+5) as f32];
-            let _=apply(&hdr,[prompt.clone(),vec![0,0,0,-1,0]].concat(),&mut eng,&mut stores,&mut active,&mut clock,&mut |_,_|false);
-            loop {
-                let prefill=!active[0].as_ref().unwrap().decoding;
-                let h=[if prefill{OP_PREFILL}else{OP_ROUND} as f32,0.,0.,0.,0.,0.,0.,0.];
-                if let Some((_,true))=apply(&h,Vec::new(),&mut eng,&mut stores,&mut active,&mut clock,&mut |_,_|false){active[0]=None;break;}
-            }
-            tch::Cuda::synchronize(0);
-            eprintln!("[serve] rank{} warm-up run store {store} action {action} prompt {} tokens: {:.2}s | {}",tp.rank,prompt.len(),tr.elapsed().as_secs_f64(),mem_note());
+    let prewarm=std::env::var("GLM53_SERVE_PREWARM").as_deref()!=Ok("0");
+    // GLM53_SERVE_PREWARM_LAZY=1: before "ready" only store 0 is warmed (short + chunk-sized prefill runs, its graphs);
+    // stores 1..max_seqs-1 are warmed later, one per idle turn of rank0 (OP_PREWARM, both ranks), only while nothing
+    // is active or queued, the store index is still unused and the KV pool has a free range for it. Requests that
+    // arrive first simply capture their store's graphs on first use, as with GLM53_SERVE_PREWARM=0 for those stores.
+    let lazy=prewarm && std::env::var("GLM53_SERVE_PREWARM_LAZY").as_deref()==Ok("1");
+    let warm_short:Vec<i64>=(0..96).map(|i|(1000+i*37) as i64).collect();
+    let warm_long:Vec<i64>=(0..(chunk as i64+64)).map(|i|(1000+(i*37)%150000) as i64).collect();
+    let warm_cap=granule.max(chunk as i64+64+64);
+    // GLM53_SERVE_PREWARM_NEW: tokens decoded by every warm-up run after the first (default 4; was 48). The first
+    // run initializes the decode path; the graph prewarm below captures every store's chain/append graphs itself.
+    // bench/load1 warmtest: first, 4-way concurrent and steady requests after a restart unchanged with 4 (~3 s saved).
+    let prewarm_new=env_num("GLM53_SERVE_PREWARM_NEW",4).clamp(1,48) as f32;
+    // One warm-up request on active slot 0 (which must be free): admit, prefill, decode to the end.
+    let warm_run=|first:bool,store:usize,action:f32,prompt:&Vec<i64>,eng:&mut Engine,stores:&mut Vec<Option<Store>>,active:&mut Vec<Option<Seq>>,clock:&mut u64| {
+        let tr=Instant::now();
+        // ADMIT payload layout: prompt ids, stop ids, stop-id count, temp*1e4, seed, src, which, fork (no stop ids here).
+        let hdr=[OP_ADMIT as f32,0.,store as f32,action,warm_cap as f32,if first {48.} else {prewarm_new},0.,(prompt.len()+6) as f32];
+        let _=apply(&hdr,[prompt.clone(),vec![0,0,0,-1,0,0]].concat(),eng,stores,active,clock,&mut |_,_|false);
+        loop {
+            let prefill=!active[0].as_ref().unwrap().decoding;
+            let h=[if prefill{OP_PREFILL}else{OP_ROUND} as f32,0.,0.,0.,0.,0.,0.,0.];
+            if let Some((_,true))=apply(&h,Vec::new(),eng,stores,active,clock,&mut |_,_|false){active[0]=None;break;}
         }
         tch::Cuda::synchronize(0);
-        eprintln!("[serve] rank{} warm-up {:.1}s (prewarm {prewarm}, stores {})",tp.rank,t0.elapsed().as_secs_f64(),stores.iter().flatten().count());
-        // GLM53_SERVE_PREWARM_GRAPHS (default on with prewarm): capture every prebuilt store's drafter append graphs
-        // (1..8 rows) and verifier chain graphs (lengths 2..8) now. Otherwise the first requests of each lane
-        // capture them mid-decode (measured: first two prose runs after a restart 37-38 vs 43.5-44 tok/s).
-        // Synthetic content: history/checkpoints are cleared, so these stores are only ever reset for reuse.
-        if prewarm && std::env::var("GLM53_SERVE_PREWARM_GRAPHS").as_deref()!=Ok("0") {
-            let t1=Instant::now();let dev=eng.w.device;
+        eprintln!("[serve] rank{} warm-up run store {store} action {action} prompt {} tokens: {:.2}s | {}",tp.rank,prompt.len(),tr.elapsed().as_secs_f64(),mem_note());
+    };
+    // GLM53_SERVE_PREWARM_GRAPHS (default on with prewarm): capture a prebuilt store's drafter append graphs
+    // (1..8 rows) and verifier chain graphs (lengths 2..8). Otherwise the first requests of each lane
+    // capture them mid-decode (measured: first two prose runs after a restart 37-38 vs 43.5-44 tok/s).
+    // Synthetic content: history/checkpoints are cleared, so these stores are only ever reset for reuse.
+    let graphs_on=prewarm && std::env::var("GLM53_SERVE_PREWARM_GRAPHS").as_deref()!=Ok("0");
+    let graph_prewarm=|s:usize,eng:&mut Engine,stores:&mut Vec<Option<Store>>| {
+        let Some(st)=stores[s].as_mut() else {return};let dev=eng.w.device;
+        for n in 1..=8i64 {draft.append(st.context.as_mut().unwrap(),&Tensor::zeros([n,20480],(Kind::Float,dev)));}
+        for len in 2..=8usize {
+            let all=with_anchor(1000,crate::speculative::chain(&vec![1001i64;len-1]));
+            crate::sampling::set_rows(&(0..len as u64).map(|i|(0f32,crate::sampling::key(0,i+1))).collect::<Vec<_>>());
+            let base=std::mem::replace(&mut st.state,DecodeStates(Vec::new()));
+            if st.chain.is_none(){st.chain=Some(ChainCache::new_on(eng,&base,&all));}
+            let v=st.chain.as_mut().unwrap().verify(eng,&base,1000,&all,len,&SERVE_EOS);
+            st.state=v.state;
+        }
+        st.history.clear();st.ckpt=[None,None];
+        eprintln!("[serve] rank{} graph prewarm store {s} | {}",tp.rank,mem_note());
+    };
+    // Lazy prewarm of one more store (both ranks, identical sequence): a short warm-up run, then its graphs.
+    let prewarm_store=|s:usize,eng:&mut Engine,stores:&mut Vec<Option<Store>>,active:&mut Vec<Option<Seq>>,clock:&mut u64| {
+        let t=Instant::now();
+        warm_run(false,s,2.,&warm_short,eng,stores,active,clock);
+        if graphs_on {graph_prewarm(s,eng,stores);}
+        eprintln!("[serve] rank{} lazy prewarm store {s}: {:.2}s",tp.rank,t.elapsed().as_secs_f64());
+    };
+    let mut lazy_steps:Vec<usize>=if lazy {(1..max_seqs).collect()} else {Vec::new()};
+    // Warm-up (both ranks, identical op sequence), before serving:
+    //  - store 0: a short prompt, then (M3) a prompt of chunk+64 tokens so the sequence-parallel prefill
+    //    path (NCCL reduce-scatter/all-gather, large-row MHC, chunk-sized GEMM algorithms) and the partial
+    //    tail chunk are initialized at start instead of on the first real long request;
+    //  - (M3) stores 1..max_seqs-1 prebuilt and decoded briefly so each has its common chain-depth graphs
+    //    captured: concurrent requests 2..N no longer capture on first use (lazy: after "ready", see above).
+    // GLM53_SERVE_PREWARM=0 keeps only the original single short warm-up.
+    {
+        let t0=Instant::now();
+        warm_run(true,0,2.,&warm_short,&mut eng,&mut stores,&mut active,&mut clock);
+        if prewarm {warm_run(false,0,1.,&warm_long,&mut eng,&mut stores,&mut active,&mut clock);}
+        else {warm_run(false,0,1.,&warm_short,&mut eng,&mut stores,&mut active,&mut clock);}
+        if prewarm && !lazy {for st in 1..max_seqs {warm_run(false,st,2.,&warm_short,&mut eng,&mut stores,&mut active,&mut clock);}}
+        tch::Cuda::synchronize(0);
+        eprintln!("[serve] rank{} warm-up {:.1}s (prewarm {prewarm}, lazy {lazy}, stores {})",tp.rank,t0.elapsed().as_secs_f64(),stores.iter().flatten().count());
+        if graphs_on {
+            let t1=Instant::now();
             // X4 sizing: allocator reserved bytes before/after capturing every store's graphs (private pools).
             extern "C"{fn rs_cuda_memory(allocated:*mut i64,reserved:*mut i64);}
             let mem=||{tch::Cuda::synchronize(0);let (mut a,mut r)=(0i64,0i64);unsafe{rs_cuda_memory(&mut a,&mut r)};(a,r)};
             let m0=mem();
-            for s in 0..stores.len() {
-                let Some(st)=stores[s].as_mut() else {continue};
-                for n in 1..=8i64 {draft.append(st.context.as_mut().unwrap(),&Tensor::zeros([n,20480],(Kind::Float,dev)));}
-                for len in 2..=8usize {
-                    let all=with_anchor(1000,crate::speculative::chain(&vec![1001i64;len-1]));
-                    crate::sampling::set_rows(&(0..len as u64).map(|i|(0f32,crate::sampling::key(0,i+1))).collect::<Vec<_>>());
-                    let base=std::mem::replace(&mut st.state,DecodeStates(Vec::new()));
-                    if st.chain.is_none(){st.chain=Some(ChainCache::new_on(&mut eng,&base,&all));}
-                    let v=st.chain.as_mut().unwrap().verify(&mut eng,&base,1000,&all,len,&SERVE_EOS);
-                    st.state=v.state;
-                }
-                st.history.clear();st.ckpt=[None,None];
-                eprintln!("[serve] rank{} graph prewarm store {s} | {}",tp.rank,mem_note());
-            }
+            for s in 0..stores.len() {graph_prewarm(s,&mut eng,&mut stores);}
             let m1=mem();
             eprintln!("[serve] rank{} graph prewarm {:.1}s allocated {:+.0} MiB reserved {:+.0} MiB ({} stores)",tp.rank,t1.elapsed().as_secs_f64(),
                 (m1.0-m0.0) as f64/1048576.,(m1.1-m0.1) as f64/1048576.,stores.iter().flatten().count());
@@ -2216,35 +2311,42 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
     }
     crate::host_memory::stage_mem("warm-up done");
     eprintln!("[serve] rank{} ready (max seqs {max_seqs}, KV budget {budget} tokens, granule {granule}, chunk {chunk})",tp.rank);
-    // Doorbell (GLM53_SERVE_DOORBELL, default on): rank0 writes one byte over TCP before it starts each
-    // broadcast op; rank1 blocks on the host for it and only then enters the op's first collective.
+    // Doorbell (GLM53_SERVE_DOORBELL, default on): rank0 writes one byte over TCP to every worker before it starts each
+    // broadcast op; a worker blocks on the host for it and only then enters the op's first collective. rank0 holds one
+    // stream per worker in rank order (each worker sends its rank once connected); a worker holds its stream to rank0.
     // Without it rank1 waits for the next op header inside the GPU allreduce, whose kernel busy-polls
     // the peer flag: an idle worker shows ~100% GPU utilization and never drops its clocks.
     let doorbell_on=std::env::var("GLM53_SERVE_DOORBELL").as_deref()!=Ok("0");
     let doorbell_port:u16=std::env::var("GLM53_SERVE_DOORBELL_PORT").ok().and_then(|v|v.parse().ok())
         .unwrap_or_else(||std::env::var("GLM53_MASTER_PORT").ok().and_then(|v|v.parse::<u16>().ok()).unwrap_or(29931)+10);
-    let mut doorbell:Option<std::net::TcpStream>=None;
+    let mut doorbell:Vec<std::net::TcpStream>=Vec::new();
     if doorbell_on {
+        use std::io::{Read,Write};
         if tp.rank==0 {
             let l=std::net::TcpListener::bind(("0.0.0.0",doorbell_port)).expect("bind doorbell port");
-            let (s,_)=l.accept().expect("doorbell accept");s.set_nodelay(true).unwrap();doorbell=Some(s);
+            let mut by_rank:Vec<(u8,std::net::TcpStream)>=(1..tp.world).map(|_|{
+                let (mut s,_)=l.accept().expect("doorbell accept");s.set_nodelay(true).unwrap();
+                let mut r=[0u8;1];s.read_exact(&mut r).expect("doorbell rank");(r[0],s)}).collect();
+            by_rank.sort_by_key(|x|x.0);
+            assert!(by_rank.iter().enumerate().all(|(i,x)|x.0 as usize==i+1),"doorbell: worker ranks {:?}",by_rank.iter().map(|x|x.0).collect::<Vec<_>>());
+            doorbell=by_rank.into_iter().map(|x|x.1).collect();
         } else {
             let addr=std::env::var("GLM53_MASTER_ADDR").unwrap_or_else(|_|"127.0.0.1".into());
             let t0=Instant::now();
             let s=loop {match std::net::TcpStream::connect((addr.as_str(),doorbell_port)) {
                 Ok(s)=>break s,
                 Err(e)=>{assert!(t0.elapsed().as_secs()<600,"doorbell connect {addr}:{doorbell_port}: {e}");std::thread::sleep(std::time::Duration::from_millis(200));}}};
-            s.set_nodelay(true).unwrap();doorbell=Some(s);
+            let mut s=s;s.set_nodelay(true).unwrap();s.write_all(&[tp.rank as u8]).expect("doorbell rank");doorbell=vec![s];
         }
         eprintln!("[serve] rank{} doorbell on port {doorbell_port}",tp.rank);
     }
     // Persistent prefix cache (GLM53_PCACHE=1): after the warm-up (whose synthetic checkpoints are not saved), both ranks
     // agree on the cached files over the doorbell stream before any control message.
     if crate::pcache::requested() {
-        match doorbell.as_mut() {Some(d)=>crate::pcache::init(tp.rank,tp.world,model,draft_dir,d),None=>eprintln!("[pcache] needs the doorbell stream (TP2); disabled")}
+        if doorbell.is_empty() {eprintln!("[pcache] needs the doorbell streams; disabled")} else {crate::pcache::init(tp.rank,tp.world,model,draft_dir,&mut doorbell)}
     }
     let ctrl_tcp=std::env::var("GLM53_SERVE_CTRL_TCP").as_deref()==Ok("1");
-    assert!(!ctrl_tcp||doorbell.is_some(),"GLM53_SERVE_CTRL_TCP=1 needs the doorbell (GLM53_SERVE_DOORBELL != 0, TP2)");
+    assert!(!ctrl_tcp||!doorbell.is_empty(),"GLM53_SERVE_CTRL_TCP=1 needs the doorbell (GLM53_SERVE_DOORBELL != 0)");
     if ctrl_tcp {eprintln!("[serve] rank{} control messages over the doorbell TCP stream",tp.rank);
     }
     if tp.rank!=0 {
@@ -2252,17 +2354,18 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
             crate::pcache::poll();
             let mut ctrl_payload:Vec<i64>=Vec::new();
             let h=if ctrl_tcp {
-                match ctrl_read(doorbell.as_mut().unwrap()) {Some((h,p))=>{ctrl_payload=p;h},None=>{eprintln!("[serve] rank1 control stream closed; exiting");break;}}
+                match ctrl_read(&mut doorbell[0]) {Some((h,p))=>{ctrl_payload=p;h},None=>{eprintln!("[serve] rank{} control stream closed; exiting",tp.rank);break;}}
             } else {
-                if let Some(d)=doorbell.as_mut() {
+                if let Some(d)=doorbell.first_mut() {
                     use std::io::Read;let mut b=[0u8;1];
-                    if d.read_exact(&mut b).is_err() {eprintln!("[serve] rank1 doorbell closed; exiting");break;}
+                    if d.read_exact(&mut b).is_err() {eprintln!("[serve] rank{} doorbell closed; exiting",tp.rank);break;}
                 }
                 bcast(Vec::new(),8)
             };
             match h[0] as i32 {
                 OP_BEAT=>continue,
                 OP_SHUTDOWN=>break,
+                OP_PREWARM=>{prewarm_store(h[1] as usize,&mut eng,&mut stores,&mut active,&mut clock);}
                 OP_ADMIT=>{let len=h[7] as usize;let ids:Vec<i64>=if ctrl_tcp {assert_eq!(ctrl_payload.len(),len);std::mem::take(&mut ctrl_payload)} else {bcast(Vec::new(),len).into_iter().map(|v|v as i64).collect()};
                     let _=apply(&h,ids,&mut eng,&mut stores,&mut active,&mut clock,&mut |_,_|false);}
                 OP_ROUND=>{
@@ -2277,7 +2380,7 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
             }
         }
         crate::pcache::shutdown(120);
-        eprintln!("[serve] rank1 shutdown");return;
+        eprintln!("[serve] rank{} shutdown",tp.rank);return;
     }
     // ---- rank0: socket I/O, queue, admission and round-robin scheduling
     let _=std::fs::remove_file(socket);
@@ -2300,9 +2403,9 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
                 Err(e)=>{eprintln!("[serve] client write failed: {e}");ok=false;break;}}}
             if !ok{eprintln!("[serve] client connection dropped (write)");*conn=None;}}};
     let ring=std::cell::RefCell::new(doorbell);
-    let ring_bell=||{if let Some(d)=ring.borrow_mut().as_mut(){d.write_all(&[1u8]).expect("doorbell write");}};
+    let ring_bell=||{for d in ring.borrow_mut().iter_mut(){d.write_all(&[1u8]).expect("doorbell write");}};
     let send=|h:[f32;8],payload:&[i64]|{
-        if ctrl_tcp {ctrl_write(ring.borrow_mut().as_mut().unwrap(),&h,payload);return;}
+        if ctrl_tcp {for d in ring.borrow_mut().iter_mut(){ctrl_write(d,&h,payload);}return;}
         ring_bell();let _=bcast(h.to_vec(),8);if !payload.is_empty(){let _=bcast(payload.iter().map(|&t|t as f32).collect(),payload.len());}};
     loop {
         crate::pcache::poll();
@@ -2374,10 +2477,12 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
             let Some(slot)=(0..max_seqs).find(|&i|active[i].is_none()) else {break};
             let Some(q)=queue.front() else {break};
             let need=(q.ids.len()+q.max_new) as i64;
+            // GLM53_KV_VMM: stores grow in place, so a too-small store with the right prefix is still a candidate.
+            let growable=crate::kv_pool::installed().is_some_and(|p|p.growable());
             // (a) exact-prefix reuse, (b) reset a free store that is large enough, (c) allocate
             // Candidates: continue a store's full history, or restore its prompt checkpoint (prefix or exact).
             let mut best:Option<(usize,i32,usize)>=None;let mut best_which=0usize;
-            for (i,st) in stores.iter().enumerate() {let Some(st)=st else{continue};if st.busy||st.capacity<need{continue;}
+            for (i,st) in stores.iter().enumerate() {let Some(st)=st else{continue};if st.busy||(st.capacity<need&&!growable){continue;}
                 if !st.history.is_empty() && q.ids.len()>st.history.len() && q.ids.starts_with(&st.history) && best.map_or(true,|b|st.history.len()>b.2) {best=Some((i,0,st.history.len()));}
                 for (w,c) in st.ckpt.iter().enumerate() {if let Some(c)=c {if ckpt_reuse && (q.ids.len()>c.ids.len()||w==0) && q.ids.starts_with(&c.ids) && best.map_or(true,|b|c.ids.len()>b.2) {best=Some((i,3,c.ids.len()));best_which=w;}}}
             }
@@ -2409,14 +2514,15 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
             let libc=if disk.is_some(){None}else{libc};
             let clone=if libc.is_some()||disk.is_some(){None}else{clone};
             let protect=clone.map(|c|c.0);
+            let mut lost_clone=false;
             let plan=if let (Some((i,a,_)),None,None,None)=(best,clone,libc,disk) {Some((i,a,0))} else {
-                let cap=((need+granule-1)/granule*granule).min(budget);
+                let cap=(((if growable {need+need*headroom/100} else {need})+granule-1)/granule*granule).min(budget);
                 let used=|stores:&Vec<Option<Store>>|stores.iter().flatten().map(|s|s.capacity).sum::<i64>();
                 let mut plan=None;
                 // A clean idle store (no history, no checkpoints: e.g. a prewarmed one) already has its verifier and
                 // drafter graphs captured; reuse it before allocating a new store that would capture them mid-decode.
                 if let Some(i)=stores.iter().enumerate().filter_map(|(i,s)|s.as_ref().map(|s|(i,s)))
-                    .filter(|(i,s)|!s.busy&&Some(*i)!=protect&&s.history.is_empty()&&s.ckpt.iter().all(|c|c.is_none())&&s.capacity>=need)
+                    .filter(|(i,s)|!s.busy&&Some(*i)!=protect&&s.history.is_empty()&&s.ckpt.iter().all(|c|c.is_none())&&(s.capacity>=need||growable))
                     .min_by_key(|(_,s)|s.capacity).map(|(i,_)|i) {plan=Some((i,1,0));}
                 if plan.is_none() {loop {
                     // KV pool: the new store needs a contiguous free range (idle stores are evicted below until one exists).
@@ -2425,15 +2531,22 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
                         let idx=stores.iter().position(|s|s.is_none()).unwrap_or(stores.len());plan=Some((idx,2,cap));break;
                     }
                     let victim=stores.iter().enumerate().filter_map(|(i,s)|s.as_ref().map(|s|(i,s))).filter(|(i,s)|!s.busy&&Some(*i)!=protect).min_by_key(|(_,s)|s.used).map(|(i,s)|(i,s.capacity));
+                    // Last resort: only the (idle) clone source is left and the new store still gets no contiguous KV range
+                    // (the source sits in the middle of the pool). Evict it too and admit from the disk copy of its
+                    // checkpoint (or cold) below; keeping it waited forever (2026-10-13: one queued request, idle engine).
+                    let victim=victim.or_else(||{let p=protect?;let s=stores[p].as_ref()?;(!s.busy&&!lost_clone).then(||{lost_clone=true;(p,s.capacity)})});
                     let Some((i,capacity))=victim else {break};
-                    if capacity>=need {plan=Some((i,1,0));break;}
+                    if capacity>=need && !lost_clone {plan=Some((i,1,0));break;}
                     let h=[OP_EVICT as f32,i as f32,0.,0.,0.,0.,0.,0.];send(h,&[]);
                     let _=apply(&h,Vec::new(),&mut eng,&mut stores,&mut active,&mut clock,&mut |_,_|false);
                 }}
                 plan
             };
+            // The clone source was evicted (last resort above): restore its prefix from disk instead, or prefill cold.
+            let (clone,disk)=if lost_clone {(None,if ckpt_reuse && crate::pcache::enabled() {crate::pcache::lookup(&q.ids,libc.map_or(0,|x|x.1),clone_min)} else {None})} else {(clone,disk)};
+            if lost_clone {eprintln!("[serve-admit] prompt {} need {need}: no contiguous KV range beside the clone source; evicted it, disk {:?}",q.ids.len(),disk);}
             // No target for the clone: fall back to the (shorter) idle-store reuse if there is one.
-            let (plan,clone,libc,disk)=match (plan,best,clone.is_some()||libc.is_some()||disk.is_some()) {(None,Some((i,a,_)),true)=>(Some((i,a,0)),None,None,None),(p,_,_)=>(p,clone,libc,disk)};
+            let (plan,clone,libc,disk)=match (plan,best,clone.is_some()||libc.is_some()||disk.is_some()) {(None,Some((i,a,_)),true) if stores.get(i).is_some_and(|s|s.is_some())=>(Some((i,a,0)),None,None,None),(p,_,_)=>(p,clone,libc,disk)};
             // Victim evictions above may have pushed the chosen library entry out (both ranks apply the same
             // evictions, so this check sees the rank-1 library too): then admit cold.
             let libc=libc.filter(|(id,_)|CKPT_LIB.with(|l|l.borrow().entries.iter().any(|e|e.id==*id)));
@@ -2447,9 +2560,42 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
                 eprintln!("[serve-admit] prompt {} need {} -> store {} action {} cap {} disk {:?} | stores {:?}",q.ids.len(),need,store,action,cap,disk,
                     stores.iter().enumerate().filter_map(|(i,s)|s.as_ref().map(|s|(i,s.capacity,s.busy,s.history.len(),s.ckpt.iter().flatten().map(|c|(c.ids.len(),q.ids.starts_with(&c.ids))).collect::<Vec<_>>()))).collect::<Vec<_>>());
             }
+            // GLM53_KV_VMM: the target store (reused, reset or restored into) grows in place to the request's need, with
+            // GLM53_KV_HEADROOM_PCT headroom when the free chunks allow. Idle stores other than the target and a clone
+            // source give their chunks back first; when the rest are busy the request stays queued until one finishes.
+            if growable && stores.get(store).is_some_and(|s|s.as_ref().is_some_and(|s|s.capacity<need)) {
+                let pool=crate::kv_pool::installed().unwrap();
+                let exact=((need+granule-1)/granule*granule).min(budget);
+                let roomy=((need+need*headroom/100+granule-1)/granule*granule).min(budget).max(exact);
+                let keep=if action==4 {Some(src as usize)} else {None};
+                let mut target=None;
+                loop {
+                    let l=stores[store].as_ref().unwrap().lease.as_ref().unwrap();
+                    if pool.can_grow(l,roomy) {target=Some(roomy);break;}
+                    if pool.can_grow(l,exact) {target=Some(exact);break;}
+                    let victim=stores.iter().enumerate().filter_map(|(i,s)|s.as_ref().map(|s|(i,s))).filter(|(i,s)|*i!=store&&Some(*i)!=keep&&!s.busy).min_by_key(|(_,s)|s.used).map(|(i,_)|i);
+                    let Some(v)=victim else {break};
+                    let h=[OP_EVICT as f32,v as f32,0.,0.,0.,0.,0.,0.];send(h,&[]);
+                    let _=apply(&h,Vec::new(),&mut eng,&mut stores,&mut active,&mut clock,&mut |_,_|false);
+                }
+                let Some(t)=target else {break};
+                let h=[OP_GROW as f32,store as f32,t as f32,0.,0.,0.,0.,0.];send(h,&[]);
+                let _=apply(&h,Vec::new(),&mut eng,&mut stores,&mut active,&mut clock,&mut |_,_|false);
+            }
+            // Fork checkpoint (GLM53_SERVE_FORK_CKPT = min fork length, 0 off): the longest prefix the prompt shares with a
+            // cached sequence it then leaves (a store's history or checkpoint, a library or disk entry). Prefill stops there
+            // and saves a checkpoint, so later prompts with the same opening (system prompt, tools) and a different tail
+            // (per-session ids, dates) restore it instead of prefilling all of it.
+            let fork=if fork_min==0 {0} else {
+                let hit=match action {0|3=>best.map_or(0,|b|b.2),4=>clone.map_or(0,|c|c.1),5=>libc.map_or(0,|x|x.1),6=>disk.map_or(0,|x|x.1),_=>0};
+                let fp=|ids:&[i64]|{let (l,whole)=crate::pcache::common_prefix(&q.ids,ids);if whole {0} else {l}};
+                let mut f=crate::pcache::fork_point(&q.ids);
+                for st in stores.iter().flatten() {f=f.max(fp(&st.history));for c in st.ckpt.iter().flatten() {f=f.max(fp(&c.ids));}}
+                CKPT_LIB.with(|l|for e in &l.borrow().entries {f=f.max(fp(&e.ids));});
+                if f>=fork_min && f>=hit+fork_gain && f<q.ids.len() {eprintln!("[serve-admit] prompt {} reuses {hit}: fork checkpoint at {f}",q.ids.len());f} else {0}};
             let q=queue.pop_front().unwrap();
             let qms=q.at.elapsed().as_secs_f64()*1000.;
-            let payload=[q.ids.clone(),q.stop_ids.clone(),vec![q.stop_ids.len() as i64,(q.temp*1e4).round() as i64,q.seed as i64,src,which as i64]].concat();
+            let payload=[q.ids.clone(),q.stop_ids.clone(),vec![q.stop_ids.len() as i64,(q.temp*1e4).round() as i64,q.seed as i64,src,which as i64,fork as i64]].concat();
             let h=[OP_ADMIT as f32,slot as f32,store as f32,action as f32,cap as f32,q.max_new as f32,qms as f32,payload.len() as f32];
             send(h,&payload);
             let _=apply(&h,payload,&mut eng,&mut stores,&mut active,&mut clock,&mut |_,_|false);
@@ -2498,6 +2644,17 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
         let next=if batch && decoding.len()>=2 {(0..max_seqs).map(|k|(rr+k)%max_seqs).find(|&i|active[i].as_ref().map_or(false,|s|!s.decoding&&s.load.is_none()))}
             else {(0..max_seqs).map(|k|(rr+k)%max_seqs).find(|&i|active[i].as_ref().is_some_and(|s|s.load.is_none()))};
         let Some(slot)=next else {
+            // GLM53_SERVE_PREWARM_LAZY: one deferred store per idle turn (nothing active or queued, index unused,
+            // a KV range free); the decision is rank0's and is broadcast, so both ranks run the same ops.
+            if !lazy_steps.is_empty() && queue.is_empty() && active.iter().all(|a|a.is_none()) && !crate::pcache::loading() {
+                let s=lazy_steps.remove(0);
+                let fits=crate::kv_pool::installed().map_or(true,|p|p.largest_free()>=warm_cap);
+                if stores.get(s).map_or(true,|x|x.is_none()) && fits {
+                    send([OP_PREWARM as f32,s as f32,0.,0.,0.,0.,0.,0.],&[]);
+                    prewarm_store(s,&mut eng,&mut stores,&mut active,&mut clock);
+                } else {eprintln!("[serve] rank0 lazy prewarm store {s} skipped (in use or no KV range)");}
+                last_beat=Instant::now();continue;
+            }
             // While a prefix cache restore is in flight, beat every idle turn: rank1 moves its staged chunks to the
             // device between control messages.
             if last_beat.elapsed().as_secs_f64()>=1.0 || crate::pcache::loading() {send([OP_BEAT as f32,0.,0.,0.,0.,0.,0.,0.],&[]);last_beat=Instant::now();}

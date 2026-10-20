@@ -10,14 +10,13 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <cstdlib>
+#include "pdl.cuh"   // pdl_wait / pdl_trigger / pdl_launch_if
 __device__ __forceinline__ void skinny_mma16816(float* c,uint32_t a0,uint32_t a1,uint32_t a2,uint32_t a3,uint32_t b0,uint32_t b1){
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
     :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3]):"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
 }
 // Programmatic dependent launch (GLM53_PDL=1): weight loads (independent of the previous kernel) are issued before
 // griddepcontrol.wait; activations are read and outputs written only after it. No-ops when not PDL-launched.
-__device__ __forceinline__ void pdl_wait(){asm volatile("griddepcontrol.wait;" ::: "memory");}
-__device__ __forceinline__ void pdl_trigger(){asm volatile("griddepcontrol.launch_dependents;" :::);}
 __device__ __forceinline__ uint4 skinny_ld_stream(const void* p){
   uint4 v; asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3},[%4];":"=r"(v.x),"=r"(v.y),"=r"(v.z),"=r"(v.w):"l"(p)); return v;
 }
@@ -117,9 +116,7 @@ inline bool skinny_pdl_enabled(){const char* e=std::getenv("GLM53_PDL");return e
 template<typename... A>
 inline void skinny_launch_pdl(void(*kernel)(A...),int grid,cudaStream_t s,A... args){
   if(!skinny_pdl_enabled()){kernel<<<grid,256,0,s>>>(args...);return;}
-  cudaLaunchConfig_t cfg{};cfg.gridDim=dim3(grid);cfg.blockDim=dim3(256);cfg.dynamicSmemBytes=0;cfg.stream=s;
-  cudaLaunchAttribute at[1];at[0].id=cudaLaunchAttributeProgrammaticStreamSerialization;at[0].val.programmaticStreamSerializationAllowed=1;
-  cfg.attrs=at;cfg.numAttrs=1;cudaLaunchKernelEx(&cfg,kernel,args...);
+  pdl_launch_if(true,kernel,dim3(grid),dim3(256),0,s,args...);
 }
 template<int U,int IN>
 inline void skinny_fp8_launch(int ks,const void* X,const uint8_t* W,const float* sc,float* Y,int M,int N,int K,bool round,cudaStream_t s){

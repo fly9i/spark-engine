@@ -8,9 +8,17 @@ extern "C" {
 size_t glm_moe_ws_bytes(int R, int S) { return moex::ws_bytes<moex::GlmMoe>(R, S); }
 // suh0: the layer's shared gate/up input scales (all experts equal, proven at load) or null
 int glm_moe_experts(const void* x, int64_t ldx, int R, const void* idx, const void* w, const void* tab,
-                    const void* add, void* out, void* ws, int S, const void* suh0, cudaStream_t st)
+                    const void* add, void* out, void* ws, int S, const void* suh0, int kmask, cudaStream_t st)
 {
-    return moex::experts<moex::GlmMoe>(x, ldx, R, idx, w, tab, add, out, ws, S, st, suh0);
+    return moex::experts<moex::GlmMoe>(x, ldx, R, idx, w, tab, add, out, ws, S, st, suh0, kmask);
+}
+// TP3 (moex::GlmMoe3): every expert 768 or 640 wide on this rank (its 6 or 5 Hadamard blocks of 16), the width in row 10 of
+// the table [11, 288]
+size_t glm_moe3_ws_bytes(int R, int S) { return moex::ws_bytes<moex::GlmMoe3>(R, S); }
+int glm_moe3_experts(const void* x, int64_t ldx, int R, const void* idx, const void* w, const void* tab,
+                     const void* add, void* out, void* ws, int S, int kmask, cudaStream_t st)
+{
+    return moex::experts<moex::GlmMoe3>(x, ldx, R, idx, w, tab, add, out, ws, S, st, nullptr, kmask);
 }
 
 }

@@ -109,6 +109,20 @@ fn shared_activation(m:&MoeMeta,h:&Tensor)->Tensor {
 }
 
 pub(crate) fn shared_activation_with_half(m:&MoeMeta,h:&Tensor,half:Option<&Tensor>)->Tensor {
+    // spx-hessian taps (no-ops unless collecting): the shared gate/up input and the down projection's input.
+    crate::spx_hess::add(crate::spx_hess::SHARED_IN,h);
+    crate::spx_hess::tap_owned(crate::spx_hess::SHARED_DOWN,shared_activation_impl(m,h,half))
+}
+fn shared_activation_impl(m:&MoeMeta,h:&Tensor,half:Option<&Tensor>)->Tensor {
+    // SPX gate/up (crate::spx): one rotation and one launch for the group, then the same clamp-SwiGLU as below.
+    if let Some(y)=crate::spx::try_rows(h,&[&m.sh_wg,&m.sh_wu],1) {
+        let n=m.sh_wg.size()[0];
+        // decode rows with an SPX down projection: one kernel for the activation and the down GEMV's rotated input
+        if let Some(act)=crate::spx::swiglu_rot(&y,n,&m.sh_wd,SWIGLU_LIMIT) {return act;}
+        let g=y.narrow(1,0,n).clamp(f64::NEG_INFINITY, SWIGLU_LIMIT);
+        let u=y.narrow(1,n,n).clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT);
+        return g.silu()*u;
+    }
     if let Some(y)=crate::shared_gu::try_activation(h,&m.sh_wg,&m.sh_wu,&m.sh_wd,half){return y;}
     // D7 (GLM53_SHARED_GU_ROWS=1): FP8 gate and up in one row-concatenated skinny launch (the KDA QKV
     // mechanism: per-row split-K layout does not depend on N, each half equals its separate call).
@@ -154,7 +168,7 @@ pub(crate) fn input_half_reuse_enabled()->bool {
 }
 
 pub fn tp_pack_enabled()->bool {
-    crate::tp::world().world==2 && crate::tp::dense_enabled() &&
+    crate::tp::world().world>=2 && crate::tp::dense_enabled() &&
         std::env::var("GLM53_TP_MOE_PACK").as_deref()==Ok("1")
 }
 

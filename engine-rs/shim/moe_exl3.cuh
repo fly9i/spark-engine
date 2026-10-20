@@ -12,6 +12,7 @@
 // first row goff[g], gcnt[g] rows). Decode / verify chains (R <= 64): GR 16, EXL3 GEMV with K split in S slices.
 // Prefill chunks: GR 128, a GEMM kernel (A tiles in shared memory, every decoded weight tile used by 8 row tiles).
 #include "qwen_exl3.cuh"
+#include "pdl.cuh"
 #include <cfloat>
 #include <cstdint>
 #include <cstdlib>
@@ -25,7 +26,7 @@ struct QwenMoe
     static constexpr int E = 512, TOPK = 10, H = 2560, I = 640, CBK = 2;
     using XT = float; using WT = float; using IT = int;
     __device__ __forceinline__ static float act(float a, float u) { return a / (1.0f + __expf(-a)) * u; }
-    static constexpr bool PERSIST = false, FINISH_COMBINE = false, PDL = false, APF = false, YD16 = false;
+    static constexpr bool PERSIST = false, FINISH_COMBINE = false, PDL = false, APF = false, YD16 = false, HOLDERS = false, VARW = false;
     static constexpr const char* GEMV_ENV = "QWEN_MOE_GEMV";
     static GemvCfgT gemv_default(int S, int) { return {2, 4, 4, S, S, 0, 0, 0}; }
 };
@@ -43,6 +44,10 @@ struct GlmMoe
     }
     // YD16: prefill per-pair expert outputs in fp16 before the fixed-order slot sum (as the reference grouped path stores them)
     static constexpr bool PERSIST = true, FINISH_COMBINE = true, PDL = true, APF = true, YD16 = true;
+    // HOLDERS (off: the kernels exactly as before): an expert whose trellis width (table row 9) is 0 belongs to another TP
+    // rank; the grouping gives it no work items and the combine leaves its pairs out. TP3 splits every expert instead
+    // (GlmMoe3); the holders layout (GLM53_TP3_EXPERTS=holders) runs its dummies through the kernels (exact zeros).
+    static constexpr bool HOLDERS = false, VARW = false;
     static constexpr const char* GEMV_ENV = "GLM53_MOE_GEMV";
     // glm-moe-ab (2026-10-08, layer 3, same process vs the cooperative library): up to 4 rows the fused kernel (stage 1,
     // mid and stage 2 in one persistent grid), above it the separate persistent GEMVs; 4 n-tiles per warp, 4 k-tiles ahead.
@@ -55,29 +60,33 @@ struct GlmMoe
     }
 };
 
+// GLM-5.3-Flash under TP3 (docs/06-TP3.md §13): every expert split over the three ranks in 128-wide Hadamard blocks, 6/5/5
+// of its 16 (the 6 rotating with the expert), so a rank's experts are 768 or 640 wide. VARW: I is the widest (768; the
+// strides of every intermediate), each expert's own width in row 10 of the table; GEMV tasks / warps / GEMM blocks past
+// it do nothing, the down products reduce over its own width only. Everything else is GlmMoe's.
+struct GlmMoe3 : GlmMoe
+{
+    static constexpr int I = 768;
+    static constexpr bool HOLDERS = false, VARW = true;
+    // glm-moe-ab GLM53_MOE_AB_WORLD=3 (2026-10-17, layer 3): up to 4 rows the fused kernel with 4 K slices for gate/up (the
+    // 640 / 768-wide experts have fewer n-blocks to spread): 3 rows 538 -> 487 us (TP2's 1024-wide: 709); above, GlmMoe's
+    static GemvCfgT gemv_default(int S, int R)
+    {
+        if (R <= 4) return {4, 4, 4, 4, 2, 0, 0, 1};
+        return GlmMoe::gemv_default(S, R);
+    }
+};
+
 constexpr int CB = 64;   // rows per counting block
 
 // Programmatic dependent launch (C::PDL): every decode kernel waits for its predecessor's completion first thing and
 // lets its successor launch right away, so launch latency overlaps the predecessor's tail. Without the launch attribute
 // (Qwen) griddepcontrol.wait returns at once.
-__device__ __forceinline__ void pdl_enter()
-{
-    asm volatile("griddepcontrol.wait;\n" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
-}
+__device__ __forceinline__ void pdl_enter() { pdl_wait(); pdl_trigger(); }   // (pdl.cuh)
 template <class C, typename... KArgs, typename... Args>
 void klaunch(void (*k)(KArgs...), dim3 grid, dim3 block, cudaStream_t st, Args... args)
 {
-    if constexpr (C::PDL)
-    {
-        cudaLaunchConfig_t cfg = {};
-        cfg.gridDim = grid; cfg.blockDim = block; cfg.dynamicSmemBytes = 0; cfg.stream = st;
-        cudaLaunchAttribute a[1];
-        a[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        a[0].val.programmaticStreamSerializationAllowed = 1;
-        cfg.attrs = a; cfg.numAttrs = 1;
-        cudaLaunchKernelEx(&cfg, k, ((KArgs) args)...);
-    }
+    if constexpr (C::PDL) pdl_launch_if(true, k, grid, block, 0, st, ((KArgs) args)...);
     else k<<<grid, block, 0, st>>>(((KArgs) args)...);
 }
 
@@ -113,6 +122,19 @@ __device__ __forceinline__ void ld16(const half* x, int64_t off, float* xa)
     }
 }
 
+// C::HOLDERS (GlmMoe): expert e has work on this rank, i.e. its trellis width in row 9 of the table is not 0 (TP3: the
+// experts another rank holds point at a dummy marked 0). Without HOLDERS (Qwen: no row 9) every expert has work.
+template <class C> __device__ __forceinline__ bool held_e(const uint64_t* tab, int e)
+{
+    if constexpr (C::HOLDERS) return tab[9 * C::E + e] != 0; else return true;
+}
+
+// expert e's intermediate width on this rank (C::VARW: row 10 of the table), else C::I
+template <class C> __device__ __forceinline__ int ewidth(const uint64_t* tab, int e)
+{
+    if constexpr (C::VARW) return (int) tab[10 * C::E + e]; else return C::I;
+}
+
 // ---- grouping: stable counting sort of the pairs by expert (rows ascending within an expert) ----
 // count: grid nb = ceil(R / CB) x E threads (thread = expert): per-block counts cblk[b][e]
 template <class C>
@@ -132,14 +154,15 @@ __global__ __launch_bounds__(512) void count_kernel(const typename C::IT* __rest
 template <class C>
 __global__ __launch_bounds__(512) void scan_kernel(int* __restrict__ cblk, int nb, int GR, int* __restrict__ eoff,
                                                    int* __restrict__ G, int* __restrict__ gexp, int* __restrict__ goff,
-                                                   int* __restrict__ gcnt)
+                                                   int* __restrict__ gcnt, const uint64_t* __restrict__ tab)
 {
     __shared__ int s_rows[C::E], s_items[C::E];
     const int e = threadIdx.x;
     int tot = 0;
     for (int b = 0; b < nb; ++b) { int c = cblk[b * C::E + e]; cblk[b * C::E + e] = tot; tot += c; }
     s_rows[e] = tot;
-    s_items[e] = (tot + GR - 1) / GR;
+    const bool held = held_e<C>(tab, e);
+    s_items[e] = held ? (tot + GR - 1) / GR : 0;
     __syncthreads();
     if (e == 0)
     {
@@ -154,7 +177,7 @@ __global__ __launch_bounds__(512) void scan_kernel(int* __restrict__ cblk, int n
     }
     __syncthreads();
     eoff[e] = s_rows[e];
-    for (int i = 0, it = s_items[e]; i * GR < tot; ++i, ++it)
+    for (int i = 0, it = s_items[e]; held && i * GR < tot; ++i, ++it)
     {
         gexp[it] = e;
         goff[it] = s_rows[e] + i * GR;
@@ -213,6 +236,38 @@ static __global__ void pexp_kernel(const int* __restrict__ G, const int* __restr
     for (int j = threadIdx.x; j < gcnt[g]; j += blockDim.x) pexp[goff[g] + j] = gexp[g];
 }
 
+// Mixed-K layers (E3): every expert has its own trellis width K in 3..6, stored as a value in row 9 of the pointer table.
+// Decode kernels run BITS = 0 and dispatch per item (MOEX_WITH_BITS); prefill kernels run once per K present with KF =
+// true (CTAs of other experts return). BITS != 0 / KF = false: exactly the previous instances.
+template <class C> __device__ __forceinline__ int expert_bits(const uint64_t* tab, int e) { return (int) tab[9 * C::E + e]; }
+#define MOEX_WITH_BITS(BITS, KX, ...)                                                                                     \
+    do {                                                                                                                  \
+        if constexpr ((BITS) != 0) { constexpr int KB = (BITS); constexpr bool DYN = false; __VA_ARGS__; }                \
+        else switch (KX) {                                                                                                \
+            case 3: { constexpr int KB = 3; constexpr bool DYN = true; __VA_ARGS__; } break;                              \
+            case 4: { constexpr int KB = 4; constexpr bool DYN = false; __VA_ARGS__; } break;                             \
+            case 5: { constexpr int KB = 5; constexpr bool DYN = true; __VA_ARGS__; } break;                              \
+            default: { constexpr int KB = 6; constexpr bool DYN = true; __VA_ARGS__; } break;                             \
+        }                                                                                                                 \
+    } while (0)
+// The dispatched instances are separate (noinline) functions: inlining all four K bodies into one kernel made the
+// register allocator spill (moe_fused_kernel BITS = 0: up to 3000 bytes). One call per GEMV task; DYN = false inlines.
+template <int KB, int TPW, int PF, int WARPS, int MT, int CBK, bool APF, bool VAR>
+__device__ __noinline__ void gemv_block_dyn(const half* __restrict__ xh, int64_t lda, const uint32_t* __restrict__ tr, float* __restrict__ out,
+                                            int64_t ldo, int M, int K, int N, int nblk, int kt0, int kts)
+{
+    qexl3::gemv_block_ld<KB, TPW, PF, WARPS, MT, CBK, APF, VAR>(xh, lda, tr, out, ldo, M, K, N, nblk, kt0, kts);
+}
+// lda / ldo: row strides of xh / out, read only for VAR (C::VARW experts narrower than C::I); otherwise K / N exactly as before
+template <int KB, int TPW, int PF, int WARPS, int MT, int CBK, bool APF, bool DYN, bool VAR = false>
+__device__ __forceinline__ void moex_gemv(const half* __restrict__ xh, int64_t lda, const uint32_t* __restrict__ tr, float* __restrict__ out,
+                                          int64_t ldo, int M, int K, int N, int nblk, int kt0, int kts)
+{
+    // K != 4 under the dynamic kernel's 128-register cap: prefetch depth 2 (PF does not change the task layout)
+    if constexpr (DYN) gemv_block_dyn<KB, TPW, (PF > 2 ? 2 : PF), WARPS, MT, CBK, APF, VAR>(xh, lda, tr, out, ldo, M, K, N, nblk, kt0, kts);
+    else qexl3::gemv_block_ld<KB, TPW, PF, WARPS, MT, CBK, APF, VAR>(xh, lda, tr, out, ldo, M, K, N, nblk, kt0, kts);
+}
+
 // decode / verify: grid (N/128, S, T * Gmax), GEMV per item; part[s][t][row][N]
 template <class C, int BITS>
 __global__ __launch_bounds__(128) void gemv_grouped_kernel(const half* __restrict__ xh, const uint64_t* __restrict__ tab,
@@ -224,21 +279,22 @@ __global__ __launch_bounds__(128) void gemv_grouped_kernel(const half* __restric
     if (g >= *G) return;
     const uint32_t* tr = (const uint32_t*) tab[(tr_slot0 + t) * C::E + gexp[g]];
     const int64_t r0 = (int64_t) t * P + goff[g];
-    qexl3::gemv_block<BITS, 2, 4, 4, 1, C::CBK>(xh + r0 * K, tr, part + ((int64_t) blockIdx.y * T * P + r0) * N, gcnt[g], K, N, blockIdx.x,
-                            blockIdx.y * kts, kts);
+    MOEX_WITH_BITS(BITS, expert_bits<C>(tab, gexp[g]),
+        moex_gemv<KB, 2, 4, 4, 1, C::CBK, false, DYN>(xh + r0 * K, K, tr, part + ((int64_t) blockIdx.y * T * P + r0) * N, N, gcnt[g], K, N, blockIdx.x,
+                                                 blockIdx.y * kts, kts));
 }
 
 // decode / verify, persistent: a fixed grid (the resident CTAs) loops over the tasks (t, item g, slice s, n-block), n-block
 // fastest (neighbouring CTAs read neighbouring trellis bytes). Per task exactly gemv_grouped_kernel's gemv_block, so the
 // partials are bitwise equal for any grid, tile shape or prefetch depth; only the schedule and the bytes in flight differ.
 template <class C, int BITS, int TPW, int PF, int WARPS>
-__global__ __launch_bounds__(WARPS * 32) void gemv_persist_kernel(const half* __restrict__ xh, const uint64_t* __restrict__ tab,
+__global__ __launch_bounds__(WARPS * 32, BITS == 0 ? 4 : 0) void gemv_persist_kernel(const half* __restrict__ xh, const uint64_t* __restrict__ tab,
                                                                   int tr_slot0, const int* __restrict__ G, const int* __restrict__ gexp,
                                                                   const int* __restrict__ goff, const int* __restrict__ gcnt, int T, int P,
                                                                   int K, int N, int S, int kts, float* __restrict__ part)
 {
     pdl_enter();
-    const int nb = N / (16 * WARPS * TPW), gn = *G, total = T * gn * S * nb;
+    const int nb = C::VARW ? (N + 16 * WARPS * TPW - 1) / (16 * WARPS * TPW) : N / (16 * WARPS * TPW), gn = *G, total = T * gn * S * nb;
     for (int task = blockIdx.x; task < total; task += gridDim.x)
     {
         const int nblk = task % nb;
@@ -246,10 +302,16 @@ __global__ __launch_bounds__(WARPS * 32) void gemv_persist_kernel(const half* __
         const int s = rest % S;
         rest /= S;
         const int g = rest % gn, t = rest / gn;
+        // VARW: the expert's own width replaces C::I (gate/up: N columns; down: K, reduced in its own S slices)
+        const int we = ewidth<C>(tab, gexp[g]);
+        const int Ne = C::VARW && N == C::I ? we : N, Ke = C::VARW && K == C::I ? we : K;
+        const int ktse = C::VARW && K == C::I ? (Ke / 16 + S - 1) / S : kts;
+        if (C::VARW && nblk * 16 * WARPS * TPW >= Ne) continue;
         const uint32_t* tr = (const uint32_t*) tab[(tr_slot0 + t) * C::E + gexp[g]];
         const int64_t r0 = (int64_t) t * P + goff[g];
-        qexl3::gemv_block<BITS, TPW, PF, WARPS, 1, C::CBK, false>(xh + r0 * K, tr, part + ((int64_t) s * T * P + r0) * N, gcnt[g], K, N, nblk,
-                                                           s * kts, kts);
+        MOEX_WITH_BITS(BITS, expert_bits<C>(tab, gexp[g]),
+            moex_gemv<KB, TPW, PF, WARPS, 1, C::CBK, false, DYN, C::VARW>(xh + r0 * K, K, tr, part + ((int64_t) s * T * P + r0) * N, N, gcnt[g], Ke, Ne, nblk,
+                                                                 s * ktse, ktse));
     }
 }
 
@@ -334,7 +396,7 @@ __global__ __launch_bounds__(WARPS * 32) void gemv_wide_kernel(const half* __res
 // rdy[g]; stage-2 tasks of g wait for rdy[g]. Deadlock-free: all CTAs are co-resident (grid <= occupancy) and every CTA
 // takes its tasks in increasing order, so it has finished all its stage-1 tasks before it waits on any item.
 template <class C, int BITS, int TPW, int PF, int WARPS, bool APF>
-__global__ __launch_bounds__(WARPS * 32) void moe_fused_kernel(const half* __restrict__ xh1, half* __restrict__ xh2,
+__global__ __launch_bounds__(WARPS * 32, BITS == 0 ? 4 : 0) void moe_fused_kernel(const half* __restrict__ xh1, half* __restrict__ xh2,
                                                                const uint64_t* __restrict__ tab, const int* __restrict__ G,
                                                                const int* __restrict__ gexp, const int* __restrict__ goff,
                                                                const int* __restrict__ gcnt, int P, int S1, int kts1, int S2, int kts2,
@@ -342,7 +404,7 @@ __global__ __launch_bounds__(WARPS * 32) void moe_fused_kernel(const half* __res
                                                                int* __restrict__ rdy)
 {
     pdl_enter();
-    constexpr int H = C::H, I = C::I, NB1 = I / (16 * WARPS * TPW), NB2 = H / (16 * WARPS * TPW);
+    constexpr int H = C::H, I = C::I, NB1 = (I + 16 * WARPS * TPW - 1) / (16 * WARPS * TPW), NB2 = H / (16 * WARPS * TPW);
     const int gn = *G, T1 = 2 * gn * S1 * NB1, total = T1 + gn * S2 * NB2;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     __shared__ int s_last;
@@ -356,16 +418,19 @@ __global__ __launch_bounds__(WARPS * 32) void moe_fused_kernel(const half* __res
             rest /= S1;
             const int g = rest % gn, t = rest / gn;
             const int64_t r0 = (int64_t) t * P + goff[g];
-            qexl3::gemv_block<BITS, TPW, PF, WARPS, 1, C::CBK, APF>(xh1 + r0 * H, (const uint32_t*) tab[t * C::E + gexp[g]],
-                                                                    part1 + ((int64_t) s * 2 * P + r0) * I, gcnt[g], H, I, nblk, s * kts1, kts1);
+            const int we = ewidth<C>(tab, gexp[g]);   // VARW: blocks past the expert's width have no columns (the counter still counts them)
+            if (!C::VARW || nblk * 16 * WARPS * TPW < we)
+                MOEX_WITH_BITS(BITS, expert_bits<C>(tab, gexp[g]),
+                    moex_gemv<KB, TPW, PF, WARPS, 1, C::CBK, APF, DYN, C::VARW>(xh1 + r0 * H, H, (const uint32_t*) tab[t * C::E + gexp[g]],
+                                                                          part1 + ((int64_t) s * 2 * P + r0) * I, I, gcnt[g], H, we, nblk, s * kts1, kts1));
             __syncthreads();
             if (threadIdx.x == 0) { __threadfence(); s_last = atomicAdd(&cnt1[g], 1) == 2 * S1 * NB1 - 1; }
             __syncthreads();
             if (s_last)
             {
                 __threadfence();
-                const int e = gexp[g], m = gcnt[g], o = goff[g];
-                for (int j = warp; j < m * (I / 128); j += WARPS) mid_row_block<C, true>(part1, S1, tab, P, e, o + j / (I / 128), j % (I / 128), lane, xh2);
+                const int e = gexp[g], m = gcnt[g], o = goff[g], nbe = ewidth<C>(tab, e) / 128;
+                for (int j = warp; j < m * nbe; j += WARPS) mid_row_block<C, true>(part1, S1, tab, P, e, o + j / nbe, j % nbe, lane, xh2);
                 __threadfence();
                 __syncthreads();
                 if (threadIdx.x == 0) atomicExch(&rdy[g], 1);
@@ -377,8 +442,10 @@ __global__ __launch_bounds__(WARPS * 32) void moe_fused_kernel(const half* __res
             if (threadIdx.x == 0) { while (*(volatile int*) &rdy[g] == 0) __nanosleep(32); __threadfence(); }
             __syncthreads();
             const int64_t r0 = goff[g];
-            qexl3::gemv_block<BITS, TPW, PF, WARPS, 1, C::CBK, APF>(xh2 + r0 * I, (const uint32_t*) tab[2 * C::E + gexp[g]],
-                                                                    part2 + ((int64_t) s * P + r0) * H, gcnt[g], I, H, nblk, s * kts2, kts2);
+            const int we = ewidth<C>(tab, gexp[g]), ktse = C::VARW ? (we / 16 + S2 - 1) / S2 : kts2;   // VARW: the expert's own K slices
+            MOEX_WITH_BITS(BITS, expert_bits<C>(tab, gexp[g]),
+                moex_gemv<KB, TPW, PF, WARPS, 1, C::CBK, APF, DYN, C::VARW>(xh2 + r0 * I, I, (const uint32_t*) tab[2 * C::E + gexp[g]],
+                                                                      part2 + ((int64_t) s * P + r0) * H, H, gcnt[g], we, H, nblk, s * ktse, ktse));
         }
         __syncthreads();
     }
@@ -392,7 +459,7 @@ bool launch_fused(int tpw, int pf, int warps, int apf, int ctas, const half* xh1
     auto k = moe_fused_kernel<C, BITS, TPW, PF, WARPS, APF>;
     static int occ = [&] { int n = 0; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, k, WARPS * 32, 0); return n; }();
     const int per_sm = ctas > 0 && ctas < occ ? ctas : occ;
-    const int NB1 = C::I / (16 * WARPS * TPW), NB2 = C::H / (16 * WARPS * TPW);
+    const int NB1 = (C::I + 16 * WARPS * TPW - 1) / (16 * WARPS * TPW), NB2 = C::H / (16 * WARPS * TPW);
     const int tasks = 2 * Gmax * S1 * NB1 + Gmax * S2 * NB2;
     const int grid = min(tasks, per_sm * sm_count());
     klaunch<C>(k, grid, WARPS * 32, st, xh1, xh2, tab, G, gexp, goff, gcnt, P, S1, (C::H / 16 + S1 - 1) / S1, S2, (C::I / 16 + S2 - 1) / S2,
@@ -414,11 +481,13 @@ bool launch_persist(const GemvCfg& c, const half* xh, const uint64_t* tab, int t
                     const int* gcnt, int Gmax, int T, int P, int K, int N, int S, float* part, cudaStream_t st)
 {
     if (c.tpw != TPW && !(c.tpw == 104 && TPW == 4) || c.pf != PF || c.warps != WARPS) return false;
-    const int kts = (K / 16 + S - 1) / S, nb = N / (16 * WARPS * TPW);
+    const int kts = (K / 16 + S - 1) / S, nb = C::VARW ? (N + 16 * WARPS * TPW - 1) / (16 * WARPS * TPW) : N / (16 * WARPS * TPW);
     const int tasks = T * Gmax * S * nb, grid = c.ctas > 0 ? min(tasks, c.ctas * sm_count()) : tasks;
     if (c.tpw == 104)   // experiment: wide loads (timing only)
     {
-        gemv_wide_kernel<C, BITS, PF, WARPS><<<grid, WARPS * 32, 0, st>>>(xh, tab, tr_slot0, G, gexp, goff, gcnt, T, P, K, N, S, kts, part);
+        if constexpr (BITS == 4)
+            gemv_wide_kernel<C, BITS, PF, WARPS><<<grid, WARPS * 32, 0, st>>>(xh, tab, tr_slot0, G, gexp, goff, gcnt, T, P, K, N, S, kts, part);
+        else { fprintf(stderr, "[moe] wide GEMV experiment is 4-bit only\n"); abort(); }
         return true;
     }
     klaunch<C>(gemv_persist_kernel<C, BITS, TPW, PF, WARPS>, grid, WARPS * 32, st, xh, tab, tr_slot0, G, gexp, goff, gcnt, T, P, K, N, S, kts, part);
@@ -448,7 +517,7 @@ __device__ __forceinline__ void cp16(void* s, const void* g)
 }
 // FIN (svh_slot >= 0): the finish (had128 over the block's 128 columns * svh) runs in the epilogue and y gets the
 // finished rows (the same fwht128 lane layout as finish_grouped_kernel, so bitwise equal).
-template <class C, int BITS, int WARPS = 4, typename OT = float>
+template <class C, int BITS, int WARPS = 4, typename OT = float, bool KF = false>
 __global__ __launch_bounds__(WARPS * 32) void gemm_grouped_kernel(const half* __restrict__ xh, const uint64_t* __restrict__ tab,
                                                            int tr_slot0, const int* __restrict__ G, const int* __restrict__ gexp,
                                                            const int* __restrict__ goff, const int* __restrict__ gcnt, int Gmax,
@@ -459,6 +528,7 @@ __global__ __launch_bounds__(WARPS * 32) void gemm_grouped_kernel(const half* __
     __shared__ __align__(16) uint32_t sw[2][TW];
     const int tg = blockIdx.y, t = tg / Gmax, g = tg % Gmax;
     if (g >= *G) return;
+    if constexpr (KF) { if (expert_bits<C>(tab, gexp[g]) != BITS) return; }
     const int M = gcnt[g];
     const int64_t r0 = (int64_t) t * P + goff[g];
     const half* A = xh + r0 * K;
@@ -484,7 +554,7 @@ __global__ __launch_bounds__(WARPS * 32) void gemm_grouped_kernel(const half* __
         asm volatile("cp.async.commit_group;\n" ::);
     };
     float c[8][TPW][2][4] = {};
-    const int nkc = K / KC;
+    const int nkc = (C::VARW && K == C::I ? ewidth<C>(tab, gexp[g]) : K) / KC;   // VARW down: the expert's own K (A rows stay K apart)
     load(0, 0);
     for (int kc = 0; kc < nkc; ++kc)
     {
@@ -501,7 +571,8 @@ __global__ __launch_bounds__(WARPS * 32) void gemm_grouped_kernel(const half* __
             for (int u = 0; u < TPW; ++u)
             {
                 const uint32_t* p = W + (kk * 8 + warp * TPW + u) * NW;
-                qexl3::decode_tile<BITS, C::CBK>(p[lane], NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u, lane, bb[kk][u]);
+                if constexpr (BITS == 4) qexl3::decode_tile<BITS, C::CBK>(p[lane], 0u, lane, bb[kk][u]);
+                else qexl3::decode_tile_sm<BITS, C::CBK>(p, lane, bb[kk][u]);
             }
         #pragma unroll
         for (int kk = 0; kk < KC / 16; ++kk)
@@ -592,18 +663,21 @@ __global__ __launch_bounds__(WARPS * 32) void gemm_grouped_kernel(const half* __
 // (= one Hadamard block of the down input). Same operations and fwht128 lane layout as the unfused stages
 // (had_grouped, products, finish, act, had_grouped), so bitwise equal.
 constexpr int H2 = 64, SA2 = 128 + 8;
-template <class C, int BITS>
+template <class C, int BITS, bool KF = false>
 __global__ __launch_bounds__(256, 2) void gux_kernel(const typename C::XT* __restrict__ x, int64_t ldx, const uint64_t* __restrict__ tab,
                                                      const int* __restrict__ G, const int* __restrict__ gexp, const int* __restrict__ goff,
                                                      const int* __restrict__ gcnt, const int* __restrict__ prow, half* __restrict__ xh2)
 {
-    constexpr int NW = 8 * BITS, K = C::H, N = C::I, Nt = N / 16;
+    constexpr int NW = 8 * BITS, K = C::H, N = C::I;
     __shared__ __align__(16) half sg[H2 * SA2], su[H2 * SA2];
     const int g = blockIdx.y >> 1, hf = blockIdx.y & 1;
     if (g >= *G) return;
+    if constexpr (KF) { if (expert_bits<C>(tab, gexp[g]) != BITS) return; }
     const int M = min(H2, gcnt[g] - hf * H2);
     if (M <= 0) return;
     const int e = gexp[g], MT = (M + 15) / 16;
+    const int we = ewidth<C>(tab, e), Nt = we / 16;   // VARW: the expert's own width (weights' tile stride); blocks past it idle
+    if (C::VARW && blockIdx.x * 128 >= we) return;
     const int64_t r0 = goff[g] + hf * H2;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nt = blockIdx.x * 8 + warp;
@@ -617,8 +691,8 @@ __global__ __launch_bounds__(256, 2) void gux_kernel(const typename C::XT* __res
     {
         const uint32_t* pg = tr_g + ((int64_t) kt * Nt + nt) * NW;
         const uint32_t* pu = tr_u + ((int64_t) kt * Nt + nt) * NW;
-        wg[0] = __ldcs(pg + lane); wg[1] = NW > 32 && lane + 32 < NW ? __ldcs(pg + 32 + lane) : 0u;
-        wu[0] = __ldcs(pu + lane); wu[1] = NW > 32 && lane + 32 < NW ? __ldcs(pu + 32 + lane) : 0u;
+        wg[0] = NW >= 32 || lane < NW ? __ldcs(pg + lane) : 0u; wg[1] = NW > 32 && lane + 32 < NW ? __ldcs(pg + 32 + lane) : 0u;
+        wu[0] = NW >= 32 || lane < NW ? __ldcs(pu + lane) : 0u; wu[1] = NW > 32 && lane + 32 < NW ? __ldcs(pu + 32 + lane) : 0u;
     };
     // transform layout: 8 lanes per row (part p = lane % 8 holds elements 16p..16p+15), 4 rows per warp pass, the
     // warp's rows r = warp + 8 (4 pass + lane / 8) < M; gate then up from the same loaded x values. fwht128_16: the
@@ -762,8 +836,8 @@ __global__ __launch_bounds__(256, 2) void gux_shared_kernel(const half* __restri
     {
         const uint32_t* pg = tr_g + ((int64_t) kt * Nt + nt) * NW;
         const uint32_t* pu = tr_u + ((int64_t) kt * Nt + nt) * NW;
-        wg[0] = __ldcs(pg + lane); wg[1] = NW > 32 && lane + 32 < NW ? __ldcs(pg + 32 + lane) : 0u;
-        wu[0] = __ldcs(pu + lane); wu[1] = NW > 32 && lane + 32 < NW ? __ldcs(pu + 32 + lane) : 0u;
+        wg[0] = NW >= 32 || lane < NW ? __ldcs(pg + lane) : 0u; wg[1] = NW > 32 && lane + 32 < NW ? __ldcs(pg + 32 + lane) : 0u;
+        wu[0] = NW >= 32 || lane < NW ? __ldcs(pu + lane) : 0u; wu[1] = NW > 32 && lane + 32 < NW ? __ldcs(pu + 32 + lane) : 0u;
     };
     // A = the per-token transformed input (shared-input layers: one had128(x * suh) per token for every expert),
     // gathered by token in k-blocks of 128 (one Hadamard block) with cp.async, double buffered.
@@ -887,7 +961,7 @@ template <class C>
 __global__ __launch_bounds__(512) void prep_small_kernel(const typename C::IT* __restrict__ idx, int R, int GR, int* __restrict__ eoff,
                                                          int* __restrict__ G, int* __restrict__ gexp, int* __restrict__ goff,
                                                          int* __restrict__ gcnt, int* __restrict__ pairmap, int* __restrict__ prow,
-                                                         int* __restrict__ pexp, int* __restrict__ zero = nullptr, int nzero = 0)
+                                                         int* __restrict__ pexp, const uint64_t* __restrict__ tab, int* __restrict__ zero = nullptr, int nzero = 0)
 {
     pdl_enter();
     for (int i = threadIdx.x; i < nzero; i += blockDim.x) zero[i] = 0;
@@ -901,7 +975,8 @@ __global__ __launch_bounds__(512) void prep_small_kernel(const typename C::IT* _
     // exclusive prefix sums of rows and items over the experts (block scan; the same integers as a serial scan)
     __shared__ int w_rows[32], w_items[32];
     const int lane = e & 31, wp = e >> 5;
-    int ir = tot, ii = (tot + GR - 1) / GR;
+    const bool held = held_e<C>(tab, e);
+    int ir = tot, ii = held ? (tot + GR - 1) / GR : 0;
     #pragma unroll
     for (int o = 1; o < 32; o <<= 1)
     {
@@ -925,9 +1000,9 @@ __global__ __launch_bounds__(512) void prep_small_kernel(const typename C::IT* _
     }
     __syncthreads();
     s_rows[e] = ir - tot + (wp ? w_rows[wp - 1] : 0);
-    s_items[e] = ii - (tot + GR - 1) / GR + (wp ? w_items[wp - 1] : 0);
+    s_items[e] = ii - (held ? (tot + GR - 1) / GR : 0) + (wp ? w_items[wp - 1] : 0);
     eoff[e] = s_rows[e];
-    for (int i = 0, it = s_items[e]; i * GR < tot; ++i, ++it)
+    for (int i = 0, it = s_items[e]; held && i * GR < tot; ++i, ++it)
     {
         gexp[it] = e;
         goff[it] = s_rows[e] + i * GR;
@@ -949,7 +1024,7 @@ __global__ void mid_grouped_kernel(const float* __restrict__ part, int S, const 
     constexpr int N = C::I;
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     const int b = warp % (N / 128), row = warp / (N / 128);
-    if (row >= P) return;
+    if (row >= P || (C::VARW && b * 128 >= ewidth<C>(tab, pexp[row]))) return;   // VARW: blocks past the expert's width
     mid_row_block<C, false>(part, S, tab, P, pexp[row], row, b, lane, xh2);
 }
 template <class C, bool CG>
@@ -1008,12 +1083,18 @@ __device__ __forceinline__ float4 ld4(const half* p)
 }
 template <class C, typename YT>
 __global__ void combine_kernel(const YT* __restrict__ yd, const int* __restrict__ pairmap, const typename C::WT* __restrict__ w,
-                               const float* __restrict__ add, float* __restrict__ out, int N)
+                               const float* __restrict__ add, float* __restrict__ out, int N,
+                               const typename C::IT* __restrict__ idx, const uint64_t* __restrict__ tab)
 {
     __shared__ int pm[C::TOPK];
     __shared__ float pw[C::TOPK];
+    __shared__ bool ph[C::TOPK];
     int r = blockIdx.x;
-    if (threadIdx.x < C::TOPK) { pm[threadIdx.x] = pairmap[r * C::TOPK + threadIdx.x]; pw[threadIdx.x] = tof(w[r * C::TOPK + threadIdx.x]); }
+    if (threadIdx.x < C::TOPK)
+    {
+        pm[threadIdx.x] = pairmap[r * C::TOPK + threadIdx.x]; pw[threadIdx.x] = tof(w[r * C::TOPK + threadIdx.x]);
+        if constexpr (C::HOLDERS) ph[threadIdx.x] = held_e<C>(tab, (int) idx[r * C::TOPK + threadIdx.x]);
+    }
     __syncthreads();
     for (int n = threadIdx.x * 4; n < N; n += blockDim.x * 4)
     {
@@ -1021,6 +1102,7 @@ __global__ void combine_kernel(const YT* __restrict__ yd, const int* __restrict_
         #pragma unroll
         for (int k = 0; k < C::TOPK; ++k)
         {
+            if constexpr (C::HOLDERS) { if (!ph[k]) continue; }   // another rank's expert (its pair has no output here)
             float4 v = ld4(yd + (int64_t) pm[k] * N + n);
             acc.x += pw[k] * v.x; acc.y += pw[k] * v.y; acc.z += pw[k] * v.z; acc.w += pw[k] * v.w;
         }
@@ -1147,7 +1229,7 @@ __global__ __launch_bounds__(512) void gu_gemm_kernel(const half* __restrict__ x
     }
 }
 // Paired variant: 8 warps, warp w computes both the gate and the up n16 tile w (one A fragment feeds 4 MMAs).
-template <class C, int BITS, int STAGES, int KCG = KC, int MINB = 1, int MTN = 8>
+template <class C, int BITS, int STAGES, int KCG = KC, int MINB = 1, int MTN = 8, bool KF = false>
 __global__ __launch_bounds__(256, MINB) void gu2_gemm_kernel(const half* __restrict__ xh1, const uint64_t* __restrict__ tab,
                                                       const int* __restrict__ G, const int* __restrict__ gexp, const int* __restrict__ goff,
                                                       const int* __restrict__ gcnt, const int* __restrict__ prow, half* __restrict__ xh2)
@@ -1159,6 +1241,7 @@ __global__ __launch_bounds__(256, MINB) void gu2_gemm_kernel(const half* __restr
     // MTN row tiles per CTA: an item (<= GM rows) is split into GM / (16 MTN) parts along blockIdx.y
     const int g = blockIdx.y / PARTS, hf = blockIdx.y % PARTS;
     if (g >= *G) return;
+    if constexpr (KF) { if (expert_bits<C>(tab, gexp[g]) != BITS) return; }
     const int M = min(GMR, gcnt[g] - hf * GMR), e = gexp[g], MT = (M + 15) / 16;
     if (M <= 0) return;
     const int64_t r0 = goff[g] + hf * GMR;
@@ -1194,19 +1277,31 @@ __global__ __launch_bounds__(256, MINB) void gu2_gemm_kernel(const half* __restr
         if (kc + STAGES - 1 < nkc) load(kc + STAGES - 1, (kc + STAGES - 1) % STAGES); else asm volatile("cp.async.commit_group;\n" ::);
         const half* S = sa + (kc % STAGES) * GMR * SAG;
         const uint32_t* W = sw + (kc % STAGES) * 2 * TW;
-        uint32_t bb[KCG / 16][2][4];
-        #pragma unroll
-        for (int kk = 0; kk < KCG / 16; ++kk)
+        // b <= 4: every k16 step's B fragments decoded up front. b >= 5 (heavier decode): decoded per k16 step right
+        // before its MMAs, so the decode temporaries never coexist with all KCG / 16 steps' fragments (the KCG = 64
+        // b = 5 / 6 instances spilled ~108 bytes). The same MMAs in the same order either way.
+        constexpr bool UP = BITS <= 4;
+        constexpr int KD = UP ? KCG / 16 : 1;
+        uint32_t bb[KD][2][4];
+        if constexpr (UP)
         {
             #pragma unroll
-            for (int m = 0; m < 2; ++m)
-            {
-                const uint32_t* p = W + m * TW + (kk * 8 + wn) * NW;
-                qexl3::decode_tile<BITS, C::CBK>(p[lane], NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u, lane, bb[kk][m]);
-            }
+            for (int kk = 0; kk < KCG / 16; ++kk)
+                #pragma unroll
+                for (int m = 0; m < 2; ++m)
+                {
+                    const uint32_t* p = W + m * TW + (kk * 8 + wn) * NW;
+                    if constexpr (BITS == 4) qexl3::decode_tile<BITS, C::CBK>(p[lane], 0u, lane, bb[kk][m]);
+                    else qexl3::decode_tile_sm<BITS, C::CBK>(p, lane, bb[kk][m]);
+                }
         }
         #pragma unroll
         for (int kk = 0; kk < KCG / 16; ++kk)
+        {
+            const int kb = UP ? kk : 0;
+            if constexpr (!UP)
+                #pragma unroll
+                for (int m = 0; m < 2; ++m) qexl3::decode_tile_sm<BITS, C::CBK>(W + m * TW + (kk * 8 + wn) * NW, lane, bb[0][m]);
             #pragma unroll
             for (int mt = 0; mt < MTN; ++mt)
             {
@@ -1219,10 +1314,11 @@ __global__ __launch_bounds__(256, MINB) void gu2_gemm_kernel(const half* __restr
                 #pragma unroll
                 for (int m = 0; m < 2; ++m)
                 {
-                    qexl3::mma16816(c[m][mt][0], a, bb[kk][m][0], bb[kk][m][1]);
-                    qexl3::mma16816(c[m][mt][1], a, bb[kk][m][2], bb[kk][m][3]);
+                    qexl3::mma16816(c[m][mt][0], a, bb[kb][m][0], bb[kb][m][1]);
+                    qexl3::mma16816(c[m][mt][1], a, bb[kb][m][2], bb[kb][m][3]);
                 }
             }
+        }
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
     __syncthreads();
@@ -1272,9 +1368,9 @@ __global__ __launch_bounds__(256, MINB) void gu2_gemm_kernel(const half* __restr
         __syncthreads();
     }
 }
-template <int STAGES, int KCG = KC, int ROWS = GM> constexpr size_t gu_smem_bytes()   // 4-bit
+template <int STAGES, int KCG = KC, int ROWS = GM, int BITS = 4> constexpr size_t gu_smem_bytes()
 {
-    constexpr size_t a = STAGES * (ROWS * (KCG + 8) * sizeof(half) + 2 * (KCG / 16) * 8 * 32 * sizeof(uint32_t));
+    constexpr size_t a = STAGES * (ROWS * (KCG + 8) * sizeof(half) + 2 * (KCG / 16) * 8 * (8 * BITS) * sizeof(uint32_t));
     return a > 2 * 16 * 128 * sizeof(float) ? a : 2 * 16 * 128 * sizeof(float);   // the epilogue's fp32 row tiles
 }
 
@@ -1295,6 +1391,7 @@ __global__ void finish_combine_kernel(const float* __restrict__ part, int S, con
     for (int k = 0; k < C::TOPK; ++k)
     {
         const int row = pairmap[r * C::TOPK + k];
+        if (!held_e<C>(tab, pexp[row])) continue;   // C::HOLDERS: another rank's expert
         const half* svh = (const half*) tab[8 * C::E + pexp[row]];
         const float wk = tof(w[r * C::TOPK + k]);
         float v[4] = {};
@@ -1321,7 +1418,12 @@ void launch_products(const half* xh, const uint64_t* tab, int tr_slot0, const in
                      const int* gcnt, int Gmax, int GR, int T, int P, int K, int N, int S, float* part, cudaStream_t st)
 {
     if (GR == GM)
-        gemm_grouped_kernel<C, BITS><<<dim3(N / 128, T * Gmax), 128, 0, st>>>(xh, tab, tr_slot0, G, gexp, goff, gcnt, Gmax, P, K, N, part, -1);
+    {
+        // non-persistent configs only (GlmMoe is persistent); mixed-K layers never take it
+        if constexpr (BITS != 0)
+            gemm_grouped_kernel<C, BITS><<<dim3(N / 128, T * Gmax), 128, 0, st>>>(xh, tab, tr_slot0, G, gexp, goff, gcnt, Gmax, P, K, N, part, -1);
+        else { fprintf(stderr, "[moe] mixed-K: grouped GEMM product path not supported\n"); abort(); }
+    }
     else
     {
         int kts = (K / 16 + S - 1) / S;
@@ -1365,13 +1467,57 @@ size_t ws_bytes(int R, int S)
     return b;
 }
 
+// Mixed-K prefill: one launch per K present in kmask (bit K), KF instances (the other experts' CTAs return at once).
+template <class C, int B, int NS, int KCG>
+void gu2_k(const half* xh1, const uint64_t* tab, const int* G, const int* gexp, const int* goff, const int* gcnt, const int* prow,
+           half* xh2, int Gmax, cudaStream_t st)
+{
+    constexpr size_t sm = gu_smem_bytes<NS, KCG, 64, B>();
+    static bool a = cudaFuncSetAttribute(gu2_gemm_kernel<C, B, NS, KCG, 2, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm) == cudaSuccess;
+    (void) a;
+    gu2_gemm_kernel<C, B, NS, KCG, 2, 4, true><<<dim3(C::I / 128, 2 * Gmax), 256, sm, st>>>(xh1, tab, G, gexp, goff, gcnt, prow, xh2);
+}
+template <class C, int NS, int KCG>
+void gu2_mixed(int kmask, const half* xh1, const uint64_t* tab, const int* G, const int* gexp, const int* goff, const int* gcnt,
+               const int* prow, half* xh2, int Gmax, cudaStream_t st)
+{
+    if (kmask & (1 << 3)) gu2_k<C, 3, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
+    if (kmask & (1 << 4)) gu2_k<C, 4, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
+    if (kmask & (1 << 5)) gu2_k<C, 5, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
+    if (kmask & (1 << 6)) gu2_k<C, 6, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
+}
+template <class C, typename XT>
+void gux_mixed(int kmask, const XT* x, int64_t ldx, const uint64_t* tab, const int* G, const int* gexp, const int* goff, const int* gcnt,
+               const int* prow, half* xh2, int Gmax, cudaStream_t st)
+{
+    const dim3 grid(C::I / 128, 2 * Gmax);
+    if (kmask & (1 << 3)) gux_kernel<C, 3, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
+    if (kmask & (1 << 4)) gux_kernel<C, 4, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
+    if (kmask & (1 << 5)) gux_kernel<C, 5, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
+    if (kmask & (1 << 6)) gux_kernel<C, 6, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
+}
+template <class C, typename OT>
+void down_mixed(int kmask, const half* xh2, const uint64_t* tab, const int* G, const int* gexp, const int* goff, const int* gcnt, int Gmax,
+                int P, OT* yd, cudaStream_t st)
+{
+    const dim3 grid(C::H / 128, Gmax);
+    if (kmask & (1 << 3)) gemm_grouped_kernel<C, 3, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
+    if (kmask & (1 << 4)) gemm_grouped_kernel<C, 4, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
+    if (kmask & (1 << 5)) gemm_grouped_kernel<C, 5, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
+    if (kmask & (1 << 6)) gemm_grouped_kernel<C, 6, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
+}
+
 // x [R, H] (row stride ldx), idx / w [R, TOPK], out [R, H] fp32 (+ add [R, H] fp32 if given).
 // shared: the layer's experts share one gate/up input scale vector suh0 (device pointer; prefill transforms each token once).
 template <class C>
 int experts(const void* x, int64_t ldx, int R, const void* idx, const void* w, const void* tab, const void* add, void* out,
-            void* ws, int S, cudaStream_t st, const void* suh0 = nullptr)
+            void* ws, int S, cudaStream_t st, const void* suh0 = nullptr, int kmask = 1 << 4)
 {
     const bool shared = suh0 != nullptr;
+    if (C::VARW && shared) { fprintf(stderr, "[moe] variable-width experts take no shared input scales\n"); abort(); }
+    // kmask: bit K set when an expert of the layer has trellis width K. 1 << 4 (uniform 4-bit): the previous kernels exactly.
+    const bool mixed = kmask != (1 << 4);
+    if (mixed && (kmask & ~0x78)) { fprintf(stderr, "[moe] unsupported expert K mask 0x%x (K must be 3..6)\n", kmask); abort(); }
     constexpr int H = C::H, I = C::I, E = C::E;
     using XT = typename C::XT;
     using IT = typename C::IT;
@@ -1395,7 +1541,7 @@ int experts(const void* x, int64_t ldx, int R, const void* idx, const void* w, c
         half* xh2 = (half*) take((size_t) P * I * 2);
         void* yd = take((size_t) P * H * 4);
         count_kernel<C><<<nb, E, 0, st>>>((const IT*) idx, R, cblk);
-        scan_kernel<C><<<1, E, 0, st>>>(cblk, nb, GR, eoff, G, gexp, goff, gcnt);
+        scan_kernel<C><<<1, E, 0, st>>>(cblk, nb, GR, eoff, G, gexp, goff, gcnt, tab_);
         fill_kernel<C><<<nb, E, 0, st>>>((const IT*) idx, R, cblk, eoff, pairmap, prow);
         if (shared)
         {
@@ -1419,7 +1565,16 @@ int experts(const void* x, int64_t ldx, int R, const void* idx, const void* w, c
             static const int kcg = [] { const char* v = getenv("GLM53_MOE_GU_KC"); return v ? atoi(v) : 64; }();
 #define GU4(n, kc) do { static bool a = cudaFuncSetAttribute(gu2_gemm_kernel<C, 4, n, kc, 2, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gu_smem_bytes<n, kc, 64>()) == cudaSuccess; (void) a; \
                         gu2_gemm_kernel<C, 4, n, kc, 2, 4><<<dim3(I / 128, 2 * Gmax), 256, gu_smem_bytes<n, kc, 64>(), st>>>(xh1, tab_, G, gexp, goff, gcnt, prow, xh2); } while (0)
-            if (pmode == 4)
+            if (mixed)
+            {
+                if (pmode != 4) { fprintf(stderr, "[moe] mixed-K layers need GLM53_MOE_GU_PAIR=4 (default)\n"); abort(); }
+                if (kcg == 32) { if (stages == 2) gu2_mixed<C, 2, 32>(kmask, xh1, tab_, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
+                                 else if (stages == 3) gu2_mixed<C, 3, 32>(kmask, xh1, tab_, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
+                                 else gu2_mixed<C, 4, 32>(kmask, xh1, tab_, G, gexp, goff, gcnt, prow, xh2, Gmax, st); }
+                else { if (stages == 2) gu2_mixed<C, 2, 64>(kmask, xh1, tab_, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
+                       else gu2_mixed<C, 3, 64>(kmask, xh1, tab_, G, gexp, goff, gcnt, prow, xh2, Gmax, st); }
+            }
+            else if (pmode == 4)
             {
                 if (kcg == 32) { if (stages == 2) GU4(2, 32); else if (stages == 3) GU4(3, 32); else GU4(4, 32); }
                 else { if (stages == 2) GU4(2, 64); else GU4(3, 64); }
@@ -1432,21 +1587,24 @@ int experts(const void* x, int64_t ldx, int R, const void* idx, const void* w, c
 #undef GU2
 #undef GU
         }
+        else if (mixed) gux_mixed<C, XT>(kmask, (const XT*) x, ldx, tab_, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
         else gux_kernel<C, 4><<<dim3(I / 128, 2 * Gmax), 256, 0, st>>>((const XT*) x, ldx, tab_, G, gexp, goff, gcnt, prow, xh2);
         // QWEN_MOE_YD16=1 (read per launch; off): the routed experts' outputs in fp16 (halves the down GEMM's writes and the
         // combine's reads). 2026-10-07: tail-512 KL vs the fp32 reference 0.00245 -> 0.00924, not adopted.
         const char* y16 = getenv("QWEN_MOE_YD16");
         if (!(C::YD16 || (y16 && *y16 == '1')))
         {
-            gemm_grouped_kernel<C, 4, 8, float><<<dim3(H / 128, Gmax), 256, 0, st>>>(xh2, tab_, 2, G, gexp, goff, gcnt, Gmax, P,
+            if (mixed) down_mixed<C, float>(kmask, xh2, tab_, G, gexp, goff, gcnt, Gmax, P, (float*) yd, st);
+            else gemm_grouped_kernel<C, 4, 8, float><<<dim3(H / 128, Gmax), 256, 0, st>>>(xh2, tab_, 2, G, gexp, goff, gcnt, Gmax, P,
                                                                                    I, H, (float*) yd, 8);
-            combine_kernel<C, float><<<R, 256, 0, st>>>((const float*) yd, pairmap, (const WT*) w, (const float*) add, (float*) out, H);
+            combine_kernel<C, float><<<R, 256, 0, st>>>((const float*) yd, pairmap, (const WT*) w, (const float*) add, (float*) out, H, (const IT*) idx, tab_);
         }
         else
         {
-            gemm_grouped_kernel<C, 4, 8, half><<<dim3(H / 128, Gmax), 256, 0, st>>>(xh2, tab_, 2, G, gexp, goff, gcnt, Gmax, P,
+            if (mixed) down_mixed<C, half>(kmask, xh2, tab_, G, gexp, goff, gcnt, Gmax, P, (half*) yd, st);
+            else gemm_grouped_kernel<C, 4, 8, half><<<dim3(H / 128, Gmax), 256, 0, st>>>(xh2, tab_, 2, G, gexp, goff, gcnt, Gmax, P,
                                                                                   I, H, (half*) yd, 8);
-            combine_kernel<C, half><<<R, 256, 0, st>>>((const half*) yd, pairmap, (const WT*) w, (const float*) add, (float*) out, H);
+            combine_kernel<C, half><<<R, 256, 0, st>>>((const half*) yd, pairmap, (const WT*) w, (const float*) add, (float*) out, H, (const IT*) idx, tab_);
         }
         return (int) cudaGetLastError();
     }
@@ -1464,12 +1622,13 @@ int experts(const void* x, int64_t ldx, int R, const void* idx, const void* w, c
     // QWEN_MOE_UNFUSED=1 (read per launch, i.e. at graph capture): the separate grouping / finish / act / transform
     const char* uf = getenv("QWEN_MOE_UNFUSED");
     const bool fused = nb == 1 && !(uf && *uf == '1');
+    if (C::VARW && !fused && !(R > 64 || GR == GM)) { fprintf(stderr, "[moe] variable-width experts need the fused decode path\n"); abort(); }
     if (fused) klaunch<C>(prep_small_kernel<C>, 1, E, st, (const IT*) idx, R, GR, eoff, G, gexp, goff, gcnt, pairmap, prow, pexp,
-                          cnt1, fuse_all ? 2 * Gmax : 0);
+                          tab_, cnt1, fuse_all ? 2 * Gmax : 0);
     else
     {
         count_kernel<C><<<nb, E, 0, st>>>((const IT*) idx, R, cblk);
-        scan_kernel<C><<<1, E, 0, st>>>(cblk, nb, GR, eoff, G, gexp, goff, gcnt);
+        scan_kernel<C><<<1, E, 0, st>>>(cblk, nb, GR, eoff, G, gexp, goff, gcnt, tab_);
         fill_kernel<C><<<nb, E, 0, st>>>((const IT*) idx, R, cblk, eoff, pairmap, prow);
         pexp_kernel<<<Gmax, 128, 0, st>>>(G, gexp, goff, gcnt, pexp);
     }
@@ -1481,18 +1640,25 @@ int experts(const void* x, int64_t ldx, int R, const void* idx, const void* w, c
     if (fuse_all)
     {
         S2 = gc.s2;
-#define LF(a, b, c, d) launch_fused<C, 4, a, b, c, d>(gc.tpw, gc.pf, gc.warps, gc.apf, gc.ctas, xh1, xh2, tab_, G, gexp, goff, gcnt, Gmax, P, gc.s1, \
-                                                       gc.s2, part, part2, cnt1, cnt1 + Gmax, st)
+#define LFA gc.tpw, gc.pf, gc.warps, gc.apf, gc.ctas, xh1, xh2, tab_, G, gexp, goff, gcnt, Gmax, P, gc.s1, gc.s2, part, part2, cnt1, cnt1 + Gmax, st
+#define LF(a, b, c, d) (mixed ? launch_fused<C, 0, a, b, c, d>(LFA) : launch_fused<C, 4, a, b, c, d>(LFA))
         if (!(LF(2, 4, 4, false) || LF(2, 4, 4, true) || LF(4, 4, 4, false) || LF(4, 4, 4, true) || LF(2, 8, 4, false) || LF(4, 8, 4, true)
               || LF(8, 4, 4, false) || LF(8, 4, 4, true) || LF(4, 4, 8, false) || LF(4, 4, 8, true)))
         { fprintf(stderr, "[moe] no fused instance\n"); abort(); }
 #undef LF
+#undef LFA
         warps = R * (H / 128);
         klaunch<C>(finish_combine_kernel<C>, (warps * 32 + 255) / 256, 256, st, part2, S2, tab_, P, pairmap, pexp, (const WT*) w,
                    (const float*) add, (float*) out, R);
         return (int) cudaGetLastError();
     }
-    if (C::PERSIST) { S1 = gc.s1; S2 = gc.s2; launch_decode_products<C, 4>(gc, xh1, tab_, 0, G, gexp, goff, gcnt, Gmax, 2, P, H, I, S1, part, st); }
+    if (C::PERSIST)
+    {
+        S1 = gc.s1; S2 = gc.s2;
+        if (mixed) launch_decode_products<C, 0>(gc, xh1, tab_, 0, G, gexp, goff, gcnt, Gmax, 2, P, H, I, S1, part, st);
+        else launch_decode_products<C, 4>(gc, xh1, tab_, 0, G, gexp, goff, gcnt, Gmax, 2, P, H, I, S1, part, st);
+    }
+    else if (mixed) launch_products<C, 0>(xh1, tab_, 0, G, gexp, goff, gcnt, Gmax, GR, 2, P, H, I, S, part, st);
     else launch_products<C, 4>(xh1, tab_, 0, G, gexp, goff, gcnt, Gmax, GR, 2, P, H, I, S, part, st);
     if (fused)
     {
@@ -1507,7 +1673,9 @@ int experts(const void* x, int64_t ldx, int R, const void* idx, const void* w, c
         warps = P * (I / 128);
         had_grouped_kernel<C, float><<<(warps * 32 + 255) / 256, 256, 0, st>>>(act, I, 1, tab_, 5, 1, P, prow, pexp, I, xh2);
     }
-    if (C::PERSIST) launch_decode_products<C, 4>(gc, xh2, tab_, 2, G, gexp, goff, gcnt, Gmax, 1, P, I, H, S2, part, st);
+    if (C::PERSIST && mixed) launch_decode_products<C, 0>(gc, xh2, tab_, 2, G, gexp, goff, gcnt, Gmax, 1, P, I, H, S2, part, st);
+    else if (C::PERSIST) launch_decode_products<C, 4>(gc, xh2, tab_, 2, G, gexp, goff, gcnt, Gmax, 1, P, I, H, S2, part, st);
+    else if (mixed) launch_products<C, 0>(xh2, tab_, 2, G, gexp, goff, gcnt, Gmax, GR, 1, P, I, H, S, part, st);
     else launch_products<C, 4>(xh2, tab_, 2, G, gexp, goff, gcnt, Gmax, GR, 1, P, I, H, S, part, st);
     if (C::FINISH_COMBINE)
     {
@@ -1518,7 +1686,7 @@ int experts(const void* x, int64_t ldx, int R, const void* idx, const void* w, c
     }
     warps = P * (H / 128);
     finish_grouped_kernel<C><<<(warps * 32 + 255) / 256, 256, 0, st>>>(part, S2, tab_, 8, 1, P, pexp, H, yd);
-    combine_kernel<C, float><<<R, 256, 0, st>>>(yd, pairmap, (const WT*) w, (const float*) add, (float*) out, H);
+    combine_kernel<C, float><<<R, 256, 0, st>>>(yd, pairmap, (const WT*) w, (const float*) add, (float*) out, H, (const IT*) idx, tab_);
     return (int) cudaGetLastError();
 }
 

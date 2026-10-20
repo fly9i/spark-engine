@@ -123,6 +123,13 @@ pub mod graph {
         let rc = unsafe { super::rs_graph_begin() };
         if rc == 0 { Ok(()) } else { Err("graph_begin 失败".into()) }
     }
+    /// Capture into the memory pool shared by every graph begun with `key` (they must replay on one stream; tensors
+    /// read across graphs stay alive on the caller side; keep at least one graph of the pool alive).
+    pub fn begin_pool(key: i64) -> Result<(), String> {
+        extern "C" { fn rs_graph_begin_pool(key: i64) -> i32; }
+        let rc = unsafe { rs_graph_begin_pool(key) };
+        if rc == 0 { Ok(()) } else { Err("graph_begin_pool 失败".into()) }
+    }
     #[track_caller]
     pub fn end() -> Result<(), String> {
         let rc = unsafe { super::rs_graph_end() };
@@ -147,6 +154,29 @@ pub mod graph {
         let rc = unsafe { super::rs_graph_replay() };
         if rc == 0 { Ok(()) } else { Err("graph_replay 失败".into()) }
     }
+}
+
+/// A rank's contiguous share of `units` equal units (heads, rotation blocks, 128-wide blocks, vocabulary blocks), in rank
+/// order: `start`, `n` units of `units`. TP3 (docs/06-TP3.md): the `units % world` extra units go to ranks rot, rot + 1, ...
+/// (mod world), so a per-layer `rot` spreads them; world 2 with even units is the TP2 half, whatever `rot`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Part { pub start: i64, pub n: i64, pub units: i64 }
+impl Part {
+    pub fn full(units: i64) -> Part { Part { start: 0, n: units, units } }
+    pub fn of(units: i64, rank: usize, world: usize, rot: usize) -> Part {
+        assert!(units > 0 && rank < world, "Part: {units} units, rank {rank} of {world}");
+        let (base, rem) = (units / world as i64, (units % world as i64) as usize);
+        let extra = |r: usize| i64::from((r + world - rot % world) % world < rem);
+        let start = (0..rank).map(|r| base + extra(r)).sum();
+        Part { start, n: base + extra(rank), units }
+    }
+    /// Element range (start, len) of this share in a dimension of `size` (a whole number of units).
+    pub fn range(&self, size: i64) -> (i64, i64) {
+        assert_eq!(size % self.units, 0, "Part: size {size} is not {} units", self.units);
+        let u = size / self.units;
+        (self.start * u, self.n * u)
+    }
+    pub fn is_full(&self) -> bool { self.start == 0 && self.n == self.units }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -180,7 +210,7 @@ pub fn init_from_env() -> Tp {
             .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
         let rank: usize = std::env::var("GLM53_TP_RANK")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-        assert!(world == 1 || world == 2, "仅支持 TP1/TP2");
+        assert!((1..=4).contains(&world), "TP world must be 1..=4");
         assert!(rank < world, "rank 必须小于 world");
         if world == 1 {
             return Tp { rank: 0, world: 1 };
@@ -325,21 +355,29 @@ pub fn materialize(p:PendingSum) {
     assert_eq!(unsafe { rs_ar_materialize(p.ptr as *mut f32,p.numel,i32::from(p.round_half)) },0,"allreduce materialize");
 }
 
-/// TP2 reduce-scatter (sum): `t` [2*r, ...] contiguous -> this rank's rows [r, ...].
+/// Reduce-scatter (sum) by rows: `t` [world*r, ...] contiguous -> this rank's rows [r, ...] (rank order). Rows not a
+/// multiple of world (TP3 sequence-parallel prefill) are zero-padded at the end first: the last rank's share then ends
+/// in padding rows (sums of zeros).
 pub fn reduce_scatter_rows(t:&Tensor)->Tensor {
     settle_pending();
-    assert!(is_tp());assert!(t.is_contiguous());assert_eq!(t.size()[0]%2,0);
+    assert!(is_tp());assert!(t.is_contiguous());
+    let w=world().world as i64;
+    if t.size()[0]%w!=0 {
+        let mut shape=t.size();shape[0]=(shape[0]+w-1)/w*w;
+        let p=Tensor::zeros(shape.as_slice(),(t.kind(),t.device()));let _=p.narrow(0,0,t.size()[0]).copy_(t);
+        return reduce_scatter_rows(&p);
+    }
     extern "C"{fn rs_reduce_scatter(i:*mut u8,o:*mut u8,n:i64,dtype:i32)->i32;}
-    let mut shape=t.size();shape[0]/=2;let out=Tensor::empty(shape.as_slice(),(t.kind(),t.device()));
+    let mut shape=t.size();shape[0]/=w;let out=Tensor::empty(shape.as_slice(),(t.kind(),t.device()));
     let dtype=match t.kind(){tch::Kind::Float=>2,tch::Kind::Half=>0,k=>panic!("reduce_scatter {k:?}")};
     assert_eq!(unsafe{rs_reduce_scatter(t.data_ptr() as *mut u8,out.data_ptr() as *mut u8,out.numel() as i64,dtype)},0,"reduce_scatter");out
 }
-/// TP2 all-gather of row shards: `t` [r, ...] -> [2*r, ...] (rank 0 rows first).
+/// All-gather of row shards: `t` [r, ...] -> [world*r, ...] (rank 0 rows first).
 pub fn all_gather_rows(t:&Tensor)->Tensor {
     settle_pending();
     assert!(is_tp());let t=t.contiguous();
     extern "C"{fn rs_all_gather(i:*mut u8,o:*mut u8,n:i64,dtype:i32)->i32;}
-    let mut shape=t.size();shape[0]*=2;let out=Tensor::empty(shape.as_slice(),(t.kind(),t.device()));
+    let mut shape=t.size();shape[0]*=world().world as i64;let out=Tensor::empty(shape.as_slice(),(t.kind(),t.device()));
     let dtype=match t.kind(){tch::Kind::Float=>2,tch::Kind::Half=>0,k=>panic!("all_gather {k:?}")};
     assert_eq!(unsafe{rs_all_gather(t.data_ptr() as *mut u8,out.data_ptr() as *mut u8,t.numel() as i64,dtype)},0,"all_gather");out
 }
@@ -350,7 +388,7 @@ pub fn all_gather_rows_start(t:&Tensor)->PendingGather {
     settle_pending();
     assert!(is_tp());let t=t.contiguous();
     extern "C"{fn rs_all_gather_async(i:*mut u8,o:*mut u8,n:i64,dtype:i32)->i32;}
-    let mut shape=t.size();shape[0]*=2;let out=Tensor::empty(shape.as_slice(),(t.kind(),t.device()));
+    let mut shape=t.size();shape[0]*=world().world as i64;let out=Tensor::empty(shape.as_slice(),(t.kind(),t.device()));
     let dtype=match t.kind(){tch::Kind::Float=>2,tch::Kind::Half=>0,k=>panic!("all_gather {k:?}")};
     let handle=unsafe{rs_all_gather_async(t.data_ptr() as *mut u8,out.data_ptr() as *mut u8,t.numel() as i64,dtype)};
     assert!(handle>=0,"async all_gather");PendingGather{out,_input:t,handle}
@@ -492,6 +530,70 @@ pub fn allreduce_latency_probe(out:&std::path::Path) {
         eprintln!("[allreduce-latency] rank{} nccl-large proto={:?} rows={rows} {:.1} us ({:.1} GB/s)",tp.rank,std::env::var("NCCL_PROTO").ok(),v[2],bytes as f64/v[2]/1e3);
     }
     std::fs::write(out.join(format!("allreduce-latency-rank{}.json",tp.rank)),serde_json::to_string_pretty(&json!({"cases":cases})).unwrap()).unwrap();
+}
+
+/// `tp-rsag-probe <out_dir> [rows] [dim]` (every rank): reduce_scatter_rows / all_gather_rows (the sequence-parallel
+/// prefill collectives) against the rank-ordered sums / concatenation of every rank's input regenerated from fixed seeds
+/// (FP32 and Half), then the time per call of each at prefill size ([rows, dim], default 4096 x 4096) and of an FP32
+/// allreduce of the same size for comparison. Which transport carries them follows the environment (NCCL_*, GLM53_RDMA_*).
+pub fn rsag_probe(out:&std::path::Path,rows:i64,dim:i64) {
+    use tch::{Device,Kind,Tensor};use serde_json::json;
+    let _guard=tch::no_grad_guard();let tp=init_from_env();assert!(tp.world>=2);
+    let dev=Device::Cuda(0);std::fs::create_dir_all(out).unwrap();let w=tp.world as i64;
+    let rows=(rows+w-1)/w*w;   // whole shares (the padding of reduce_scatter_rows is the prefill's business)
+    let input=|r:usize,k:i64,kind:Kind|{tch::manual_seed(77+10*k+r as i64);(Tensor::randn([rows,dim],(Kind::Float,dev))*((r+1) as f64)).to_kind(kind)};
+    let mut cases=Vec::new();
+    for kind in [Kind::Float,Kind::Half] {
+        let x=input(tp.rank,0,kind);let y=reduce_scatter_rows(&x);tch::Cuda::synchronize(0);
+        let mut acc=input(0,0,kind).to_kind(Kind::Float);for r in 1..tp.world{acc=&acc+input(r,0,kind).to_kind(Kind::Float);}
+        let rr=rows/w;let want=acc.narrow(0,tp.rank as i64*rr,rr).to_kind(kind);
+        let rs_err=(y.to_kind(Kind::Float)-want.to_kind(Kind::Float)).abs().max().double_value(&[]);
+        let own=input(tp.rank,1,kind).narrow(0,0,rows/w).contiguous();let g=all_gather_rows(&own);tch::Cuda::synchronize(0);
+        let wantg=Tensor::cat(&(0..tp.world).map(|r|input(r,1,kind).narrow(0,0,rows/w)).collect::<Vec<_>>(),0);
+        let ag_ok=g.equal(&wantg);
+        let time=|f:&dyn Fn()|{for _ in 0..3{f();}tch::Cuda::synchronize(0);let t=std::time::Instant::now();for _ in 0..10{f();}tch::Cuda::synchronize(0);t.elapsed().as_secs_f64()*1e3/10.};
+        let rs_ms=time(&||{let _=reduce_scatter_rows(&x);});
+        let ag_ms=time(&||{let _=all_gather_rows(&own);});
+        let ar_ms=if kind==Kind::Float {time(&||{let z=x.copy();allreduce(&z);})} else {0.};
+        eprintln!("[tp-rsag-probe] rank{} {kind:?} [{rows},{dim}]: reduce-scatter max |err| {rs_err:.3e} ({rs_ms:.2} ms), all-gather exact {ag_ok} ({ag_ms:.2} ms), allreduce {ar_ms:.2} ms",tp.rank);
+        cases.push(json!({"kind":format!("{kind:?}"),"rows":rows,"dim":dim,"rs_max_err":rs_err,"rs_ms":rs_ms,"ag_exact":ag_ok,"ag_ms":ag_ms,"allreduce_ms":ar_ms}));
+    }
+    std::fs::write(out.join(format!("rsag-rank{}.json",tp.rank)),serde_json::to_string_pretty(&json!({"rank":tp.rank,"world":tp.world,"cases":cases})).unwrap()).unwrap();
+}
+
+/// TP3 P2 (docs/06-TP3.md §11): N-way lean RDMA allreduce (GLM53_RDMA_ARN_INIT=1, GLM53_RDMA_AR=1) against the
+/// rank-ordered FP32 sum x0+x1+... formed locally (every rank regenerates every rank's input from fixed seeds), eager and
+/// inside a replayed CUDA graph with changing inputs; then latency per size inside a graph (rows x `dim` FP32).
+pub fn arn_probe(out:&std::path::Path,dim:i64) {
+    use tch::{Device,Kind,Tensor};use serde_json::json;
+    let _guard=tch::no_grad_guard();let tp=init_from_env();assert!(tp.world>=2);
+    assert_eq!(std::env::var("GLM53_RDMA_ARN_INIT").as_deref(),Ok("1"),"set GLM53_RDMA_ARN_INIT=1");
+    std::env::set_var("GLM53_RDMA_AR","1");
+    let dev=Device::Cuda(0);std::fs::create_dir_all(out).unwrap();let mut cases=Vec::new();
+    let input=|rows:i64,r:usize,k:i64|{tch::manual_seed(1000*rows+10*k+r as i64);Tensor::randn([rows,dim],(Kind::Float,dev))*((r+1) as f64)};
+    let expected=|rows:i64,k:i64|{let mut acc=input(rows,0,k);for r in 1..tp.world{acc=&acc+input(rows,r,k);}acc};
+    for rows in [1i64,2,3,5,8,16,32,51] {
+        let x=input(rows,tp.rank,0);allreduce(&x);tch::Cuda::synchronize(0);
+        assert!(x.equal(&expected(rows,0)),"rank-ordered sum differs rows={rows}");
+        let g=input(rows,tp.rank,0);graph::begin().unwrap();allreduce(&g);graph::end().unwrap();
+        for k in 1..4 {let _=g.shallow_clone().copy_(&input(rows,tp.rank,k));graph::replay().unwrap();tch::Cuda::synchronize(0);
+            assert!(g.equal(&expected(rows,k)),"graph replay differs rows={rows} k={k}");}
+        graph::destroy();
+    }
+    eprintln!("[arn-probe] rank{}/{} rank-ordered sum bitwise (eager + graph replay) PASS",tp.rank,tp.world);
+    for rows in [1i64,2,3,4,8,16,32] {
+        let x=Tensor::ones([rows,dim],(Kind::Float,dev));
+        let op=||{for _ in 0..64 {allreduce(&x);}};
+        op();tch::Cuda::synchronize(0);graph::begin().unwrap();op();graph::end().unwrap();
+        for _ in 0..3{graph::replay().unwrap();}tch::Cuda::synchronize(0);
+        let mut v=Vec::new();
+        for _ in 0..9 {allreduce(&Tensor::zeros([1],(Kind::Float,dev)));tch::Cuda::synchronize(0);
+            let t=std::time::Instant::now();graph::replay().unwrap();tch::Cuda::synchronize(0);v.push(t.elapsed().as_secs_f64()*1e6/64.);}
+        graph::destroy();v.sort_by(|a,b|a.partial_cmp(b).unwrap());
+        cases.push(json!({"rows":rows,"bytes":rows*dim*4,"us_median":v[4],"us_min":v[0]}));
+        eprintln!("[arn-probe] rank{} rows={rows} {} KiB: {:.1} us (min {:.1})",tp.rank,rows*dim*4/1024,v[4],v[0]);
+    }
+    std::fs::write(out.join(format!("arn-probe-rank{}.json",tp.rank)),serde_json::to_string_pretty(&json!({"world":tp.world,"dim":dim,"cases":cases})).unwrap()).unwrap();
 }
 
 /// Stream-ordered upload of a small host slice into device tensor `dst` (same numel and dtype) without the

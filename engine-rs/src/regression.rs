@@ -19,7 +19,7 @@ fn close(a: &Tensor, b: &Tensor, tol: f64) {
 fn layer() -> LayerWeights {
     let z = || Tensor::zeros([1], (Kind::Float, Device::Cpu));
     LayerWeights {
-        plan: LayerPlanOwned { attn: "test".into(), mlp: "test".into() },
+        plan: LayerPlanOwned { attn: "test".into(), mlp: "test".into(), tp: None },
         hc: HcParams { attn_fn: z(), attn_scale: z(), attn_base: z(), ffn_fn: z(),
             ffn_scale: z(), ffn_base: z(), in_ln: z(), post_ln: z() },
         kda: None, mla: None, dense: None, moe: None,

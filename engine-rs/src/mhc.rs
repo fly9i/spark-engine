@@ -76,9 +76,14 @@ pub fn mhc_pre(
         let partial=Tensor::empty([(n*h/128)*t*25],(Kind::Float,dev));
         let z=Tensor::empty([t,h],(Kind::Float,dev));let post_mix=Tensor::empty([t,n],(Kind::Float,dev));
         let comb=Tensor::empty([t,n,n],(Kind::Float,dev));
-        extern "C"{fn rs_mhc_pre_fused(residual:*const f32,fn_:*const std::ffi::c_void,fn_bf16:i32,scale:*const f32,base:*const f32,ln:*const f32,partial:*mut f32,z:*mut f32,post:*mut f32,comb:*mut f32,rows:i32,h:i32)->i32;}
+        extern "C"{fn rs_mhc_pre_fused(residual:*const f32,fn_:*const std::ffi::c_void,fn_bf16:i32,scale:*const f32,base:*const f32,ln:*const f32,partial:*mut f32,z:*mut f32,post:*mut f32,comb:*mut f32,rows:i32,h:i32,
+            rsign:*const std::ffi::c_void,rbk:i32,zr:*mut std::ffi::c_void,clamp:*const crate::ablate::ClampArgs)->i32;}
         let p=|x:&Tensor|x.data_ptr() as *const f32;let q=|x:&Tensor|x.data_ptr() as *mut f32;
-        assert_eq!(unsafe{rs_mhc_pre_fused(p(residual),fn_t.data_ptr(),i32::from(fn_t.kind()==Kind::BFloat16),p(scale_t),p(base_t),p(ln_t),q(&partial),q(&z),q(&post_mix),q(&comb),t as i32,h as i32)},0,"fused mhc_pre launch");
+        let rot=crate::spx::mhc_rot_plan(ln_t,t,h);let (rs,rb,zr)=rot_args(&rot);
+        let cl=crate::ablate::clamp().and_then(|c|c.mhc_args(ln_t,t));
+        assert_eq!(unsafe{rs_mhc_pre_fused(p(residual),fn_t.data_ptr(),i32::from(fn_t.kind()==Kind::BFloat16),p(scale_t),p(base_t),p(ln_t),q(&partial),q(&z),q(&post_mix),q(&comb),t as i32,h as i32,rs,rb,zr,cl.as_ref().map_or(std::ptr::null(),|a|a))},0,"fused mhc_pre launch");
+        crate::spx::mhc_rot_done(&z,ln_t,rot);
+        if cl.is_none() { if let Some(c)=crate::ablate::clamp() {c.apply_input(ln_t,&z);} }
         return (PreOut{post_mix,comb},z);
     }
     let x = residual.reshape([t, n * h]).to_kind(Kind::Float);
@@ -107,7 +112,7 @@ pub fn mhc_pre(
     let collapsed =
         (pre.unsqueeze(-1) * residual.to_kind(Kind::Float)).sum_dim_intlist(&[1i64][..], false, Kind::Float);
     let z = rmsnorm(&collapsed, ln_t, RMS_EPS);
-    
+    if let Some(c)=crate::ablate::clamp() {c.apply_input(ln_t,&z);}
     (PreOut { post_mix, comb }, z)
 }
 
@@ -364,10 +369,19 @@ fn post_pre_fused(x:&Tensor,residual:&Tensor,prev:&PreOut,fn_t:&Tensor,scale_t:&
     let out=Tensor::empty([t,4,h],(Kind::Float,dev));
     let partial=Tensor::empty([(4*h/128)*t*25],(Kind::Float,dev));
     let z=Tensor::empty([t,h],(Kind::Float,dev));let post_mix=Tensor::empty([t,4],(Kind::Float,dev));let comb_next=Tensor::empty([t,4,4],(Kind::Float,dev));
-    extern "C"{fn rs_mhc_post_pre_fused(x:*const f32,residual:*const f32,comb:*const f32,post:*const f32,out:*mut f32,fn_:*const std::ffi::c_void,fn_bf16:i32,scale:*const f32,base:*const f32,ln:*const f32,partial:*mut f32,z:*mut f32,post_next:*mut f32,comb_next:*mut f32,rows:i32,h:i32)->i32;}
+    extern "C"{fn rs_mhc_post_pre_fused(x:*const f32,residual:*const f32,comb:*const f32,post:*const f32,out:*mut f32,fn_:*const std::ffi::c_void,fn_bf16:i32,scale:*const f32,base:*const f32,ln:*const f32,partial:*mut f32,z:*mut f32,post_next:*mut f32,comb_next:*mut f32,rows:i32,h:i32,
+        rsign:*const std::ffi::c_void,rbk:i32,zr:*mut std::ffi::c_void,clamp:*const crate::ablate::ClampArgs)->i32;}
     let p=|x:&Tensor|x.data_ptr() as *const f32;let q=|x:&Tensor|x.data_ptr() as *mut f32;
-    assert_eq!(unsafe{rs_mhc_post_pre_fused(p(&x),p(residual),p(&comb),p(&post),q(&out),fn_t.data_ptr(),i32::from(fn_t.kind()==Kind::BFloat16),p(scale_t),p(base_t),p(ln_t),q(&partial),q(&z),q(&post_mix),q(&comb_next),t as i32,h as i32)},0,"fused mhc post+pre");
+    let rot=crate::spx::mhc_rot_plan(ln_t,t,h);let (rs,rb,zr)=rot_args(&rot);
+    let cl=crate::ablate::clamp().and_then(|c|c.mhc_args(ln_t,t));
+    assert_eq!(unsafe{rs_mhc_post_pre_fused(p(&x),p(residual),p(&comb),p(&post),q(&out),fn_t.data_ptr(),i32::from(fn_t.kind()==Kind::BFloat16),p(scale_t),p(base_t),p(ln_t),q(&partial),q(&z),q(&post_mix),q(&comb_next),t as i32,h as i32,rs,rb,zr,cl.as_ref().map_or(std::ptr::null(),|a|a))},0,"fused mhc post+pre");
+    crate::spx::mhc_rot_done(&z,ln_t,rot);
+    if cl.is_none() { if let Some(c)=crate::ablate::clamp() {c.apply_input(ln_t,&z);} }
     (out,PreOut{post_mix,comb:comb_next},z)
+}
+/// Kernel arguments of an optional O5-3 rotation plan (null / 0 / null without one).
+fn rot_args(rot:&Option<(Tensor,i64,Tensor)>)->(*const std::ffi::c_void,i32,*mut std::ffi::c_void) {
+    match rot {Some((s,bk,xr))=>(s.data_ptr() as *const _,*bk as i32,xr.data_ptr()),None=>(std::ptr::null(),0,std::ptr::null_mut())}
 }
 
 /// I3 step 2 gate (TP2, GLM53_AR_FUSED=1 and GLM53_RDMA_AR=1 set before start): the send-only allreduce consumed by the

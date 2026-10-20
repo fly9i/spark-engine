@@ -97,6 +97,67 @@ __global__ void __launch_bounds__(1024) draft_head_int4_mma(const __nv_bfloat16*
         if(g<m){y[(long long)g*n+n0+2*q]=tot0;y[(long long)g*n+n0+2*q+1]=tot1;}
     }
 }
+// 9..32 rows (batched drafting: up to 4 sequences x 7 positions): the whole X does not fit shared memory, so the block
+// stages one 128-wide k group of X at a time (32 rows x 128 Half, converted with the same __float2half_rn(__bfloat162float(.))
+// as draft_head_int4_mma) and its 32 warps (one n8 head tile each) read their A fragments from it. RT 16-row tiles share each
+// weight fragment; row r's MMAs, scale FMAs and order are exactly draft_head_int4_mma's for that row (rows of an MMA are
+// independent), so the output equals draft_head_int4_mma run on the rows in groups of 8, bit for bit.
+constexpr int H32_LD=136;   // padded row stride (Half) of the staged group
+template<int RT>
+__global__ void __launch_bounds__(1024) draft_head_int4_mma32(const __nv_bfloat16* __restrict__ x,const uint8_t* __restrict__ q4,const float* __restrict__ s,
+    float* __restrict__ y,int m,int n,int k,bool tiled){
+    __shared__ __half xg[32*H32_LD];
+    const int warp=threadIdx.x>>5,lane=threadIdx.x&31,g=lane>>2,q=lane&3,groups=k/128;
+    const int wpb=blockDim.x>>5,tiles=n/8;
+    for(int base=blockIdx.x*wpb;base<tiles;base+=gridDim.x*wpb){
+        const int tile=base+warp;const bool live=tile<tiles;const int n0=tile*8;
+        const uint8_t* wr=q4+(long long)(n0+g)*(k/2);
+        const uint8_t* tr=q4+(long long)tile*groups*512+lane*16;
+        auto ld=[&](int gi)->uint4{if(!live)return make_uint4(0,0,0,0);return tiled?*reinterpret_cast<const uint4*>(tr+(size_t)gi*512):*reinterpret_cast<const uint4*>(wr+(gi*128+q*32)/2);};
+        float tot[RT][4];
+#pragma unroll
+        for(int r=0;r<RT;++r){tot[r][0]=tot[r][1]=tot[r][2]=tot[r][3]=0.f;}
+        uint4 wnext=ld(0);
+        uint4 wnext2=groups>1?ld(1):wnext;
+        for(int grp=0;grp<groups;++grp){
+            __syncthreads();
+            for(int i=threadIdx.x;i<RT*16*128;i+=blockDim.x){const int r=i>>7,c=i&127;
+                xg[r*H32_LD+c]=r<m?__float2half_rn(__bfloat162float(x[(long long)r*k+grp*128+c])):__float2half_rn(0.f);}
+            __syncthreads();
+            const uint4 w=wnext;wnext=wnext2;
+            if(grp+2<groups)wnext2=ld(grp+2);
+            if(!live)continue;
+            const uint32_t ws[4]={w.x,w.y,w.z,w.w};
+            float c[RT][4];
+#pragma unroll
+            for(int r=0;r<RT;++r){c[r][0]=c[r][1]=c[r][2]=c[r][3]=0.f;}
+#pragma unroll
+            for(int t=0;t<8;++t){
+                const uint32_t seg=(ws[t>>1]>>(16*(t&1)))&0xFFFFu;
+                const uint32_t b0=h2_from_nibbles(seg&0xFFu),b1=h2_from_nibbles(seg>>8);
+#pragma unroll
+                for(int r=0;r<RT;++r){
+                    const uint2 xa=*reinterpret_cast<const uint2*>(xg+(r*16+g)*H32_LD+q*32+4*t);
+                    const uint2 xb=*reinterpret_cast<const uint2*>(xg+(r*16+g+8)*H32_LD+q*32+4*t);
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                        :"+f"(c[r][0]),"+f"(c[r][1]),"+f"(c[r][2]),"+f"(c[r][3]):"r"(xa.x),"r"(xb.x),"r"(xa.y),"r"(xb.y),"r"(b0),"r"(b1));
+                }
+            }
+            const float* sc=s+(long long)(n0+2*q)*groups+grp;
+#pragma unroll
+            for(int r=0;r<RT;++r){tot[r][0]=fmaf(c[r][0],sc[0],tot[r][0]);tot[r][1]=fmaf(c[r][1],sc[groups],tot[r][1]);
+                tot[r][2]=fmaf(c[r][2],sc[0],tot[r][2]);tot[r][3]=fmaf(c[r][3],sc[groups],tot[r][3]);}
+        }
+        if(live){
+#pragma unroll
+            for(int r=0;r<RT;++r){
+                const int ra=r*16+g,rb=ra+8;
+                if(ra<m){y[(long long)ra*n+n0+2*q]=tot[r][0];y[(long long)ra*n+n0+2*q+1]=tot[r][1];}
+                if(rb<m){y[(long long)rb*n+n0+2*q]=tot[r][2];y[(long long)rb*n+n0+2*q+1]=tot[r][3];}
+            }
+        }
+    }
+}
 static bool head4_tiled(){static const bool on=[]{const char* e=std::getenv("GLM53_DRAFT_HEAD4_TILED");return e&&e[0]=='1';}();return on;}
 __global__ void draft_head4_tile(const uint8_t* __restrict__ src,uint8_t* __restrict__ dst,int n,int k){
     const int groups=k/128;const long long id=(long long)blockIdx.x*blockDim.x+threadIdx.x,total=(long long)(n/8)*groups*32;if(id>=total)return;
@@ -114,7 +175,15 @@ extern "C" int glm53_draft_head4_tile_cuda(void* q4,int n,int k,cudaStream_t st)
     cudaFreeAsync(tmp,st);return int(cudaGetLastError());
 }
 extern "C" int glm53_draft_head_int4_cuda(const void* x,const void* q4,const float* s,float* y,int m,int n,int k,cudaStream_t st){
-    if(m<1||m>8||k%1024||n<1)return int(cudaErrorInvalidValue);
+    if(m<1||m>32||k%1024||n<1)return int(cudaErrorInvalidValue);
+    if(m>8){   // batched drafting: rows 9..32 on the MMA path only
+        const char* mm=std::getenv("GLM53_DRAFT_HEAD_INT4_MMA");if((mm&&mm[0]=='0')||n%8)return int(cudaErrorInvalidValue);
+        int dev=0,sms=48;cudaGetDevice(&dev);cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,dev);
+        const int blocks=min((n/8+31)/32,sms*2);
+        if(m<=16)draft_head_int4_mma32<1><<<blocks,1024,0,st>>>((const __nv_bfloat16*)x,(const uint8_t*)q4,s,y,m,n,k,head4_tiled());
+        else draft_head_int4_mma32<2><<<blocks,1024,0,st>>>((const __nv_bfloat16*)x,(const uint8_t*)q4,s,y,m,n,k,head4_tiled());
+        return int(cudaGetLastError());
+    }
     const size_t sh=(size_t)m*k*sizeof(__half);
     static bool attr=false;if(!attr){cudaFuncSetAttribute(draft_head_int4<8>,cudaFuncAttributeMaxDynamicSharedMemorySize,64*1024);attr=true;}
     if(sh>64*1024)return int(cudaErrorInvalidValue);

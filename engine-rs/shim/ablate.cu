@@ -2,6 +2,7 @@
 // stride ld), d a unit vector. One block per row: block-wide dot product in a fixed order, then the update.
 #include <cuda_runtime.h>
 #include <cstdint>
+#include "ablate_clamp.cuh"
 
 __global__ void ablate_rows_kernel(float* __restrict__ y, int64_t ld, const float* __restrict__ d, int D)
 {
@@ -73,5 +74,33 @@ extern "C" int spark_ablate_rows_k(void* y, int64_t ld, int R, const void* d, in
     if (K > 16) return (int) cudaErrorInvalidValue;
     size_t shmem = (size_t)(K * 32 + K) * sizeof(float);
     ablate_rows_k_kernel<<<R, 256, shmem, st>>>((float*) y, ld, (const float*) d, D, K);
+    return (int) cudaGetLastError();
+}
+
+// SPARK_ABLATE_CLAMP: conditional clamp of R rows in place (ablate_clamp.cuh). One block per row: read the row once for
+// all K dots, then subtract sum_j e_j d_j. Replaces the ATen chain (2 matmuls + ~6 elementwise launches) per site.
+__global__ void ablate_clamp_rows_kernel(float* __restrict__ y, int64_t ld, SparkClamp cl, int D)
+{
+    __shared__ float red[SPARK_CLAMP_MAX_K * 32], e[SPARK_CLAMP_MAX_K];
+    float* row = y + (int64_t) blockIdx.x * ld;
+    float acc[SPARK_CLAMP_MAX_K];
+#pragma unroll
+    for (int j = 0; j < SPARK_CLAMP_MAX_K; ++j) acc[j] = 0.f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        const float yi = row[i];
+#pragma unroll
+        for (int j = 0; j < SPARK_CLAMP_MAX_K; ++j) if (j < cl.k) acc[j] += yi * cl.d[(int64_t) j * D + i];
+    }
+    spark_clamp_reduce(cl, acc, red, e, blockIdx.x);
+    for (int i = threadIdx.x; i < D; i += blockDim.x) row[i] -= spark_clamp_update(cl, e, D, i);
+}
+
+extern "C" int spark_ablate_clamp_rows(void* y, int64_t ld, int R, const void* d, int D, int K, const void* tau, const void* lo,
+                                       const void* target, void* count, int min, int reset, cudaStream_t st)
+{
+    if (R <= 0 || K <= 0) return 0;
+    if (K > SPARK_CLAMP_MAX_K) return (int) cudaErrorInvalidValue;
+    const SparkClamp cl{(const float*) d, (const float*) tau, (const float*) lo, (const float*) target, K, (int*) count, min, reset};
+    ablate_clamp_rows_kernel<<<R, 256, 0, st>>>((float*) y, ld, cl, D);
     return (int) cudaGetLastError();
 }

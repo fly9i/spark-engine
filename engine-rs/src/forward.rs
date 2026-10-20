@@ -97,7 +97,7 @@ impl Engine {
             }
         }
         let s = hc_contract(&residual); // [T,4096]
-        let z = rmsnorm_final(&s, &self.w.final_norm);
+        let z = crate::ablate::clamp_final(rmsnorm_final(&s, &self.w.final_norm));
         self.w.logits(&z)
     }
 
@@ -158,6 +158,20 @@ impl Engine {
             let (latent,pools)=pool.views(mla,lease);mla+=1;
             LayerState::MlaLatent(crate::mla_latent::State::from_pool(layer.mla.as_ref().unwrap(),lease.len,latent,pools))
         }).collect())
+    }
+    /// After `pool.grow(lease, ..)` (GLM53_KV_VMM): re-view every MLA layer over the grown lease. Rows, length and DSA
+    /// tails are kept (same storage); capacity-sized index constants are rebuilt, so graphs captured over the old
+    /// capacity must be dropped by the caller.
+    pub(crate) fn grow_states_pooled(&self,ds:&mut DecodeStates,pool:&crate::kv_pool::KvPool,lease:&crate::kv_pool::Lease) {
+        let mut mla=0usize;
+        for (layer,st) in self.w.layers.iter().zip(ds.0.iter_mut()) {
+            let LayerState::MlaLatent(m)=st else {continue};
+            let (latent,pools)=pool.views_of(mla,lease);mla+=1;
+            let mut g=crate::mla_latent::State::from_pool(layer.mla.as_ref().unwrap(),lease.len,latent,pools);
+            g.len=m.len.shallow_clone();g.index.tail_k=m.index.tail_k.shallow_clone();g.index.tail_gate=m.index.tail_gate.shallow_clone();
+            g.pool_row=m.pool_row.take();
+            *m=g;
+        }
     }
     /// KV pool layout of this model: (latent width, latent kind, DSA dim) of each MLA layer in state order.
     pub(crate) fn kv_pool_layers(&self)->Vec<(i64,Kind,i64)> {
@@ -356,7 +370,7 @@ impl Engine {
             crate::tp::clear_ar_prefetch();probe_point(i,"resid",&residual);
             if collect&&[5,14,24,33,42].contains(&i){features.push(hc_contract(&residual));}
         }
-        let z=if verify_invariant(){final_norm_invariant(&residual,&self.w.final_norm)}else{rmsnorm_final(&hc_contract(&residual),&self.w.final_norm)};
+        let z=crate::ablate::clamp_final(if verify_invariant(){final_norm_invariant(&residual,&self.w.final_norm)}else{rmsnorm_final(&hc_contract(&residual),&self.w.final_norm)});
         let head=if predictions { self.w.predictions(&z) } else { self.w.logits(&z) };
         probe_point(99,"final_z",&z);probe_point(99,"head",&head);
         let states=if deferred{VerifierStates::Deferred{tokens:count,layers:deferred_layers}}else{VerifierStates::Full(states)};
@@ -505,7 +519,7 @@ impl Engine {
             tick(2,&mut acc);
             if collect&&[5,14,24,33,42].contains(&i){features.push(hc_contract(&residual));}
         }
-        let z=if verify_invariant(){final_norm_invariant(&residual,&self.w.final_norm)}else{rmsnorm_final(&hc_contract(&residual),&self.w.final_norm)};
+        let z=crate::ablate::clamp_final(if verify_invariant(){final_norm_invariant(&residual,&self.w.final_norm)}else{rmsnorm_final(&hc_contract(&residual),&self.w.final_norm)});
         let head=if predictions { self.w.predictions(&z) } else { self.w.logits(&z) };
         tick(3,&mut acc);
         if timing {eprintln!("[multi-timing] seqs {} rows {} mhc_ms {:.1} attn_ms {:.1} ffn_ms {:.1} head_ms {:.1}",segs.len(),count,acc[0],acc[1],acc[2],acc[3]);}
@@ -567,15 +581,22 @@ impl Engine {
     /// all-reduce, half of the row-wise work). Per-row arithmetic equals the replicated path; the
     /// MoE lane uses the MOE_SUM1 combine (routed + shared partials, one collective).
     fn sp_eligible(&self,t:i64)->bool {
-        std::env::var("GLM53_PREFILL_SP").as_deref()==Ok("1") && crate::tp::world().world==2 && t>=128 && t%2==0 && crate::tp::dense_enabled()
+        let w=crate::tp::world().world;
+        std::env::var("GLM53_PREFILL_SP").as_deref()==Ok("1") && ((w==2 && t%2==0) || w==3) && t>=128 && crate::tp::dense_enabled()
             && crate::mla_latent::enabled() && self.fast.as_ref().map_or(false,|f|f.assume_hot)
             && !["","0"].contains(&std::env::var("GLM53_PREFILL_GROUPED").unwrap_or_default().as_str())
     }
-    fn prefill_record_sp(&mut self,ids:&Tensor,ds:Option<DecodeStates>,collect:bool)->Option<(Tensor,DecodeStates,Vec<Tensor>)> {
+    fn prefill_record_sp(&mut self,ids:&Tensor,ds:Option<DecodeStates>,collect:bool,last:bool)->Option<(Tensor,DecodeStates,Vec<Tensor>)> {
         let t=ids.size()[0];let tp=crate::tp::world();
         if let Some(s)=ds.as_ref().and_then(|d|d.0.iter().find_map(|s|match s {LayerState::MlaLatent(s)=>Some(s),_=>None})) {s.ensure_room(t);}
-        let half=t/2;let lo=tp.rank as i64*half;let sp_rows=half;
+        // rows of this rank: the chunk padded to a multiple of world (TP3; TP2 chunks are even), `half` rows each; padding rows
+        // sit at the end of the last rank's share, never reach the attention (it reads the first t gathered rows) and are
+        // dropped at the end
+        let w=tp.world as i64;let tpad=(t+w-1)/w*w;
+        let half=tpad/w;let lo=tp.rank as i64*half;let sp_rows=half;
         let x=self.w.embed_prefill(ids);
+        let x=if tpad>t {let p=Tensor::zeros([tpad,x.size()[1]],(x.kind(),x.device()));let _=p.narrow(0,0,t).copy_(&x);p} else {x};
+        let real=|g:Tensor|if tpad>t {g.narrow(0,0,t)} else {g};
         let mut residual=hc_expand(&x.narrow(0,lo,half)).contiguous();
         let n=self.w.layers.len();
         let mut prior=ds.map(|d|{assert_eq!(d.0.len(),n);d.0.into_iter()});
@@ -586,7 +607,7 @@ impl Engine {
         let (half_reuse,shared_fuse,feature_reuse)=(flag("GLM53_PREFILL_HALF_REUSE"),flag("GLM53_PREFILL_SHARED_FUSE"),flag("GLM53_PREFILL_FEATURE_REUSE"));
         let half_gather=flag("GLM53_PREFILL_SP_HALF_GATHER");
         let half_z=flag("GLM53_PREFILL_SP_HALF_Z");
-        let ag_overlap=crate::tp::ag_overlap_enabled();
+        let ag_overlap=crate::tp::ag_overlap_enabled() && tp.world==2;   // the overlapped paths join two ranks' rows
         let mut feature_pending=false;let nv=nvtx_on();
         for (i,layer) in self.w.layers.iter().enumerate() {
             let _mhc1=Nvtx::new(nv,"mhc-attn");
@@ -594,7 +615,7 @@ impl Engine {
                 let (r,p,z)=crate::mhc::mhc_post_pre(&m,&residual,&prev,&layer.hc.attn_fn,&layer.hc.attn_scale,&layer.hc.attn_base,&layer.hc.in_ln);
                 residual=r;(p,z)
             } else {mhc_pre(&residual,&layer.hc.attn_fn,&layer.hc.attn_scale,&layer.hc.attn_base,&layer.hc.in_ln)};
-            if feature_pending {features.push(crate::tp::all_gather_rows(&hc_contract(&residual)));feature_pending=false;}
+            if feature_pending {features.push(real(crate::tp::all_gather_rows(&hc_contract(&residual))));feature_pending=false;}
             drop(_mhc1);
             // GLM53_PREFILL_SP_HALF_Z=1 (L1): gather z as Half (half the bytes). Its Half-GEMM consumers round it to Half
             // anyway (same values); the TF32 consumers (KDA beta, DSA indexer) see the same 10-bit mantissa.
@@ -612,7 +633,7 @@ impl Engine {
                         kfront=Some(crate::kda::front_cat(own,crate::kda::front(kw,&other).expect("KDA front for the gathered rows")));
                     }
                     z
-                } else if half_z {crate::tp::all_gather_rows(&z_half.to_kind(tch::Kind::Half)).to_kind(tch::Kind::Float)} else {crate::tp::all_gather_rows(&z_half)}};
+                } else if half_z {real(crate::tp::all_gather_rows(&z_half.to_kind(tch::Kind::Half))).to_kind(tch::Kind::Float)} else {real(crate::tp::all_gather_rows(&z_half))}};
             let _att=Nvtx::new(nv,if layer.kda.is_some(){"kda"}else{"mla"});
             let old=prior.as_mut().map(|p|p.next().unwrap());
             let (a_half,ls)=crate::weights::with_sp_scatter(|| if let Some(kw)=&layer.kda {
@@ -685,22 +706,24 @@ impl Engine {
                 // P6 (GLM53_PREFILL_FEATURE_REUSE=1): the next layer's fused post+pre writes the same
                 // residual (bitwise equal to mhc_post); contract that instead of a second mhc_post.
                 if feature_reuse && i<n-1 {feature_pending=true;}
-                else {features.push(crate::tp::all_gather_rows(&hc_contract(&mhc_post(&m_half,&residual,&pre2))));}
+                else {features.push(real(crate::tp::all_gather_rows(&hc_contract(&mhc_post(&m_half,&residual,&pre2)))));}
             }
             if i==n-1 {residual=mhc_post(&m_half,&residual,&pre2);} else {deferred=Some((pre2,m_half));}
         }
         crate::moefast::route_error_check(self.w.device);
         let s=hc_contract(&residual);
-        let last_row=s.narrow(0,half-1,1);
-        let s_last=crate::tp::all_gather_rows(&last_row).narrow(0,1,1);
+        // the prompt's last row: local row (t - 1) % half of rank (t - 1) / half (TP2: rank 1's last row); every row's
+        // logits only for the GLM53_PREFILL_SP_ALL diagnostic (teacher-forced export of the sequence-parallel path)
+        let s_last=if last {crate::tp::all_gather_rows(&s.narrow(0,(t-1)%half,1)).narrow(0,(t-1)/half,1)} else {real(crate::tp::all_gather_rows(&s))};
         let sq=&s_last*&s_last;let ms=sq.mean_dim(&[-1i64][..],true,tch::Kind::Float);
-        let z=&self.w.final_norm*(s_last*(ms+1e-5).rsqrt());
+        let z=crate::ablate::clamp_final(&self.w.final_norm*(s_last*(ms+1e-5).rsqrt()));
         let logits=self.w.logits(&z);
         Some((logits,DecodeStates(states),features))
     }
     fn prefill_record_impl(&mut self,ids:&Tensor,ds:Option<DecodeStates>,collect:bool,last:bool)->(Tensor,DecodeStates,Vec<Tensor>) {
-        if last && self.sp_eligible(ids.size()[0]) {
-            return self.prefill_record_sp(ids,ds,collect).expect("SP prefill");
+        // GLM53_PREFILL_SP_ALL=1 (diagnostic): every row's logits through the sequence-parallel path too
+        if (last || std::env::var("GLM53_PREFILL_SP_ALL").as_deref()==Ok("1")) && self.sp_eligible(ids.size()[0]) {
+            return self.prefill_record_sp(ids,ds,collect,last).expect("SP prefill");
         }
         self.prefill_record_impl_inner(ids,ds,collect,last)
     }
@@ -724,7 +747,7 @@ impl Engine {
         let mut deferred: Option<(crate::mhc::PreOut, Tensor)> = None;
         let mut states: Vec<LayerState> = Vec::with_capacity(n);
         for (i, layer) in self.w.layers.iter().enumerate() {
-            crate::deep_probe::begin_layer();
+            crate::deep_probe::begin_layer();crate::spx_hess::set_layer(i);
             let (pre, z) = if let Some((prev, m)) = deferred.take() {
                 let (r,p,z)=crate::mhc::mhc_post_pre(&m,&residual,&prev,&layer.hc.attn_fn,&layer.hc.attn_scale,&layer.hc.attn_base,&layer.hc.in_ln);
                 residual=r;(p,z)
@@ -774,7 +797,7 @@ impl Engine {
                 let tt = z2.size()[0];
                 let dev = self.w.device;
                 let cooperative=self.fast.as_ref().unwrap().assume_hot
-                    && crate::tp::world().world==2
+                    && crate::tp::world().world>=2
                     && std::env::var("GLM53_PREFILL_COOP").as_deref()==Ok("1");
                 let grouped=std::env::var("GLM53_PREFILL_GROUPED").unwrap_or_else(|_|"0".into());
                 assert!(["0","direct","recon"].contains(&grouped.as_str()));
@@ -787,7 +810,10 @@ impl Engine {
                 let mut t=if is_grouped{tt}else{0};
                 while t<tt {
                     let rows=(tt-t).min(32);
-                    if cooperative && rows>=8 {
+                    // Every row of a cooperative layer goes through the own kernel, which decodes each expert at its own
+                    // trellis K. The per-row mgemm below decodes at K=4 only: on mixed-K checkpoints it read past K=3
+                    // experts (illegal address, 2026-10-14) and mis-decoded K=5/6 ones for chunk tails of 1-7 rows.
+                    if cooperative {
                         let yb=self.fast.as_mut().unwrap().expert_cooperative(i,
                             &x16.narrow(0,t,rows).contiguous(),
                             &topi.narrow(0,t,rows).contiguous(),&wts.narrow(0,t,rows));
@@ -822,7 +848,8 @@ impl Engine {
         let s = hc_contract(&residual);
         let sq = &s * &s;
         let ms = sq.mean_dim(&[-1i64][..], true, tch::Kind::Float);
-        let z = &self.w.final_norm * (s * (ms + 1e-5).rsqrt());
+        let z = crate::ablate::clamp_final(&self.w.final_norm * (s * (ms + 1e-5).rsqrt()));
+        crate::spx_hess::add_at(n,crate::spx_hess::HEAD_IN,&z);
         let z=if last{z.narrow(0,z.size()[0]-1,1)}else{z};
         let logits=self.w.logits(&z);stamp(n,"head");
         (logits, DecodeStates(states),features)
@@ -879,7 +906,9 @@ impl Engine {
                 let (topi, wts) = crate::moe::route(&z2, &mm.w_gate, &mm.bias, 8);
                 let x16 = crate::deep_probe::expert_input(&z2);
                 let f = self.fast.as_mut().unwrap();
-                let sel = if std::env::var("GLM53_NO_SELDEV").is_ok() {
+                // Mixed-K experts need the own kernel (see the prefill path); the mgemm below decodes at K=4 only.
+                let coop = f.assume_hot && crate::tp::world().world>=2 && std::env::var("GLM53_MOE_COOP").as_deref()==Ok("1");
+                let sel = if coop {Tensor::empty([0],(Kind::Int64,self.w.device))} else if std::env::var("GLM53_NO_SELDEV").is_ok() {
                     let host: Vec<i64> = topi.get(0).to_device(tch::Device::Cpu).try_into().expect("topi");
                     let es: Vec<usize> = host.iter().map(|&e| e as usize).collect();
                     f.ensure_many(i, &es, self.w.device);
@@ -891,7 +920,7 @@ impl Engine {
                 let w8 = wts.get(0);
                 let prof2 = std::env::var("GLM53_PROFILE2").is_ok();
                 let tb = std::time::Instant::now();
-                let yb = f.expert_batch_sel(&x16, &sel, &w8, self.w.device);
+                let yb = if coop {f.expert_cooperative(i,&x16.contiguous(),&topi.contiguous(),&wts)} else {f.expert_batch_sel(&x16, &sel, &w8, self.w.device)};
                 if crate::moe::tp_pack_enabled() {
                     crate::moe::finish_tp(yb.to_kind(Kind::Float).contiguous(),mm,&z2)
                 } else {
@@ -929,7 +958,7 @@ impl Engine {
         let s = hc_contract(&residual);
         let sq = &s * &s;
         let ms = sq.mean_dim(&[-1i64][..], true, tch::Kind::Float);
-        let z = &self.w.final_norm * (s * (ms + 1e-5).rsqrt());
+        let z = crate::ablate::clamp_final(&self.w.final_norm * (s * (ms + 1e-5).rsqrt()));
         let out = self.w.logits(&z).get(0);
         if prof {
             sync(dev0);
@@ -952,8 +981,13 @@ pub fn mlp_forward_f(
 ) -> Tensor {
         use tch::Kind;
         if let Some(dm) = &layer.dense {
+            crate::spx_hess::add(crate::spx_hess::DENSE_IN,z2);
+            if let Some(y)=crate::spx::try_rows(z2,&[&dm.wg,&dm.wu],1) {   // SPX gate/up group: one rotation, one launch
+                let n=dm.wg.size()[0];
+                return crate::weights::row_mm16(crate::spx_hess::tap(crate::spx_hess::DENSE_DOWN,&(y.narrow(1,0,n).silu()*y.narrow(1,n,n))), &dm.wd);
+            }
             let g = crate::weights::mm16(z2, &dm.wg).silu();
-            crate::weights::row_mm16(&(g * crate::weights::mm16(z2, &dm.wu)), &dm.wd)
+            crate::weights::row_mm16(crate::spx_hess::tap(crate::spx_hess::DENSE_DOWN,&(g * crate::weights::mm16(z2, &dm.wu))), &dm.wd)
         } else if let Some(mm) = &layer.moe {
             let (topi, wts) = crate::moe::route(z2, &mm.w_gate, &mm.bias, 8);
             let mut y = Tensor::zeros([z2.size()[0], z2.size()[1]], (Kind::Float, z2.device()));

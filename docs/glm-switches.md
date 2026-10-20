@@ -1,6 +1,6 @@
 # GLM-5.3-Flash engine switches
 
-These are the `GLM53_*` switches set by `engine-rs/profiles/glm-tp2.env`, the serving profile for GLM-5.3-Flash on two DGX Sparks (tensor parallelism 2). The values below are the tuned defaults. Most switches select a kernel, a data layout or a launch schedule; they stay switches so that each change can be A/B-tested against the path it replaced. A value of 0 keeps the alternative path available for comparison; it is not used in serving.
+These are the `GLM53_*` switches set by `engine-rs/profiles/glm.env`, the serving profile for GLM-5.3-Flash on two or three DGX Sparks (tensor parallelism 2 or 3; the same profile serves both, and the transport of each world size is in `profiles/tp2-rdma.env` / `tp3-rdma.env`). The values below are the tuned defaults. Most switches select a kernel, a data layout or a launch schedule; they stay switches so that each change can be A/B-tested against the path it replaced. A value of 0 keeps the alternative path available for comparison; it is not used in serving.
 
 Precision classes (effect of the listed setting on outputs, relative to the path it replaces):
 
@@ -16,7 +16,7 @@ For switches set to 0, the class describes the switched-off path ("L3 if on").
 
 Notes:
 
-- The server launcher (`serve/glm-rank.sh`) clears the caller's `GLM53_*` variables, sources this profile, then applies `spark.env`, whose `GLM53_*` entries override the profile. It also sets `GLM53_MAX_CONTEXT` to the KV token budget.
+- The server launcher (`serve/glm-rank.sh`) clears the caller's `GLM53_*` variables, sources this profile, then applies `spark.env`, whose `GLM53_*` entries override the profile, then the topology env of the world size. It also sets `GLM53_MAX_CONTEXT` to the KV token budget.
 - The `serve` command always turns on `GLM53_MHC_FUSED`, `GLM53_KDA_FUSED`, `GLM53_MLA_LATENT` and `GLM53_PREFILL_BATCH`.
 - "Rows" means the token rows of one call: 1 for plain decode, 2..8 for a verified draft chain, up to 32 for batched multi-sequence verification, hundreds to thousands for prefill chunks. "Decode-sized" means 1..32 rows.
 - C12 is a lossless 12-bit coding of the Half weights; Q8 is int8 with one FP32 scale per 128 inputs. Routed experts always use the checkpoint's EXL3 4-bit weights.
@@ -276,6 +276,35 @@ Notes:
 
 | Variable | Value | Meaning | Class |
 | --- | --- | --- | --- |
-| `GLM53_GRAPH` | `1` | Use CUDA graphs for decode/verification (enabled when set; tensor parallelism 2 only, since all experts must be resident). | L0 |
+| `GLM53_GRAPH` | `1` | Use CUDA graphs for decode/verification (enabled when set; all experts must be resident). | L0 |
 | `GLM53_GRAPH_SHARED_WS` | `1` | One cuBLAS/cuBLASLt workspace shared by every graph instead of one per capture stream (about 32 MiB per graph). | — |
 | `GLM53_STATIC_TENSORS` | `0` | Make constant tensors (decay base, convolution weights, DSA constants) static; off (no measurable gain). | L0 if on |
+
+## Added in v0.2 (5)
+
+| Variable | Value | Meaning | Class |
+| --- | --- | --- | --- |
+| `GLM53_SERVE_FORK_CKPT` | `2048` | Fork checkpoints: when a prompt leaves a cached sequence after at least this many shared tokens, prefill stops at the fork point and saves a checkpoint there, so the next request that branches at the same place resumes from it. 0 = off. | — |
+| `GLM53_KV_VMM` | `1` | KV stores on CUDA virtual memory: a store grows in place (no clone, no contiguous range needed), so one session can use the whole KV budget. | — |
+| `GLM53_KV_HEADROOM_PCT` | `25` | Extra capacity (percent) given to a new or grown KV store, so a growing conversation does not regrow every turn. | — |
+| `GLM53_SERVE_PREWARM_LAZY` | `1` | Report ready after warming store 0; stores 1.. are warmed afterwards, one per idle turn (ready about 10 s sooner). | — |
+| `GLM53_MHC_SINKHORN_SPLIT` | `1` | mHC Sinkhorn normalization on its own CTAs, off the collapse / RMS path. | L0 |
+
+Available but off in this profile: `GLM53_MLA_DECODE_TC=1` (MLA decode attention on tensor cores, L1, −0.2..−0.6 ms per
+round; validated with the SPX1 checkpoint only), `GLM53_DEPTH_TABLE` (a recalibrated speculation depth table, JSON).
+
+## Three nodes (TP3): `profiles/tp3-rdma.env`
+
+With `GLM_WORLD=3` the engine splits KDA heads 22/21/21, MLA heads 32/16/16 (the latent kernel works in 16-head units), the
+shared expert 1024/1024/0, and each routed expert's 16 Hadamard blocks 6/5/5 (rotating with the expert, so every node does the same work per layer); prefill is
+sequence-parallel (rows padded to a multiple of 3, row reduce-scatter / all-gather). With two nodes every split is
+bitwise the same as before. The topology env sets:
+
+| Variable | Value | Meaning | Class |
+| --- | --- | --- | --- |
+| `GLM53_RDMA_ARN_INIT` | `1` | Set up the N-way RDMA all-reduce (`shim/rdma_arn.cu`): links are found by subnet (one directly connected RoCE port pair per node pair), sums are FP32 in rank order. | L0 vs. the rank-ordered sum |
+| `GLM53_RDMA_AR` | `1` | Route decode / verify / prefill collectives over the engine's RDMA path. | L0 |
+| `GLM53_RDMA_AR_INIT`, `GLM53_TP_SMALL_COMM`, `GLM53_TP_SMALL_COMM_ACTIVE` | `0` | The two-rank transports are off. | — |
+| `GLM53_RDMA_ARN_RS_BF16` | `1` | Prefill row reduce-scatter carries the peers' partial sums as BF16 (own rows FP32, FP32 rank-ordered sum). | L1 |
+| `GLM53_PREFILL_SP_HALF_Z` | `1` | The prefill z all-gather in Half. | L1 |
+| `NCCL_SOCKET_IFNAME`, `NCCL_IB_DISABLE=1` | from `SPARK_TP3_IFNAME` | NCCL only bootstraps the process group over sockets. | — |

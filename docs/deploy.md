@@ -1,10 +1,13 @@
 # Deployment
 
+This page covers GLM-5.3-Flash (two or three nodes) and Qwen3.8-Flash-Next (one node). DeepSeek-V4.1-Flash on three
+nodes has its own recipe, [ds41.md](ds41.md), which builds on sections 1, 3 and 5 here.
+
 ## 1. Hardware and system
 
 | | GLM-5.3-Flash | Qwen3.8-Flash-Next |
 | --- | --- | --- |
-| Machines | 2× DGX Spark (GB10), each 128 GB unified memory | 1× DGX Spark |
+| Machines | 2× DGX Spark (GB10), each 128 GB unified memory; or 3× (TP3) | 1× DGX Spark |
 | Interconnect | the two ConnectX-7 QSFP ports cabled directly between the Sparks (2 × 200 Gb/s RoCE) | — |
 | Disk | ~170 GB per node (checkpoint 164 GB + drafter 2.2 GB), same path on both nodes | ~101 GB (includes a 39 GB n-gram embedding table read from NVMe at run time) |
 | Software | DGX OS 7 / Ubuntu 24.04 aarch64, NVIDIA driver with CUDA 13 support, Python 3.12 | same |
@@ -27,7 +30,7 @@ The engine itself keeps its pinned host buffers out of compaction's way: they ar
 `cudaHostRegister`, which compaction never isolates (`cudaHostAlloc` memory is shared-memory backed and is). Set
 `GLM53_HOST_REGISTER=0` to go back to `cudaHostAlloc`.
 
-## 2. Networking for GLM (two nodes)
+## 2. Networking for GLM
 
 Connect port 0 of each ConnectX-7 to the other Spark's port 0 (both QSFP ports if you have two cables). Give the two
 interfaces of each node a point-to-point address, for example:
@@ -43,6 +46,20 @@ on DGX OS; NCCL and the engine's RDMA all-reduce use both RDMA devices.
 Node A starts rank 1 on node B over ssh: set up key-based login from A to B for the user that runs the server (the
 example uses `root@10.0.1.1`). Install the release, the Python environment and the models **at the same paths on both
 nodes**; the launcher refuses to start if the two engine binaries differ.
+
+### Three nodes (GLM TP3)
+
+GLM-5.3-Flash also runs over three Sparks with the same binary, checkpoint and profile (`GLM_WORLD=3` or
+`start.sh glm3`): KDA heads split 22/21/21, MLA heads 32/16/16, each routed expert 6/5/5 of its 16 Hadamard blocks, and
+prefill is sequence-parallel. The three nodes need a full mesh of the ConnectX-7 ports (one cable per pair, each
+function on its own /30) and a LAN on which all three reach each other; the layout and how the engine pairs links is
+in [ds41.md](ds41.md) §2, which uses the same cluster. Set `SPARK_WORKERS`, `SPARK_MASTER_ADDRS` and `SPARK_TP3_IFNAME`
+in `spark.env`.
+
+TP3 was developed and accepted with the project's own SPX1 checkpoint of GLM-5.3-Flash (not published): spec decode
++21% over TP2 (60.2 vs 49.7 tok/s on the project's mixed benchmark), prefill +4%, KL vs. the FP8 reference unchanged
+(0.01370 vs 0.01364). With the public EXL3 checkpoint TP3 uses the same code paths but has **not been measured**; TP2
+remains the tested configuration for it.
 
 ## 3. Install
 
@@ -77,15 +94,18 @@ The script pins the revisions the engine was tested with. The DFlash2 drafter is
 cp spark.env.example spark.env
 ```
 
-Edit `spark.env` (same content on both nodes): paths, the worker's ssh target, fabric address and NCCL interface names.
+Edit `spark.env` (same content on every node): paths, the workers' ssh targets (`SPARK_WORKERS`), the address of rank 0
+as each rank sees it (`SPARK_MASTER_ADDRS`) and the NCCL interface names.
 Every setting is explained in the file and in [configuration.md](configuration.md).
 
 ## 6. Start, use, stop
 
 ```bash
-engine-rs/serve/start.sh glm      # on node A; about a minute (loading 82 GB per node)
+engine-rs/serve/start.sh glm      # on node A; about a minute (loading 82 GB per node); GLM_WORLD nodes
+engine-rs/serve/start.sh glm3     # GLM over three nodes
+engine-rs/serve/start.sh ds41     # DeepSeek-V4.1-Flash over three nodes (ds41.md)
 engine-rs/serve/start.sh qwen     # one node; about 50 s
-engine-rs/serve/start.sh status   # glm | qwen | none
+engine-rs/serve/start.sh status   # glm | ds41 | qwen | none
 engine-rs/serve/start.sh stop
 ```
 
@@ -103,14 +123,16 @@ Thinking: both models think by default. Turn it off per request with `"chat_temp
 Qwen also accepts `"reasoning_effort": "none" | "low" | "medium" | "high"`. Images: put `{"type": "image_url",
 "image_url": {"url": "https://... or data:image/png;base64,..."}}` in the message content; videos: `"type": "video_url"`.
 
-Logs: `/tmp/spark-glm-rank0.log`, `/tmp/spark-glm-rank1.log` (on node B), `/tmp/spark-glm-front.log`,
+Logs: `/tmp/spark-glm-rank0.log`, `/tmp/spark-glm-rank<r>.log` (on the worker nodes), `/tmp/spark-glm-front.log`,
 `/tmp/spark-qwen-engine.log`, `/tmp/spark-qwen-front.log`. Prometheus metrics: `GET /metrics`.
 
 ## 7. Troubleshooting
 
 | Symptom | Cause / fix |
 | --- | --- |
-| `engine binary differs between the nodes` | Install the same release on both nodes (same `SPARK_BIN` path). |
+| `engine binary differs on rank N` | Install the same release on every node (same `SPARK_BIN` path). |
+| `no address of rank 0 for rank N` / `no node for rank N` | `SPARK_MASTER_ADDRS` / `SPARK_WORKERS` in `spark.env` list fewer nodes than the world size. |
+| `SPARK_TP3_IFNAME` error, or rank 0 waits forever under TP3 | Set `SPARK_TP3_IFNAME` to an interface on which all three nodes reach each other. |
 | `rank 0 exited` with NCCL errors | Check the fabric addresses, `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`, `ibv_devinfo` port state, and that rank 1 started (`/tmp/spark-glm-rank1.log` on node B). |
 | Out of memory at start | Another process holds GPU memory, or the other model is still releasing memory: `start.sh stop`, wait, start again. Lower `GLM_KV_TOKENS` (or `QWEN_KV_TOKENS`) to shrink the KV pool. |
 | `libexllamav3_ext.so` / `libtorch_cuda.so` not found | Source `scripts/env.sh` with `SPARK_PYTHON` pointing at the environment that has torch 2.13 cu130. |

@@ -60,14 +60,15 @@ only that object.
 
 | Path | Contents |
 | --- | --- |
-| `engine-rs/src` | engine (Rust): loading, GLM forward and speculative decoding, tensor parallelism, serving loop; `src/qwen/` the Qwen3.8 model, serving and drafting |
-| `engine-rs/shim` | CUDA / C++ kernels and the libtorch bridge; `moe_exl3.cuh` (EXL3 MoE shared by both models), `qwen_*.cu`, `glm_moe.cu`, `c12*`, `q8.cuh`, `rdma_*.cu`, ... |
-| `engine-rs/serve` | OpenAI-compatible front ends (`openai_server.py`, `qwen_server.py`, media handling) and start/stop scripts |
-| `engine-rs/profiles` | `glm-tp2.env`: the GLM serving profile ([switch reference](glm-switches.md)) |
+| `engine-rs/src` | engine (Rust): loading, GLM forward and speculative decoding, tensor parallelism, serving loop; `src/qwen/` the Qwen3.8 model, serving and drafting; `src/ds41/` DeepSeek-V4.1-Flash (sharding, model, kernels, speculation, serving); shared modules `kv_pool.rs`, `mm_canvas.rs`, `pcache_core.rs` |
+| `engine-rs/shim` | CUDA / C++ kernels and the libtorch bridge; `moe_exl3.cuh` (EXL3 MoE shared by GLM and Qwen), `ds41*.cu` (`ds41_mx.cu` needs the arch-specific `sm_121a` target), `qwen_*.cu`, `glm_moe.cu`, `spx*`, `c12*`, `q8.cuh`, `rdma_*.cu` (`rdma_arn.cu`: N-way), shared headers `pdl.cuh`, `topk_select.cuh`, `mhc_common.cuh`, ... |
+| `engine-rs/serve` | OpenAI-compatible front ends (`openai_server.py`, `qwen_server.py`, `ds41_server.py`, media handling) and start/stop scripts |
+| `engine-rs/profiles` | `glm.env`: the GLM serving profile ([switch reference](glm-switches.md)); `tp2-rdma.env` / `tp3-rdma.env`: transport per world size |
+| `engine-rs/testdata` | byte-exact manifest of the prefix-cache regression test (`spark-engine pcache-golden`) |
 | `scripts` | dependency fetch / build, runtime environment, packaging, model download, abliteration donor fetch |
 | `patches` | patch applied to the fetched `torch-sys` |
 | `bench` | speed and text-consistency tools |
-| `reference` | Python reference implementations used to validate the kernels (developer tools; need extra packages) |
+| `reference` | Python reference implementations used to validate the kernels (developer tools; need extra packages); `reference/ds41/export_engram.py` produces DeepSeek's Engram hash file (a deployment step) |
 | `assets` | the Qwen MTP draft sub-vocabulary |
 
 ## Continuous integration

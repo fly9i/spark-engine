@@ -3,18 +3,15 @@
 #include <cuda_fp16.h>
 #include <cstdlib>
 #include <cstdint>
+#include "mhc_common.cuh"
+#include "ablate_clamp.cuh"
 
 // One 16-lane group per 4x4 matrix. Keep every lane active, including padding.
 // Input is the existing FP32 softmax + epsilon; only the 39 normalizations fuse.
 __global__ void sinkhorn4(const float* input, float* output, int rows) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     float v = i < rows * 16 ? input[i] : 0.0f;
-    for (int step = 0; step < 39; ++step) {
-        int stride = (step % 2 == 0) ? 4 : 1; // column, row, column, ...
-        float sum = v + __shfl_xor_sync(0xffffffff, v, stride, 16);
-        sum += __shfl_xor_sync(0xffffffff, sum, 2 * stride, 16);
-        v = v / (sum + 1.0e-6f);
-    }
+    v = mhc_sinkhorn16(v, 39, 1.0e-6f);   // column, row, column, ... (mhc_common.cuh)
     if (i < rows * 16) output[i] = v;
 }
 
@@ -152,12 +149,52 @@ __global__ void mhc_post_four_ar_kernel(const float* x,const float* __restrict__
     for(int stream=0;stream<4;++stream)
         out[(row*4+stream)*hidden+col]=__fadd_rn(mixed[stream],__fmul_rn(post[row*4+stream],branch));
 }
+// N ranks (rdma_arn.cu, TP3): every sender's partial from its recv area (sender r at recv_base + r * rank_stride), summed in
+// rank order with this rank's own partial in its place (acc = x0, acc += x1, ...), as arn_kernel / arn_materialize do, so the
+// fused and the separate paths give the same bits on every rank; then the same rounding and post as above.
+template<bool PACKED, bool ROUND>
+__global__ void mhc_post_four_arn_kernel(const float* x,const float* __restrict__ recv_base,const unsigned long long* seq,int slot_floats,int nslot,
+                                        long long rank_stride,int rank,int world,
+                                        const float* residual,const float* comb,const float* post,float* out,int rows,int hidden,
+                                        long long stride0,long long stride1,long long stride2) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*hidden)return;
+    int row=i/hidden,col=i%hidden;
+    const long long slot=(long long)(*(volatile const unsigned long long*)seq%(unsigned long long)nslot)*slot_floats;
+    auto sum=[&](int j){float acc=0.f;for(int r=0;r<world;++r){const float v=r==rank?x[j]:__ldcv(recv_base+r*rank_stride+slot+j);acc=r==0?v:__fadd_rn(acc,v);}return acc;};
+    float mixed[4]={0.f,0.f,0.f,0.f};
+    #pragma unroll
+    for(int k=0;k<4;++k) {
+        float r=residual[row*stride0+k*stride1+col*stride2];
+        #pragma unroll
+        for(int stream=0;stream<4;++stream)
+            mixed[stream]=__fmaf_rn(comb[row*16+k*4+stream],r,mixed[stream]);
+    }
+    float branch=sum(i);
+    if constexpr (PACKED) {
+        float shared=sum(rows*hidden+i);
+        if constexpr (ROUND) shared=__half2float(__float2half_rn(shared));
+        branch=__fadd_rn(branch,shared);
+    } else if constexpr (ROUND) branch=__half2float(__float2half_rn(branch));
+    #pragma unroll
+    for(int stream=0;stream<4;++stream)
+        out[(row*4+stream)*hidden+col]=__fadd_rn(mixed[stream],__fmul_rn(post[row*4+stream],branch));
+}
 extern "C" int glm53_rdma_ar_peer(const float**,const unsigned long long**,int*,int*);
+extern "C" int glm53_rdma_arn_peer(const float**,const unsigned long long**,int*,int*,long long*,int*,int*);
 extern "C" int glm53_mhc_post_four_ar_cuda(const float* x,const float* residual,const float* comb,const float* post,float* out,
                                            int rows,int hidden,long long s0,long long s1,long long s2,int packed,int round,cudaStream_t stream) {
     if(rows<=0 || hidden<=0 || (packed!=0 && packed!=1) || (round!=0 && round!=1))return int(cudaErrorInvalidValue);
     const float* recv=nullptr;const unsigned long long* seq=nullptr;int slot_floats=0,nslot=0;
-    if(glm53_rdma_ar_peer(&recv,&seq,&slot_floats,&nslot))return int(cudaErrorNotReady);
+    if(glm53_rdma_ar_peer(&recv,&seq,&slot_floats,&nslot)) {
+        long long rank_stride=0;int rank=0,world=0;
+        if(glm53_rdma_arn_peer(&recv,&seq,&slot_floats,&nslot,&rank_stride,&rank,&world))return int(cudaErrorNotReady);
+        if((long long)rows*hidden*(packed?2:1)>slot_floats)return int(cudaErrorInvalidValue);
+        const unsigned blocks=(rows*hidden+255)/256;
+#define POST_ARN(P,R) mhc_post_four_arn_kernel<P,R><<<blocks,256,0,stream>>>(x,recv,seq,slot_floats,nslot,rank_stride,rank,world,residual,comb,post,out,rows,hidden,s0,s1,s2)
+        if(packed){if(round)POST_ARN(true,true);else POST_ARN(true,false);}else{if(round)POST_ARN(false,true);else POST_ARN(false,false);}
+#undef POST_ARN
+        return static_cast<int>(cudaGetLastError());
+    }
     if((long long)rows*hidden*(packed?2:1)>slot_floats)return int(cudaErrorInvalidValue);
     const unsigned blocks=(rows*hidden+255)/256;
 #define POST_AR(P,R) mhc_post_four_ar_kernel<P,R><<<blocks,256,0,stream>>>(x,recv,seq,slot_floats,nslot,residual,comb,post,out,rows,hidden,s0,s1,s2)
@@ -196,14 +233,58 @@ __global__ void mhc_pre_partial(const float* __restrict__ x,const W* __restrict_
     __syncthreads();
     if(tid<25)partial[((long long)slice*rows+r)*25+tid]=(red[0][tid]+red[1][tid])+(red[2][tid]+red[3][tid]);
 }
-__device__ __forceinline__ float mhc_sigmoid(float x){return 1.f/(1.f+expf(-x));}
 // Kernel 2: one CTA per row. Partials are staged to shared memory cooperatively, then summed in
 // fixed slice order. Gates, softmax and Sinkhorn run on 16 lanes with sinkhorn4's pairing order.
 static bool mhc_finish_reg(int h){const char* e=std::getenv("GLM53_MHC_FINISH_REG");return e&&e[0]=='1'&&h<=8*1024;}
-__global__ void mhc_pre_finish(const float* __restrict__ partial,int slices,const float* __restrict__ residual,
+// GLM53_MHC_SINKHORN_SPLIT=1 (L0): rows extra CTAs (blockIdx.x >= rows) each redo one row's slice sums and run its
+// 39-step Sinkhorn (comb), while the row's main CTA skips it and goes straight on to the collapse / RMS norm, which never
+// reads comb. Same operations per output; the ~3.5 us serial Sinkhorn leaves the critical path.
+static int mhc_finish_ctas(int rows){const char* e=std::getenv("GLM53_MHC_SINKHORN_SPLIT");return e&&e[0]=='1'?2*rows:rows;}
+// O5 step 3 (GLM53_SPX_MHC_ROT=1): the finished row z (staged as sign (.) z in shared memory rb[h]) also leaves as the
+// SPX rotated input of the sublayer's first SPX projection: blockdiag(H_bk) FWHT in FP32, scaled by rsqrt(bk), Half.
+// The exact operation sequence of spx_rot<float,__half,true> (per-thread 8-point butterflies, warp shuffles, then shared
+// memory stages; lower+upper / lower-upper at every stage), so x_rot is bitwise the separate kernel's (L0).
+// Needs h % 256 == 0, h <= 8 * blockDim, bk a power of two in [8, h] (checked on the host).
+__device__ __forceinline__ void mhc_rot_row(float* rb,int h,int bk,__half* out){
+    const int tid=threadIdx.x,nt=bk>>3;const bool act=tid<(h>>3);   // warp-uniform: h/8 is a multiple of 32
+    float v[8];
+    if(act){
+#pragma unroll
+        for(int i=0;i<8;i++)v[i]=rb[tid*8+i];
+#pragma unroll
+        for(int s=1;s<8;s<<=1)
+#pragma unroll
+            for(int i=0;i<8;i++)if(!(i&s)){const float a=v[i],b=v[i+s];v[i]=a+b;v[i+s]=a-b;}
+        for(int hs=1;hs<32&&hs<nt;hs<<=1){
+#pragma unroll
+            for(int i=0;i<8;i++){const float o=__shfl_xor_sync(0xffffffffu,v[i],hs);v[i]=(tid&hs)?(o-v[i]):(v[i]+o);}
+        }
+    }
+    for(int hs=32;hs<nt;hs<<=1){
+        __syncthreads();
+        if(act){
+#pragma unroll
+            for(int i=0;i<8;i++)rb[tid*8+i]=v[i];
+        }
+        __syncthreads();
+        if(act){
+#pragma unroll
+            for(int i=0;i<8;i++){const float o=rb[(tid^hs)*8+i];v[i]=(tid&hs)?(o-v[i]):(v[i]+o);}
+        }
+    }
+    if(act){const float sc=rsqrtf((float)bk);
+#pragma unroll
+        for(int i=0;i<8;i++)out[tid*8+i]=__float2half_rn(v[i]*sc);}
+}
+static bool mhc_rot_ok(int h,int bk){return h%256==0&&h<=8*1024&&bk>=8&&bk<=h&&!(bk&(bk-1))&&h%bk==0;}
+// CL (SPARK_ABLATE_CLAMP epilogue, ablate_clamp.cuh): z is clamped before it is stored, cl.k*33 floats of dynamic shared
+// memory past the partials; never combined with zr (checked on the host). CL=false is the unchanged kernel.
+template<bool CL> __global__ void mhc_pre_finish(const float* __restrict__ partial,int slices,const float* __restrict__ residual,
     const float* __restrict__ scale,const float* __restrict__ base,const float* __restrict__ ln,
-    float* __restrict__ z,float* __restrict__ post,float* __restrict__ comb,int rows,int h,bool reg_z){
-    const int r=blockIdx.x,tid=threadIdx.x,lane=tid&31;
+    float* __restrict__ z,float* __restrict__ post,float* __restrict__ comb,int rows,int h,bool reg_z,
+    const int8_t* __restrict__ rsign=nullptr,int rbk=0,__half* __restrict__ zr=nullptr,SparkClamp cl=SparkClamp{}){
+    const bool split=gridDim.x>(unsigned)rows,sk=blockIdx.x>=(unsigned)rows;   // sk: this CTA only does the Sinkhorn
+    const int r=sk?blockIdx.x-rows:blockIdx.x,tid=threadIdx.x,lane=tid&31;
     extern __shared__ float stage[];
     __shared__ float mix[25];__shared__ float pre[4];__shared__ float wsum[32];__shared__ float rinv;
     for(int i=tid;i<slices*25;i+=blockDim.x){const int sl=i/25,c=i%25;stage[i]=partial[((long long)sl*rows+r)*25+c];}
@@ -212,22 +293,18 @@ __global__ void mhc_pre_finish(const float* __restrict__ partial,int slices,cons
     __syncthreads();
     if(tid<32){
         const float rstd=rsqrtf(mix[24]/(float)(4*h)+1e-5f);
+        if(!sk){
         if(lane<4){pre[lane]=mhc_sigmoid(mix[lane]*rstd*scale[0]+base[lane])+1e-6f;}
         else if(lane<8){const int s=lane-4;post[r*4+s]=mhc_sigmoid(mix[4+s]*rstd*scale[1]+base[4+s])*2.f;}
-        const int e=lane&15;
-        float x=mix[8+e]*rstd*scale[2]+base[8+e];
-        float mx=fmaxf(x,__shfl_xor_sync(0xffffffff,x,1,16));mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,2,16));
-        const float ex=expf(x-mx);
-        float sum=ex+__shfl_xor_sync(0xffffffff,ex,1,16);sum+=__shfl_xor_sync(0xffffffff,sum,2,16);
-        float v=ex/sum+1e-6f;
-        for(int step=0;step<39;++step){
-            const int stride=(step%2==0)?4:1;
-            float t=v+__shfl_xor_sync(0xffffffff,v,stride,16);
-            t+=__shfl_xor_sync(0xffffffff,t,2*stride,16);
-            v=v/(t+1.0e-6f);
         }
+        if(!split||sk){
+        const int e=lane&15;
+        const float x=mix[8+e]*rstd*scale[2]+base[8+e];
+        const float v=mhc_sinkhorn16(mhc_row_softmax16(x,1e-6f),39,1.0e-6f);
         if(lane<16)comb[r*16+lane]=v;
+        }
     }
+    if(sk)return;   // CTA-uniform
     __syncthreads();
     const float* res=residual+(long long)r*4*h;
     float sq=0.f;
@@ -248,11 +325,37 @@ __global__ void mhc_pre_finish(const float* __restrict__ partial,int slices,cons
     __syncthreads();
     if(tid==0){float s=0.f;for(int i=0;i<(int)(blockDim.x>>5);++i)s+=wsum[i];rinv=rsqrtf(s/(float)h+1e-5f);}
     __syncthreads();
+    float* rb=stage+slices*25;   // zr only: sign (.) z of this row (h floats past the partials)
+    if constexpr(CL){
+        float acc[SPARK_CLAMP_MAX_K];
+#pragma unroll
+        for(int q=0;q<SPARK_CLAMP_MAX_K;++q)acc[q]=0.f;
+        if(reg_z){
+#pragma unroll
+            for(int j=0;j<8;++j){const int c=tid+j*blockDim.x;if(c<h){const float zv=ln[c]*(keep[j]*rinv);keep[j]=zv;
+#pragma unroll
+                for(int q=0;q<SPARK_CLAMP_MAX_K;++q)if(q<cl.k)acc[q]+=zv*cl.d[(long long)q*h+c];}}
+        } else
+        for(int c=tid;c<h;c+=blockDim.x){const long long i=(long long)r*h+c;const float zv=ln[c]*(z[i]*rinv);z[i]=zv;
+#pragma unroll
+            for(int q=0;q<SPARK_CLAMP_MAX_K;++q)if(q<cl.k)acc[q]+=zv*cl.d[(long long)q*h+c];}
+        float* e=rb+cl.k*32;
+        spark_clamp_reduce(cl,acc,rb,e,r);
+        if(reg_z){
+#pragma unroll
+            for(int j=0;j<8;++j){const int c=tid+j*blockDim.x;if(c<h)z[(long long)r*h+c]=keep[j]-spark_clamp_update(cl,e,h,c);}
+        } else
+        for(int c=tid;c<h;c+=blockDim.x){const long long i=(long long)r*h+c;z[i]=z[i]-spark_clamp_update(cl,e,h,c);}
+        return;
+    }
     if(reg_z){
 #pragma unroll
-        for(int j=0;j<8;++j){const int c=tid+j*blockDim.x;if(c<h)z[(long long)r*h+c]=ln[c]*(keep[j]*rinv);}
+        for(int j=0;j<8;++j){const int c=tid+j*blockDim.x;if(c<h){const float zv=ln[c]*(keep[j]*rinv);z[(long long)r*h+c]=zv;if(zr)rb[c]=zv*(float)rsign[c];}}
     } else
-    for(int c=tid;c<h;c+=blockDim.x){const long long i=(long long)r*h+c;z[i]=ln[c]*(z[i]*rinv);}
+    for(int c=tid;c<h;c+=blockDim.x){const long long i=(long long)r*h+c;const float zv=ln[c]*(z[i]*rinv);z[i]=zv;if(zr)rb[c]=zv*(float)rsign[c];}
+    if(!zr)return;   // grid-uniform
+    __syncthreads();
+    mhc_rot_row(rb,h,rbk,zr+(long long)r*h);
 }
 template<bool SPLIT,typename W> __global__ void mhc_pre_partial_tc(const float* __restrict__ x,const W* __restrict__ fn,float* __restrict__ partial,int rows,int k);
 template<typename W> static void mhc_pre_partial_launch(const float* residual,const W* fn,float* partial,int rows,int k,int slices,cudaStream_t stream){
@@ -266,13 +369,15 @@ template<typename W> static void mhc_pre_partial_launch(const float* residual,co
     else mhc_pre_partial<W><<<dim3(slices,rows),MHC_PRE_SLICE,0,stream>>>(residual,fn,partial,rows,k);
 }
 extern "C" int glm53_mhc_pre_fused_cuda(const float* residual,const void* fn,int fn_bf16,const float* scale,const float* base,const float* ln,
-    float* partial,float* z,float* post,float* comb,int rows,int h,cudaStream_t stream){
+    float* partial,float* z,float* post,float* comb,int rows,int h,const int8_t* rsign,int rbk,__half* zr,const SparkClamp* cl,cudaStream_t stream){
     const int k=4*h;
-    if(rows<1||k%MHC_PRE_SLICE)return int(cudaErrorInvalidValue);
+    if(cl&&cl->k<1)cl=nullptr;
+    if(rows<1||k%MHC_PRE_SLICE||(zr&&(!rsign||!mhc_rot_ok(h,rbk)))||(cl&&(zr||cl->k>SPARK_CLAMP_MAX_K)))return int(cudaErrorInvalidValue);
     const int slices=k/MHC_PRE_SLICE;
     if(fn_bf16)mhc_pre_partial_launch(residual,(const __nv_bfloat16*)fn,partial,rows,k,slices,stream);
     else mhc_pre_partial_launch(residual,(const float*)fn,partial,rows,k,slices,stream);
-    mhc_pre_finish<<<rows,1024,slices*25*sizeof(float),stream>>>(partial,slices,residual,scale,base,ln,z,post,comb,rows,h,mhc_finish_reg(h));
+    if(cl)mhc_pre_finish<true><<<mhc_finish_ctas(rows),1024,(slices*25+cl->k*33)*sizeof(float),stream>>>(partial,slices,residual,scale,base,ln,z,post,comb,rows,h,mhc_finish_reg(h),nullptr,0,nullptr,*cl);
+    else mhc_pre_finish<false><<<mhc_finish_ctas(rows),1024,(slices*25+(zr?h:0))*sizeof(float),stream>>>(partial,slices,residual,scale,base,ln,z,post,comb,rows,h,mhc_finish_reg(h),rsign,rbk,zr);
     return int(cudaGetLastError());
 }
 
@@ -375,11 +480,13 @@ __global__ void mhc_post_pre_partial(const float* __restrict__ x,const float* __
   for(int i=threadIdx.x;i<nt*25;i+=blockDim.x){const int tok=i/25,o=i%25;
     partial[((long long)slice*rows+row0+tok)*25+o]=(red[0][tok][o]+red[1][tok][o])+(red[2][tok][o]+red[3][tok][o]);}
 }
-static int glm53_mhc_post_pre_fused_cuda_rows(const float*,const float*,const float*,const float*,float*,const void*,int,const float*,const float*,const float*,float*,float*,float*,float*,int,int,cudaStream_t);
+static int glm53_mhc_post_pre_fused_cuda_rows(const float*,const float*,const float*,const float*,float*,const void*,int,const float*,const float*,const float*,float*,float*,float*,float*,int,int,const int8_t*,int,__half*,const SparkClamp*,cudaStream_t);
 extern "C" int glm53_mhc_post_pre_fused_cuda(const float* x,const float* residual,const float* comb,const float* post,float* out,
-    const void* fn,int fn_bf16,const float* scale,const float* base,const float* ln,float* partial,float* z,float* post_next,float* comb_next,int rows,int h,cudaStream_t stream){
+    const void* fn,int fn_bf16,const float* scale,const float* base,const float* ln,float* partial,float* z,float* post_next,float* comb_next,int rows,int h,
+    const int8_t* rsign,int rbk,__half* zr,const SparkClamp* cl,cudaStream_t stream){
   const int k=4*h;
-  if(rows<1||h%128||k%MHC_PRE_SLICE)return int(cudaErrorInvalidValue);
+  if(cl&&cl->k<1)cl=nullptr;
+  if(rows<1||h%128||k%MHC_PRE_SLICE||(zr&&(!rsign||!mhc_rot_ok(h,rbk)))||(cl&&(zr||cl->k>SPARK_CLAMP_MAX_K)))return int(cudaErrorInvalidValue);
   const int slices=k/MHC_PRE_SLICE;
   // GLM53_MHC_GROUP_ROWS=G (multiple of 8): prefill rows in groups of G, partial then finish per group, so the finish
   // re-reads the new residual from L2 instead of DRAM. Every row's arithmetic (its 8-row MMA tile, slice partials,
@@ -387,15 +494,17 @@ extern "C" int glm53_mhc_post_pre_fused_cuda(const float* x,const float* residua
   static const int grp=[]{const char* e=std::getenv("GLM53_MHC_GROUP_ROWS");int g=e?atoi(e):0;return g>=8&&g%8==0?g:0;}();
   if(grp&&rows>grp){
     for(int r0=0;r0<rows;r0+=grp){const int n=rows-r0<grp?rows-r0:grp;
+      SparkClamp g;if(cl){g=*cl;if(g.count)g.count+=r0;}   // the count gate is per row too
       const int rc=glm53_mhc_post_pre_fused_cuda_rows(x+(long long)r0*h,residual+(long long)r0*k,comb+(long long)r0*16,post+(long long)r0*4,out+(long long)r0*k,
-        fn,fn_bf16,scale,base,ln,partial,z+(long long)r0*h,post_next+(long long)r0*4,comb_next+(long long)r0*16,n,h,stream);
+        fn,fn_bf16,scale,base,ln,partial,z+(long long)r0*h,post_next+(long long)r0*4,comb_next+(long long)r0*16,n,h,rsign,rbk,zr?zr+(long long)r0*h:nullptr,cl?&g:nullptr,stream);
       if(rc)return rc;}
     return 0;
   }
-  return glm53_mhc_post_pre_fused_cuda_rows(x,residual,comb,post,out,fn,fn_bf16,scale,base,ln,partial,z,post_next,comb_next,rows,h,stream);
+  return glm53_mhc_post_pre_fused_cuda_rows(x,residual,comb,post,out,fn,fn_bf16,scale,base,ln,partial,z,post_next,comb_next,rows,h,rsign,rbk,zr,cl,stream);
 }
 static int glm53_mhc_post_pre_fused_cuda_rows(const float* x,const float* residual,const float* comb,const float* post,float* out,
-    const void* fn,int fn_bf16,const float* scale,const float* base,const float* ln,float* partial,float* z,float* post_next,float* comb_next,int rows,int h,cudaStream_t stream){
+    const void* fn,int fn_bf16,const float* scale,const float* base,const float* ln,float* partial,float* z,float* post_next,float* comb_next,int rows,int h,
+    const int8_t* rsign,int rbk,__half* zr,const SparkClamp* cl,cudaStream_t stream){
   const int k=4*h,slices=k/MHC_PRE_SLICE;
   // Decode rows <= 8 with GLM53_MHC_PRE_TC=1 use the plain-TF32 MMA of mhc_pre_partial_tc<false> (what the
   // separate decode pre uses); prefill keeps split-TF32. Either way bitwise the separate post + pre partial.
@@ -404,6 +513,7 @@ static int glm53_mhc_post_pre_fused_cuda_rows(const float* x,const float* residu
               else mhc_post_pre_partial<__nv_bfloat16,true><<<dim3(slices,(rows+7)/8),128,0,stream>>>(x,residual,comb,post,out,(const __nv_bfloat16*)fn,partial,rows,h);}
   else{if(plain)mhc_post_pre_partial<float,false><<<dim3(slices,(rows+7)/8),128,0,stream>>>(x,residual,comb,post,out,(const float*)fn,partial,rows,h);
        else mhc_post_pre_partial<float,true><<<dim3(slices,(rows+7)/8),128,0,stream>>>(x,residual,comb,post,out,(const float*)fn,partial,rows,h);}
-  mhc_pre_finish<<<rows,1024,slices*25*sizeof(float),stream>>>(partial,slices,out,scale,base,ln,z,post_next,comb_next,rows,h,mhc_finish_reg(h));
+  if(cl)mhc_pre_finish<true><<<mhc_finish_ctas(rows),1024,(slices*25+cl->k*33)*sizeof(float),stream>>>(partial,slices,out,scale,base,ln,z,post_next,comb_next,rows,h,mhc_finish_reg(h),nullptr,0,nullptr,*cl);
+  else mhc_pre_finish<false><<<mhc_finish_ctas(rows),1024,(slices*25+(zr?h:0))*sizeof(float),stream>>>(partial,slices,out,scale,base,ln,z,post_next,comb_next,rows,h,mhc_finish_reg(h),rsign,rbk,zr);
   return int(cudaGetLastError());
 }

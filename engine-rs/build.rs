@@ -79,20 +79,23 @@ fn main() {
     let nv: Vec<String> = ["-O3", "-std=c++17", "-Xcompiler", "-fPIC", "--fmad=false"].iter().map(|s| s.to_string())
         .chain([format!("-gencode=arch=compute_{arch},code=sm_{arch}")]).collect();
     let nvcc = format!("{cuda}/bin/nvcc");
-    let kernels = ["mhc","kda","gemv","latent","fp8","dataflow","kda_conv_chain","kda_correction","dsa_index","draft_selector","draft_conv","shared_gu","rdma_ar","rdma_big","fp8_big","l2pf","c12","draft_head4","draft_q4","qwen_exl3","qwen_gdn","qwen_qsa","qwen_moe","qwen_hc","qwen_ple","qwen_f16","qwen_q8","glm_moe","ablate"];
+    let kernels = ["mhc","kda","gemv","latent","fp8","dataflow","kda_conv_chain","kda_correction","dsa_index","draft_selector","draft_conv","shared_gu","rdma_ar","rdma_arn","rdma_big","fp8_big","l2pf","c12","draft_head4","draft_q4","qwen_exl3","qwen_gdn","qwen_qsa","qwen_moe","qwen_hc","qwen_ple","qwen_f16","qwen_q8","glm_moe","ablate","spx","ds41","ds41_moe","ds41_hc","ds41_attn","ds41_ops","ds41_mx"];
     let mut jobs: Vec<(String, Vec<String>, String, String)> = Vec::new();
-    for src in ["shim/shim.cpp", "shim/lt.cpp", "shim/host_pin.cpp"] {
+    for src in ["shim/shim.cpp", "shim/lt.cpp", "shim/host_pin.cpp", "shim/vmm.cpp"] {
         jobs.push(("c++".into(), cxx.clone(), src.into(), cached_object(src, &cxx, hh)));
     }
+    // ds41_mx*: the block-scaled tensor-core MMA (mma ... kind::mxf8f6f4.block_scale) needs the arch-specific target (sm_121a)
+    let nv_a: Vec<String> = nv.iter().map(|f| if f.starts_with("-gencode") { format!("-gencode=arch=compute_{arch}a,code=sm_{arch}a") } else { f.clone() }).collect();
     for k in kernels {
         let src = format!("shim/{k}.cu");
-        let obj = cached_object(&src, &nv, hh);
-        jobs.push((nvcc.clone(), nv.clone(), src, obj));
+        let flags = if k.starts_with("ds41_mx") { &nv_a } else { &nv };
+        let obj = cached_object(&src, flags, hh);
+        jobs.push((nvcc.clone(), flags.clone(), src, obj));
     }
     compile_all(&jobs);
-    cc::Build::new().object(&jobs[0].3).object(&jobs[1].3).object(&jobs[2].3).compile("exl3shim");
+    cc::Build::new().object(&jobs[0].3).object(&jobs[1].3).object(&jobs[2].3).object(&jobs[3].3).compile("exl3shim");
     for (i, k) in kernels.iter().enumerate() {
-        cc::Build::new().object(&jobs[3 + i].3).compile(&format!("{k}cuda"));
+        cc::Build::new().object(&jobs[4 + i].3).compile(&format!("{k}cuda"));
         println!("cargo:rerun-if-changed=shim/{k}.cu");
     }
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib:{exl3}");
@@ -100,10 +103,13 @@ fn main() {
     println!("cargo:rustc-link-search=native={out}");
     println!("cargo:rustc-link-search=native={exl3}");
     println!("cargo:rustc-link-search=native={cuda}/lib64");
+    // libcuda (CUDA VMM for the KV pool, shim/vmm.cpp): the driver's copy at run time; the toolkit stub lets a machine
+    // without the driver (CI) link. Searched last, so an installed driver library is used when present.
+    println!("cargo:rustc-link-search=native={cuda}/lib64/stubs");
     for h in std::fs::read_dir("shim").unwrap().flatten().map(|e| e.path()) {
         if matches!(h.extension().and_then(|e| e.to_str()), Some("cuh") | Some("h") | Some("cpp")) { println!("cargo:rerun-if-changed={}", h.display()); }
     }
-    for l in ["cudart", "cublas", "cublasLt", "ibverbs", "exllamav3_ext", "torch", "torch_cpu", "torch_cuda", "c10", "c10_cuda"] {
+    for l in ["cudart", "cuda", "cublas", "cublasLt", "ibverbs", "exllamav3_ext", "torch", "torch_cpu", "torch_cuda", "c10", "c10_cuda"] {
         println!("cargo:rustc-link-lib=dylib={l}");
     }
     println!("cargo:rerun-if-changed={nccl_in}");

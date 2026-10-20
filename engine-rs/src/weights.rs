@@ -116,9 +116,47 @@ pub struct LayerWeights {
     pub moe: Option<MoeMeta>,
 }
 
+/// TP placement of a layer's split tensors (crate::tp::Part): `attn` over the attention heads, `mlp` over the dense or
+/// shared-expert intermediate. The units follow the SPX rotation blocks of the row-parallel writers (o_proj, down_proj)
+/// when the checkpoint has them, so no rank's input slice cuts a block (TP3 without re-quantization: KDA 32-head units
+/// 1/1/0, MLA 16-head units 2/1/1, shared expert 1024 units 1/1/0, dense 2048 units 2/2/2, rotating by layer); else one
+/// head / 128 columns. World 2 gives every tensor its half, as before.
+/// A rank whose share is zero units (KDA 1/1/0, shared 1/1/0) holds one unit anyway as a *shadow* (`shadow_attn` /
+/// `shadow_mlp`): it runs that unit like its owner (no empty tensors on any path; the layer's slowest rank is an owner
+/// either way) and its row-parallel output (o_proj / shared down) is zeroed before the TP sum (`mark_shadow`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerTp { pub attn: crate::tp::Part, pub mlp: crate::tp::Part, pub shadow_attn: bool, pub shadow_mlp: bool }
+
+/// The LayerTp of layer `i` (`attn` "kda" or other, `mlp` "dense" or MoE): units from the SPX rotation blocks in `idx`
+/// when present, else one head / 128 columns.
+pub fn layer_tp(idx: Option<&ShardIndex>, prefix: &str, i: usize, attn: &str, mlp: &str, rank: usize, world: usize) -> LayerTp {
+    // no index (probes splitting a loaded layer): `world` equal parts of every split dimension, the original TP2 rule
+    let Some(idx) = idx else { let p = crate::tp::Part::of(world as i64, rank, world, 0); return LayerTp { attn: p, mlp: p, shadow_attn: false, shadow_mlp: false } };
+    let idx = Some(idx);
+    let rot = |name: &str| idx.filter(|x| crate::spx::present(x, name)).map(|x| crate::spx::shape_rot(x, name).2);
+    let (heads, head_w) = if attn == "kda" { (64, 128) } else { (64, 256) };
+    let unit_h = rot(&format!("{prefix}.self_attn.o_proj.weight")).map_or(1, |r| (r / head_w).max(1));
+    assert_eq!(heads % unit_h, 0, "layer {i}: rotation block of {unit_h} heads");
+    let (width, down, mrot) = if mlp == "dense" { (12288, format!("{prefix}.mlp.down_proj.weight"), i) }
+        else { (2048, format!("{prefix}.mlp.shared_experts.down_proj.weight"), i + 1) };
+    let unit_c = rot(&down).unwrap_or(128).max(128);
+    assert_eq!(width % unit_c, 0, "layer {i}: rotation block of {unit_c} columns");
+    let shadow = |p: crate::tp::Part| if p.n == 0 { (crate::tp::Part { start: 0, n: 1, units: p.units }, true) } else { (p, false) };
+    let (attn, shadow_attn) = shadow(crate::tp::Part::of(heads / unit_h, rank, world, i));
+    let (mlp, shadow_mlp) = shadow(crate::tp::Part::of(width / unit_c, rank, world, mrot));
+    LayerTp { attn, mlp, shadow_attn, shadow_mlp }
+}
+/// This rank's vocabulary rows: 128-row blocks, the extra blocks to the lowest ranks (TP2: the half).
+pub fn vocab_part(v: i64, rank: usize, world: usize) -> crate::tp::Part {
+    assert_eq!(v % 128, 0, "vocabulary {v} is not a whole number of 128-row blocks");
+    crate::tp::Part::of(v / 128, rank, world, 0)
+}
+
 pub struct LayerPlanOwned {
     pub attn: String, // "kda" | "dsa"
     pub mlp: String,  // "dense" | "sparse"
+    /// TP placement chosen at load (None: unsplit, or split later by shard_dense_layer with the default units)
+    pub tp: Option<LayerTp>,
 }
 
 pub struct ModelWeights {
@@ -207,6 +245,31 @@ pub(crate) fn upload_stored(idx: &ShardIndex, name: &str, dev: Device) -> Tensor
     });
     dst
 }
+/// SPX (crate::spx): bytes [off, off+n) of tensor `name` as a contiguous u8 device tensor, staged like upload_stored.
+pub(crate) fn upload_bytes(idx:&ShardIndex,name:&str,off:usize,nbytes:usize,dev:Device)->Tensor {
+    assert!(dev.is_cuda());
+    let t0=std::time::Instant::now();
+    let dst=Tensor::empty([nbytes as i64],(Kind::Uint8,dev));
+    const STAGING:usize=64<<20;
+    LOAD_BUF.with(|b|{
+        let mut b=b.borrow_mut();
+        if b.is_none() {*b=Some(crate::expert_load::HostBuf::pinned(STAGING));}
+        let buf=b.as_mut().unwrap();
+        let mut o=0;
+        while o<nbytes {
+            let n=(nbytes-o).min(STAGING);
+            idx.read_range(name,off+o,&mut buf.bytes_mut()[..n]).unwrap_or_else(|err|panic!("权重缺失 {name}: {err}"));
+            buf.copy_to(&dst,o,n);
+            o+=n;
+        }
+    });
+    LOAD_BYTES.fetch_add(nbytes as u64,std::sync::atomic::Ordering::Relaxed);load_ns(0,t0);
+    dst
+}
+/// SPX: tensor `name` is done with (page cache dropped, its prefetched bytes no longer pending).
+pub(crate) fn consumed(idx:&ShardIndex,name:&str) {
+    if let Some(e)=idx.entries.get(name) {idx.drop_cache(name);CACHE_PENDING.fetch_sub(e.nbytes as i64,std::sync::atomic::Ordering::Relaxed);}
+}
 /// Release the host staging buffer of upload_stored (up to one LM head of bytes).
 pub(crate) fn release_load_buffer() {LOAD_BUF.with(|b|*b.borrow_mut()=None);}
 fn load_slow(idx: &mut ShardIndex, name: &str, dev: Device) -> Tensor {
@@ -264,8 +327,8 @@ fn ablit_prefetch_start()->Option<std::sync::Arc<crate::safetensors::Done>> {
 /// Page-cache warm-up of the loaded layers' non-expert tensors, in load order (see ModelWeights::load).
 fn prefetch_weights(idx:&ShardIndex,n_layers:usize)->crate::safetensors::Prefetch {
     let layer_of=|n:&str|n.strip_prefix("model.language_model.layers.").and_then(|r|r.split('.').next()).and_then(|i|i.parse::<usize>().ok());
-    idx.prefetch(8,|n|(n.starts_with("model.language_model.") || n=="lm_head.weight") && !n.contains(".mlp.experts.")
-        && layer_of(n).map_or(true,|i|i<n_layers),|n|layer_of(n).map_or(0,|i|i as i64+1))
+    idx.prefetch(8,|n|(n.starts_with("model.language_model.") || n.starts_with("lm_head.weight")) && !n.contains(".mlp.experts.")
+        && layer_of(n).map_or(true,|i|i<n_layers) && !crate::spx::shadowed(idx,n),|n|layer_of(n).map_or(0,|i|i as i64+1))
 }
 /// Bytes warmed into the page cache for the non-expert and drafter loads and not yet read by them. The expert
 /// arena allocations keep this much of MemAvailable untouched (see expert_load), so the arenas never push the
@@ -297,6 +360,14 @@ pub(crate) fn finish_early_prefetch() {DRAFT_PREFETCH.lock().unwrap().take();CAC
 fn ablit_take(layer:usize)->Option<AblitRead> {
     let h=ABLIT_READS.lock().unwrap().as_mut()?.remove(&layer)?;
     Some(h.join().expect("GLM53_ABLIT prefetch thread"))
+}
+/// SPARK_ABLATE on embedding rows y [rows, hidden] (any float kind; projected in FP32, returned in y's kind). Every row is
+/// linear in the table, so a vocabulary-sharded partial may be projected before its allreduce.
+fn ablate_embed(y:Tensor)->Tensor {
+    match crate::ablate::get() {
+        Some(a) if !crate::ablate::oproj_only()=>{let f=y.to_kind(Kind::Float).contiguous();a.apply(0,&f);f.to_kind(y.kind())}
+        _=>y,
+    }
 }
 /// SPARK_ABLATE (crate::ablate): a projection writing into the residual stream, orthogonalized for layer `layer`.
 fn ablate_out(layer:usize,w:Tensor)->Tensor {
@@ -332,8 +403,44 @@ fn ablit_wo_timed(layer:usize,stock:Tensor)->Tensor {
 }
 fn load_h(idx: &mut ShardIndex, name: &str, dev: Device) -> Tensor {
     let t = load(idx, name, dev);
-    if w_fp16() { t.to_kind(Kind::Half) } else { t }
+    let t = if w_fp16() { t.to_kind(Kind::Half) } else { t };
+    finite_check(name,"load",&t);t
 }
+/// GLM53_LOAD_FINITE=1 (diagnostic): report non-finite values of loaded / edited non-expert weights.
+fn finite_check(name:&str,stage:&str,t:&Tensor) {
+    static E:std::sync::OnceLock<bool>=std::sync::OnceLock::new();
+    if !*E.get_or_init(||std::env::var("GLM53_LOAD_FINITE").as_deref()==Ok("1")) || !t.device().is_cuda() {return;}
+    let bad=t.isfinite().logical_not().sum(Kind::Int64).int64_value(&[]);
+    if bad>0 {eprintln!("[load-finite] {stage} {name}: {bad} non-finite of {}",t.numel());}
+}
+
+/// A non-expert linear: its SPX copy when the checkpoint has one (crate::spx; the placeholder already holds this rank's
+/// TP part), else load_h unchanged.
+fn lin(idx:&mut ShardIndex,name:&str,split:crate::spx::Split,dev:Device)->Tensor {
+    if crate::spx::present(idx,name) {return crate::spx::load(idx,name,split,dev);}
+    load_h(idx,name,dev)
+}
+/// A projection writing into the residual stream (o_proj / down_proj): the ablation edits need the dense weight.
+fn lin_out(idx:&mut ShardIndex,name:&str,layer:usize,split:crate::spx::Split,dev:Device,ablit:bool)->Tensor {
+    if crate::spx::present(idx,name) {
+        assert!(!ablit || ablit_layers().map_or(true,|(_,r)|!r.contains(&layer)),"GLM53_ABLIT covers layer {layer} but {name} is an SPX tensor (GLM53_ABLIT=0 or GLM53_SPX=0)");
+        let w=crate::spx::load(idx,name,split,dev);
+        // SPARK_ABLATE on an SPX writer: its outputs are projected at run time (the codes stay as stored).
+        if crate::ablate::get().is_some_and(|a|a.covers(layer)) && (ablit || !crate::ablate::oproj_only()) {crate::spx::mark_residual_writer(&w,layer);}
+        // SPARK_ABLATE_OPROJ (`ablit` = this is an attention o_proj): the per-layer edit, also at run time.
+        if ablit && crate::ablate::oproj().is_some_and(|o|o.covers(layer)) {crate::spx::mark_oproj_writer(&w,layer);}
+        return w;
+    }
+    let w=load_h(idx,name,dev);
+    let w=if ablit {ablit_wo(layer,w)} else {w};
+    let w=match crate::ablate::oproj() {Some(o) if ablit=>o.ortho_out(layer,&w),_=>w};
+    let w=if ablit || !crate::ablate::oproj_only() {ablate_out(layer,w)} else {w};
+    finite_check(name,"ablated",&w);w
+}
+/// TP placement of SPX tensors, matching shard_dense_layer (only used when the checkpoint has SPX tensors).
+fn spx_rows(p:Option<crate::tp::Part>)->crate::spx::Split {p.map_or(crate::spx::Split::Full,crate::spx::Split::Rows)}
+fn spx_cols(p:Option<crate::tp::Part>)->crate::spx::Split {p.map_or(crate::spx::Split::Full,crate::spx::Split::Cols)}
+
 
 /// 权重自适应 GEMM:w fp16 → fp16 计算;w fp32 → fp32 直通。
 pub fn mm16(x: &Tensor, w: &Tensor) -> Tensor {
@@ -344,6 +451,7 @@ pub fn mm16(x: &Tensor, w: &Tensor) -> Tensor {
 /// forward's caller. Never substitute it for x before backend selection or
 /// diagnostics: FP8/GEMV and full-F32 modes consume the original FP32 tensor.
 pub(crate) fn mm16_with_half(x:&Tensor,w:&Tensor,half:Option<&Tensor>)->Tensor {
+    if let Some(y)=crate::spx::try_mm(x,w,1) {return y;}
     if let Some(h)=half {
         assert_eq!(h.kind(),Kind::Half);assert_eq!(h.size(),x.size());assert_eq!(h.device(),x.device());
         assert!(h.is_contiguous(),"shared Half input must preserve the native matrix layout");
@@ -359,6 +467,7 @@ pub(crate) fn mm16_with_half(x:&Tensor,w:&Tensor,half:Option<&Tensor>)->Tensor {
 /// diagnostics; preserve the original native matmul, retaining its Half result.
 pub(crate) fn shared_native_half(x:&Tensor,w:&Tensor,half:Option<&Tensor>)->Tensor {
     assert!(!crate::root_probe::retain_f32() && !crate::root_probe::full_f32() && !crate::root_probe::recording());
+    if let Some(y)=crate::spx::try_mm(x,w,2) {return y;}
     assert_eq!(w.kind(),Kind::Half);
     if let Some(h)=half {assert_eq!(h.kind(),Kind::Half);assert_eq!(h.size(),x.size());assert_eq!(h.device(),x.device());assert!(h.is_contiguous());}
     if let Some(y)=crate::c12::try_run(x,w,2){return y;}
@@ -443,12 +552,12 @@ impl ModelWeights {
             let rows=self.embed.size()[0];
             let local=(&real-start).clamp(0,rows-1);
             let invalid=real.lt(start).logical_or(&real.ge(start+rows));
-            let mut y=self.embed.index_select(0,&local).masked_fill(&invalid.unsqueeze(1),0.);
+            let mut y=ablate_embed(self.embed.index_select(0,&local).masked_fill(&invalid.unsqueeze(1),0.));
             let _=Tensor::zeros([total],(Kind::Int64,real.device())).index_select(0,&real);
             fill(&mut y);
             crate::tp::allreduce(&y);y
         } else {
-            let mut y=self.embed.index_select(0,&real);
+            let mut y=ablate_embed(self.embed.index_select(0,&real));
             if crate::tp::world().world>1 {
                 // Replicated table: only the vision rows need the other rank's contribution.
                 let k=inj.rows.size()[0];
@@ -458,7 +567,11 @@ impl ModelWeights {
             y
         }
     }
-    pub fn embed_tokens(&self,ids:&Tensor)->Tensor {
+    /// Target-model embedding rows: the lookup with SPARK_ABLATE applied (the rows lose the ablated directions, as the
+    /// former load-time orthogonalized table gave them).
+    pub fn embed_tokens(&self,ids:&Tensor)->Tensor {ablate_embed(self.embed_raw(ids))}
+    /// The stored table's rows (the drafter's input embedding: it was trained on the unablated table).
+    pub fn embed_raw(&self,ids:&Tensor)->Tensor {
         if let Some((start,total))=self.vocab_shard {
             let rows=self.embed.size()[0];
             let local=(ids-start).clamp(0,rows-1);
@@ -502,11 +615,15 @@ impl ModelWeights {
     }
     /// Drafter uses a replicated BF16 vocabulary head. Gather only at load time.
     pub fn drafter_head(&self)->Tensor {
+        let head=self.head_dense();
         if let Some((start,total))=self.vocab_shard {
-            let full=Tensor::zeros([total,self.lm_head.size()[1]],(self.lm_head.kind(),self.device));
-            full.narrow(0,start,self.lm_head.size()[0]).copy_(&self.lm_head);crate::tp::allreduce(&full);full
-        }else{self.lm_head.shallow_clone()}
+            let full=Tensor::zeros([total,head.size()[1]],(head.kind(),self.device));
+            full.narrow(0,start,head.size()[0]).copy_(&head);crate::tp::allreduce(&full);full
+        }else{head}
     }
+    /// This rank's LM head as a dense tensor for load-time consumers (the drafter): the resident Half head, or for an
+    /// SPX head its reconstruction BF16(W_rot R^T) (transient).
+    pub fn head_dense(&self)->Tensor {crate::spx::reconstruct(&self.lm_head).unwrap_or_else(||self.lm_head.shallow_clone())}
     pub fn load(dir: &Path, cfg: &Config, n_layers: usize, dev: Device) -> Self {
         let disk0=crate::host_memory::thread_read_bytes();
         let t_scan=std::time::Instant::now();
@@ -518,9 +635,14 @@ impl ModelWeights {
         });
         let p = "model.language_model";
         let embed = load(&mut idx, &format!("{p}.embed_tokens.weight"), dev);
-        let embed = match crate::ablate::get() { Some(a) => a.ortho_rows(0, &embed), None => embed };
+        // SPARK_ABLATE: the table stays as stored (the drafter embeds through it, see `embed_raw`); the target's rows are
+        // projected at lookup (`embed_tokens`).
         let final_norm = load(&mut idx, &format!("{p}.norm.weight"), dev);
-        let lm_head = load_h(&mut idx, "lm_head.weight", dev);
+        // SPX LM head: loaded as this rank's vocabulary rows directly when the vocabulary is TP-split (below).
+        let vocab_tp=crate::tp::world().world>1&&std::env::var("GLM53_VOCAB_TP").as_deref()==Ok("1");
+        let head_rows=idx.entries.get("lm_head.weight.spx_q").filter(|_|crate::spx::present(&idx,"lm_head.weight")).map(|e|e.shape[0] as i64);
+        let lm_head = if let Some(v)=head_rows {let t=crate::tp::world();crate::spx::load(&idx,"lm_head.weight",if vocab_tp {crate::spx::Split::Rows(vocab_part(v,t.rank,t.world))} else {crate::spx::Split::Full},dev)}
+            else {load_h(&mut idx, "lm_head.weight", dev)};
         let mut layers = Vec::with_capacity(n_layers);
         for plan in cfg.plans.iter().take(n_layers) {
             let i = plan.idx;
@@ -535,15 +657,18 @@ impl ModelWeights {
                 in_ln: load(&mut idx, &format!("{l}.input_layernorm.weight"), dev),
                 post_ln: load(&mut idx, &format!("{l}.post_attention_layernorm.weight"), dev),
             };
+            if let Some(c)=crate::ablate::clamp() {c.register(&hc.in_ln,i,0);c.register(&hc.post_ln,i,1);}
             let sa = format!("{l}.self_attn");
+            let ltp=crate::tp::dense_enabled().then(||{let t=crate::tp::world();layer_tp(Some(&idx),&l,i,plan.attn,plan.mlp,t.rank,t.world)});
+            let (pa,pm)=(ltp.map(|t|t.attn),ltp.map(|t|t.mlp));
             let (kda, mla) = if plan.attn == "kda" {
                 (
                     Some(KdaWeights {
                         constants:None,
-                        wq: load_h(&mut idx, &format!("{sa}.q_proj.weight"), dev),
-                        wk: load_h(&mut idx, &format!("{sa}.k_proj.weight"), dev),
-                        wv: load_h(&mut idx, &format!("{sa}.v_proj.weight"), dev),
-                        wo: ablate_out(i, ablit_wo(i, load_h(&mut idx, &format!("{sa}.o_proj.weight"), dev))),
+                        wq: lin(&mut idx, &format!("{sa}.q_proj.weight"), spx_rows(pa), dev),
+                        wk: lin(&mut idx, &format!("{sa}.k_proj.weight"), spx_rows(pa), dev),
+                        wv: lin(&mut idx, &format!("{sa}.v_proj.weight"), spx_rows(pa), dev),
+                        wo: lin_out(&mut idx, &format!("{sa}.o_proj.weight"), i, spx_cols(pa), dev, true),
                         wb: load(&mut idx, &format!("{sa}.b_proj.weight"), dev),
                         fa: load_h(&mut idx, &format!("{sa}.f_a_proj.weight"), dev),
                         fb: load_h(&mut idx, &format!("{sa}.f_b_proj.weight"), dev),
@@ -577,10 +702,11 @@ impl ModelWeights {
                             })
                         } else {None},
                         q_a: load_h(&mut idx, &format!("{qp}.q_a_proj.weight"), dev),
-                        q_b: load_h(&mut idx, &format!("{qp}.q_b_proj.weight"), dev),
+                        q_b: lin(&mut idx, &format!("{qp}.q_b_proj.weight"), spx_rows(pa), dev),
                         kv_a: load_h(&mut idx, &format!("{qp}.kv_a_proj_with_mqa.weight"), dev),
-                        kv_b: load_h(&mut idx, &format!("{qp}.kv_b_proj.weight"), dev),
-                        wo: ablate_out(i, ablit_wo(i, load_h(&mut idx, &format!("{qp}.o_proj.weight"), dev))),
+                        // Absorbed form only: an SPX kv_b is reconstructed (BF16 of W_rot R^T, as Half, full rows; sharded below).
+                        kv_b: {let n=format!("{qp}.kv_b_proj.weight");if crate::spx::present(&idx,&n) {crate::spx::load_reconstructed(&idx,&n,crate::spx::Split::Full,dev)} else {load_h(&mut idx,&n,dev)}},
+                        wo: lin_out(&mut idx, &format!("{qp}.o_proj.weight"), i, spx_cols(pa), dev, true),
                         q_a_ln: load(&mut idx, &format!("{qp}.q_a_layernorm.weight"), dev),
                         kv_a_ln: load(&mut idx, &format!("{qp}.kv_a_layernorm.weight"), dev),
                     }),
@@ -590,9 +716,9 @@ impl ModelWeights {
                 let m = format!("{l}.mlp");
                 (
                     Some(DenseMlp {
-                        wg: load_h(&mut idx, &format!("{m}.gate_proj.weight"), dev),
-                        wu: load_h(&mut idx, &format!("{m}.up_proj.weight"), dev),
-                        wd: ablate_out(i, load_h(&mut idx, &format!("{m}.down_proj.weight"), dev)),
+                        wg: lin(&mut idx, &format!("{m}.gate_proj.weight"), spx_rows(pm), dev),
+                        wu: lin(&mut idx, &format!("{m}.up_proj.weight"), spx_rows(pm), dev),
+                        wd: lin_out(&mut idx, &format!("{m}.down_proj.weight"), i, spx_cols(pm), dev, false),
                     }),
                     None,
                 )
@@ -603,9 +729,9 @@ impl ModelWeights {
                     Some(MoeMeta {
                         w_gate: load_bf16_resident(&mut idx, &format!("{m}.gate.weight"), dev),
                         bias: load(&mut idx, &format!("{m}.gate.e_score_correction_bias"), dev),
-                        sh_wg: load_h(&mut idx, &format!("{m}.shared_experts.gate_proj.weight"), dev),
-                        sh_wu: load_h(&mut idx, &format!("{m}.shared_experts.up_proj.weight"), dev),
-                        sh_wd: ablate_out(i, load_h(&mut idx, &format!("{m}.shared_experts.down_proj.weight"), dev)),
+                        sh_wg: lin(&mut idx, &format!("{m}.shared_experts.gate_proj.weight"), spx_rows(pm), dev),
+                        sh_wu: lin(&mut idx, &format!("{m}.shared_experts.up_proj.weight"), spx_rows(pm), dev),
+                        sh_wd: lin_out(&mut idx, &format!("{m}.shared_experts.down_proj.weight"), i, spx_cols(pm), dev, false),
                     }),
                 )
             };
@@ -613,6 +739,7 @@ impl ModelWeights {
                 plan: LayerPlanOwned {
                     attn: plan.attn.to_string(),
                     mlp: plan.mlp.to_string(),
+                    tp: ltp,
                 },
                 hc,
                 kda,
@@ -637,14 +764,25 @@ impl ModelWeights {
             ns(3),ns(0),ns(4),ns(5),LOAD_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64*1e-9,(crate::host_memory::thread_read_bytes()-disk0) as f64*1e-9,ns(1),ns(2));
         if let Some(p)=prefetch {eprintln!("[load] model weights: prefetched {:.1} GB",p.bytes as f64*1e-9);}
         *ABLIT_READS.lock().unwrap()=None;
+        if crate::spx::enabled() {
+            let supported=|n:&str|n=="lm_head.weight" || [".self_attn.q_proj.weight",".self_attn.k_proj.weight",".self_attn.v_proj.weight",".self_attn.o_proj.weight",
+                ".self_attn.q_b_proj.weight",".self_attn.kv_b_proj.weight",".mlp.gate_proj.weight",".mlp.up_proj.weight",".mlp.down_proj.weight",
+                ".mlp.shared_experts.gate_proj.weight",".mlp.shared_experts.up_proj.weight",".mlp.shared_experts.down_proj.weight"].iter().any(|s|n.ends_with(s));
+            crate::spx::warn_unused(&idx,n_layers,&supported);
+            crate::spx::register_groups(&layers);
+        }
         release_load_buffer();
         crate::host_memory::stage("model weights: tensors resident");
         let tp=crate::tp::world();
         let vocab_shard=if tp.world>1&&std::env::var("GLM53_VOCAB_TP").as_deref()==Ok("1") {
-            assert_eq!(embed.size()[0],lm_head.size()[0]);assert_eq!(embed.size()[0]%tp.world as i64,0);
-            Some((embed.size()[0]/tp.world as i64*tp.rank as i64,embed.size()[0]))
+            assert_eq!(embed.size()[0],head_rows.unwrap_or(lm_head.size()[0]));
+            Some((vocab_part(embed.size()[0],tp.rank,tp.world).range(embed.size()[0]).0,embed.size()[0]))
         }else{None};
-        let (embed,lm_head)=if vocab_shard.is_some(){(shard(&embed,0,tp.rank,tp.world),shard(&lm_head,0,tp.rank,tp.world))}else{(embed,lm_head)};
+        assert!(vocab_shard.is_some()==vocab_tp || head_rows.is_none());
+        // An SPX head was loaded as this rank's rows already.
+        let vp=vocab_part(embed.size()[0],tp.rank,tp.world);
+        let (embed,lm_head)=if vocab_shard.is_some(){(shard_part(&embed,0,vp),if head_rows.is_some() {lm_head} else {shard_part(&lm_head,0,vp)})}else{(embed,lm_head)};
+        crate::spx::report();
         crate::dense_fp8::register(&layers);
         if crate::dense_fp8::free_sources_enabled() {
             let mut freed=0i64;
@@ -673,46 +811,54 @@ impl ModelWeights {
             crate::c12::finish_compact();
             eprintln!("[c12-free-source] released {:.2} GiB of Half sources",freed as f64/(1u64<<30) as f64);
         }
+        mark_shadows(&layers);
         Self { embed, final_norm, lm_head, layers, device: dev, vocab_shard }
     }
 }
 
 /// Materialize the local shard; a narrow view alone would retain the full allocation.
-fn shard(t: &Tensor, dim: i64, rank: usize, world: usize) -> Tensor {
-    assert!(world > 0 && rank < world);
-    assert_eq!(t.size()[dim as usize] % world as i64, 0);
-    let width = t.size()[dim as usize] / world as i64;
-    t.narrow(dim, rank as i64 * width, width).copy()
+fn shard_part(t: &Tensor, dim: i64, p: crate::tp::Part) -> Tensor {
+    let (s, n) = p.range(t.size()[dim as usize]);
+    t.narrow(dim, s, n).copy()
+}
+
+/// shard_part, except SPX placeholders (crate::spx loads this rank's part directly).
+fn shard_w(t: &Tensor, dim: i64, p: crate::tp::Part) -> Tensor {
+    if crate::spx::is_spx(t) { return t.shallow_clone(); }
+    shard_part(t, dim, p)
 }
 
 /// Head-parallel attention and intermediate-parallel MLP; residual stays replicated.
-/// q_a/kv_a, low-rank f_a/g_a, norms, router, embed and lm_head stay replicated.
+/// q_a/kv_a, low-rank f_a/g_a, norms, router, embed and lm_head stay replicated. The placement is the layer's LayerTp
+/// (chosen at load), else the default units (TP2: the halves).
 pub fn shard_dense_layer(layer: &mut LayerWeights, rank: usize, world: usize) {
+    let t = layer.plan.tp.unwrap_or_else(|| layer_tp(None, "", 0, &layer.plan.attn, &layer.plan.mlp, rank, world));
+    let (pa, pm) = (t.attn, t.mlp);
     if let Some(w) = layer.kda.as_mut() {
         w.constants=None;
         for t in [&mut w.wq, &mut w.wk, &mut w.wv, &mut w.wb,
                   &mut w.fb, &mut w.gb, &mut w.conv_q, &mut w.conv_k,
                   &mut w.conv_v, &mut w.dt_bias, &mut w.a_log] {
-            *t = shard(t, 0, rank, world);
+            *t = shard_w(t, 0, pa);
         }
-        w.wo = shard(&w.wo, 1, rank, world);
+        w.wo = shard_w(&w.wo, 1, pa);
     }
     if let Some(w) = layer.mla.as_mut() {
         w.invalidate_latent_cache();
-        w.q_b = shard(&w.q_b, 0, rank, world);
+        w.q_b = shard_w(&w.q_b, 0, pa);
         // kv_b rows are interleaved [head, k|v], so contiguous head shards preserve layout.
-        w.kv_b = shard(&w.kv_b, 0, rank, world);
-        w.wo = shard(&w.wo, 1, rank, world);
+        w.kv_b = shard_part(&w.kv_b, 0, pa);
+        w.wo = shard_w(&w.wo, 1, pa);
     }
     if let Some(w) = layer.dense.as_mut() {
-        w.wg = shard(&w.wg, 0, rank, world);
-        w.wu = shard(&w.wu, 0, rank, world);
-        w.wd = shard(&w.wd, 1, rank, world);
+        w.wg = shard_w(&w.wg, 0, pm);
+        w.wu = shard_w(&w.wu, 0, pm);
+        w.wd = shard_w(&w.wd, 1, pm);
     }
     if let Some(w) = layer.moe.as_mut() {
-        w.sh_wg = shard(&w.sh_wg, 0, rank, world);
-        w.sh_wu = shard(&w.sh_wu, 0, rank, world);
-        w.sh_wd = shard(&w.sh_wd, 1, rank, world);
+        w.sh_wg = shard_w(&w.sh_wg, 0, pm);
+        w.sh_wu = shard_w(&w.sh_wu, 0, pm);
+        w.sh_wd = shard_w(&w.sh_wd, 1, pm);
     }
 }
 
@@ -725,10 +871,34 @@ extern "C" {
 /// computes mm16_partial and copies (same values).
 pub fn mm16_partial_into(x:&Tensor,w:&Tensor,out:&Tensor) {
     assert!(out.is_contiguous() && out.kind()==Kind::Float && out.size()==[x.size()[0],w.size()[0]]);
-    if !crate::root_probe::full_f32() && w.kind()==Kind::Half && !crate::dense_fp8::registered_enabled(w) && crate::c12::try_run_into(x,w,0,out) {return;}
+    if crate::spx::try_mm_into(x,w,0,out) || (!crate::root_probe::full_f32() && w.kind()==Kind::Half && !crate::dense_fp8::registered_enabled(w) && crate::c12::try_run_into(x,w,0,out)) {
+        if is_shadow(w) {let _=out.shallow_clone().zero_();}
+        return;
+    }
     let _=out.shallow_clone().copy_(&mm16_partial(x,w));
 }
 pub fn mm16_partial(x: &Tensor, w: &Tensor) -> Tensor {
+    let y=mm16_partial_raw(x,w);
+    if is_shadow(w) {let _=y.shallow_clone().zero_();}
+    y
+}
+/// Shadow writers (LayerTp): row-parallel weights whose partial output is zeroed before the TP sum. Keyed by the weight's
+/// data pointer, registered after every load-time compaction; empty (and never consulted) outside TP3 shadows.
+static SHADOWS: std::sync::OnceLock<std::collections::HashSet<usize>> = std::sync::OnceLock::new();
+fn is_shadow(w:&Tensor)->bool {SHADOWS.get().is_some_and(|s|!s.is_empty() && s.contains(&(w.data_ptr() as usize)))}
+/// Registers the shadow writers of `layers` (once, after the weights are final).
+pub fn mark_shadows(layers:&[LayerWeights]) {
+    let mut s=std::collections::HashSet::new();
+    for l in layers {
+        let Some(t)=l.plan.tp else {continue};
+        if t.shadow_attn {if let Some(k)=&l.kda {s.insert(k.wo.data_ptr() as usize);} if let Some(m)=&l.mla {s.insert(m.wo.data_ptr() as usize);}}
+        if t.shadow_mlp {if let Some(m)=&l.moe {s.insert(m.sh_wd.data_ptr() as usize);} if let Some(d)=&l.dense {s.insert(d.wd.data_ptr() as usize);}}
+    }
+    if !s.is_empty() {eprintln!("[tp] {} shadow writers (TP3 zero shares: computed, output zeroed before the sum)",s.len());}
+    assert!(SHADOWS.set(s).is_ok() || SHADOWS.get().is_some_and(|x|x.is_empty()),"shadow writers registered twice");
+}
+fn mm16_partial_raw(x: &Tensor, w: &Tensor) -> Tensor {
+    if let Some(y)=crate::spx::try_mm(x,w,0) {return y;}
     if crate::root_probe::full_f32() {
         let x = if crate::root_probe::round_f32_input() { x.to_kind(Kind::Half).to_kind(Kind::Float) } else { x.to_kind(Kind::Float) };
         return x.matmul(&crate::deep_probe::float_weight(w).transpose(0,1));
@@ -839,7 +1009,7 @@ pub fn row_mm16(x: &Tensor, w: &Tensor) -> Tensor {
 fn row_mm16_rs_split(x:&Tensor,w:&Tensor)->Option<Tensor> {
     static N:std::sync::OnceLock<i64>=std::sync::OnceLock::new();
     let parts=*N.get_or_init(||std::env::var("GLM53_PREFILL_SP_RS_SPLIT").ok().and_then(|v|v.parse().ok()).filter(|&n:&i64|n==2||n==4).unwrap_or(0));
-    if parts==0 || w.kind()!=Kind::Half || w.dim()!=2 || !w.is_contiguous() || w.stride().iter().all(|&s|s==0) || x.size()[0]<256 || x.size()[0]%2!=0 {return None;}
+    if parts==0 || is_shadow(w) || crate::tp::world().world!=2 || w.kind()!=Kind::Half || w.dim()!=2 || !w.is_contiguous() || w.stride().iter().all(|&s|s==0) || x.size()[0]<256 || x.size()[0]%2!=0 {return None;}
     let n=w.size()[0];if n%(parts*64)!=0 {return None;}
     let step=n/parts;let rows=x.size()[0];
     extern "C"{fn rs_reduce_scatter_async(i:*mut u8,o:*mut u8,n:i64,dtype:i32)->i32;fn rs_work_wait(h:i32)->i32;}

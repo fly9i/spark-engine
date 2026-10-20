@@ -207,11 +207,12 @@ pub fn kda_forward_state(w: &KdaWeights, x: &Tensor, mut st: KdaState) -> (Tenso
 
 /// Batch projections and final row reduction; recurrence remains strictly causal.
 fn kda_chunk(w:&KdaWeights,x:&Tensor,mut st:KdaState)->(Tensor,KdaState) {
+    crate::spx_hess::add(crate::spx_hess::KDA_IN,x);
     let t=x.size()[0];let heads=w.wq.size()[0]/128;assert!(t>0);
     // GLM53_PREFILL_HALF_GLUE: the plain-Half q/k/v results stay three Half tensors (no FP32 cat); see kda_chunk_fused.
     let half_glue=crate::weights::half_glue_enabled() && prefill_fused_enabled() && t>8;
     let mut hparts:Option<Vec<Tensor>>=None;
-    let projected=crate::dense_fp8::try_run_rows(x,&[&w.wq,&w.wk,&w.wv]).or_else(||crate::c12::try_run_rows(x,&[&w.wq,&w.wk,&w.wv]))
+    let projected=crate::spx::try_rows(x,&[&w.wq,&w.wk,&w.wv],1).or_else(||crate::dense_fp8::try_run_rows(x,&[&w.wq,&w.wk,&w.wv])).or_else(||crate::c12::try_run_rows(x,&[&w.wq,&w.wk,&w.wv]))
         .or_else(||{if half_glue {if let Some(p)=crate::weights::mm16_half_parts(x,&[&w.wq,&w.wk,&w.wv]) {hparts=Some(p);return Some(Tensor::empty([0],(Kind::Float,x.device())));}} None})
         .or_else(||crate::weights::mm16_cat_into(x,&[&w.wq,&w.wk,&w.wv]))
         .unwrap_or_else(||Tensor::cat(&[mm16(x,&w.wq),mm16(x,&w.wk),mm16(x,&w.wv)],1));
@@ -238,7 +239,7 @@ fn kda_chunk(w:&KdaWeights,x:&Tensor,mut st:KdaState)->(Tensor,KdaState) {
     };let ms=(&o*&o).mean_dim(&[-1i64][..],true,Kind::Float);
     let hidden=&w.o_norm*(o*(ms+1e-5).rsqrt())*g2.sigmoid();
 
-    ({let h2=hidden.reshape([t,heads*128]);crate::weights::row_mm16(&h2,&w.wo)},st)
+    ({let h2=hidden.reshape([t,heads*128]);crate::weights::row_mm16(crate::spx_hess::tap(crate::spx_hess::KDA_O,&h2),&w.wo)},st)
 }
 
 fn onorm_sig_fused(w:&KdaWeights,heads:i64)->bool {
@@ -326,13 +327,13 @@ fn kda_chunk_fused(w:&KdaWeights,x:&Tensor,mut st:KdaState,projected:Tensor,hpar
             let out=Tensor::empty([t,heads*128],(Kind::Half,o.device()));
             extern "C"{fn rs_kda_onorm_gate_sig_hh(o:*const f32,onorm:*const f32,len:i32,g2:*const std::ffi::c_void,out:*mut std::ffi::c_void,groups:i32)->i32;}
             assert_eq!(unsafe{rs_kda_onorm_gate_sig_hh(o.data_ptr().cast(),w.o_norm.data_ptr().cast(),w.o_norm.numel() as i32,g2h.data_ptr(),out.data_ptr(),(t*heads) as i32)},0);
-            return (crate::weights::row_mm16(&out,&w.wo),st);
+            return (crate::weights::row_mm16(crate::spx_hess::tap(crate::spx_hess::KDA_O,&out),&w.wo),st);
         }
         let g2f=g2h.to_kind(Kind::Float);let out=Tensor::empty([t,heads,128],(Kind::Float,o.device()));
         extern "C"{fn rs_kda_onorm_gate_sig(o:*const f32,onorm:*const f32,len:i32,g2:*const f32,out:*mut f32,groups:i32)->i32;}
         assert_eq!(unsafe{rs_kda_onorm_gate_sig(o.data_ptr().cast(),w.o_norm.data_ptr().cast(),w.o_norm.numel() as i32,g2f.data_ptr().cast(),out.data_ptr().cast(),(t*heads) as i32)},0);
 
-        return ({let h2=out.reshape([t,heads*128]);crate::weights::row_mm16(&h2,&w.wo)},st);
+        return ({let h2=out.reshape([t,heads*128]);crate::weights::row_mm16(crate::spx_hess::tap(crate::spx_hess::KDA_O,&h2),&w.wo)},st);
     }
     let hidden=if sig_fused && o.kind()==Kind::Float && o.size()==[t,heads,128] {
         let o=o.contiguous();let g2=sg2.contiguous();let out=Tensor::empty([t,heads,128],(Kind::Float,o.device()));
@@ -341,13 +342,15 @@ fn kda_chunk_fused(w:&KdaWeights,x:&Tensor,mut st:KdaState,projected:Tensor,hpar
         out
     } else {onorm_gate_any(w,&o,&if sig_fused {sg2.sigmoid()} else {sg2},heads)};
 
-    ({let h2=hidden.reshape([t,heads*128]);crate::weights::row_mm16(&h2,&w.wo)},st)
+    ({let h2=hidden.reshape([t,heads*128]);crate::weights::row_mm16(crate::spx_hess::tap(crate::spx_hess::KDA_O,&h2),&w.wo)},st)
 }
 fn onorm_gate_any(w:&KdaWeights,o:&Tensor,sg2:&Tensor,heads:i64)->Tensor {
     let t=o.size()[0];
     if o.kind()==Kind::Float && o.size()==[t,heads,128] && sg2.size()==[t,heads,128] && w.o_norm.is_contiguous() && w.o_norm.kind()==Kind::Float
         && (w.o_norm.numel() as i64==128 || w.o_norm.numel() as i64==heads*128) {
-        let o=o.contiguous();let sg2=sg2.contiguous();let out=Tensor::empty([t,heads,128],(Kind::Float,o.device()));
+        let o=o.contiguous();let sg2=sg2.contiguous();
+        if let Some(out)=crate::spx::kda_onorm_rot(&o,&w.o_norm,&sg2,heads,&w.wo) {return out;}   // SPX o_proj: + its rotated input
+        let out=Tensor::empty([t,heads,128],(Kind::Float,o.device()));
         extern "C"{fn rs_kda_onorm_gate(o:*const f32,onorm:*const f32,len:i32,sg2:*const f32,out:*mut f32,groups:i32)->i32;}
         assert_eq!(unsafe{rs_kda_onorm_gate(o.data_ptr().cast(),w.o_norm.data_ptr().cast(),w.o_norm.numel() as i32,sg2.data_ptr().cast(),out.data_ptr().cast(),(t*heads) as i32)},0);
         return out;
@@ -509,6 +512,7 @@ fn onorm_gate(w:&KdaWeights,o:&Tensor,sg2:&Tensor,heads:i64)->Tensor {
     if gate_fused_enabled() && o.kind()==Kind::Float && o.size()==[t,heads,128] && sg2.size()==[t,heads,128]
         && w.o_norm.is_contiguous() && w.o_norm.kind()==Kind::Float && (w.o_norm.numel() as i64==128 || w.o_norm.numel() as i64==heads*128) {
         let o=o.contiguous();let sg2=sg2.contiguous();
+        if let Some(out)=crate::spx::kda_onorm_rot(&o,&w.o_norm,&sg2,heads,&w.wo) {return out;}   // SPX o_proj: + its rotated input
         let out=Tensor::empty([t,heads,128],(Kind::Float,o.device()));
         extern "C"{fn rs_kda_onorm_gate(o:*const f32,onorm:*const f32,len:i32,sg2:*const f32,out:*mut f32,groups:i32)->i32;}
         assert_eq!(unsafe{rs_kda_onorm_gate(o.data_ptr().cast(),w.o_norm.data_ptr().cast(),w.o_norm.numel() as i32,sg2.data_ptr().cast(),out.data_ptr().cast(),(t*heads) as i32)},0);
@@ -585,7 +589,7 @@ pub(crate) fn tree_deferred(w:&KdaWeights,x:&Tensor,base:&KdaState,parents:&[Opt
     // GLM53_KDA_GATE_SIDE=1 (L0, schedule only): the gate chain (x only) runs on a forked side stream while the
     // bandwidth-bound q/k/v projection runs on the main stream; joined before the convolution consumes both.
     let gates=side_gates_start(w,x,heads);
-    let projected=crate::dense_fp8::try_run_rows(x,&[&w.wq,&w.wk,&w.wv]).or_else(||crate::c12::try_run_rows(x,&[&w.wq,&w.wk,&w.wv])).unwrap_or_else(||Tensor::cat(&[mm16(x,&w.wq),mm16(x,&w.wk),mm16(x,&w.wv)],1));
+    let projected=crate::spx::try_rows(x,&[&w.wq,&w.wk,&w.wv],1).or_else(||crate::dense_fp8::try_run_rows(x,&[&w.wq,&w.wk,&w.wv])).or_else(||crate::c12::try_run_rows(x,&[&w.wq,&w.wk,&w.wv])).unwrap_or_else(||Tensor::cat(&[mm16(x,&w.wq),mm16(x,&w.wk),mm16(x,&w.wv)],1));
     crate::forward::probe_point(0,"kda_proj",&projected);
     let wall=w.convolution_weights();
     let (beta,decay,g2s)=side_gates_finish(gates,w,x,heads);
@@ -637,7 +641,7 @@ pub(crate) fn tree_deferred_multi(w:&KdaWeights,x:&Tensor,bases:&[&KdaState],seg
     }
     let t=x.size()[0];
     let gates=side_gates_start(w,x,heads);
-    let projected=crate::dense_fp8::try_run_rows(x,&[&w.wq,&w.wk,&w.wv]).or_else(||crate::c12::try_run_rows(x,&[&w.wq,&w.wk,&w.wv])).unwrap_or_else(||Tensor::cat(&[mm16(x,&w.wq),mm16(x,&w.wk),mm16(x,&w.wv)],1));
+    let projected=crate::spx::try_rows(x,&[&w.wq,&w.wk,&w.wv],1).or_else(||crate::dense_fp8::try_run_rows(x,&[&w.wq,&w.wk,&w.wv])).or_else(||crate::c12::try_run_rows(x,&[&w.wq,&w.wk,&w.wv])).unwrap_or_else(||Tensor::cat(&[mm16(x,&w.wq),mm16(x,&w.wk),mm16(x,&w.wv)],1));
     let (beta,decay,g2s)=side_gates_finish(gates,w,x,heads);
     let beta=beta.contiguous();let decay=decay.contiguous();
     let wall=w.convolution_weights();
@@ -709,7 +713,7 @@ pub(crate) fn tree_deferred_multi(w:&KdaWeights,x:&Tensor,bases:&[&KdaState],seg
 /// Batched projections with an independent recurrent/conv state for every tree node.
 pub fn tree(w:&KdaWeights,x:&Tensor,base:&KdaState,parents:&[Option<usize>])->(Tensor,Vec<KdaState>) {
     let t=x.size()[0];let heads=w.wq.size()[0]/128;assert_eq!(t as usize,parents.len());
-    let projected=crate::dense_fp8::try_run_rows(x,&[&w.wq,&w.wk,&w.wv]).or_else(||crate::c12::try_run_rows(x,&[&w.wq,&w.wk,&w.wv])).unwrap_or_else(||Tensor::cat(&[mm16(x,&w.wq),mm16(x,&w.wk),mm16(x,&w.wv)],1));
+    let projected=crate::spx::try_rows(x,&[&w.wq,&w.wk,&w.wv],1).or_else(||crate::dense_fp8::try_run_rows(x,&[&w.wq,&w.wk,&w.wv])).or_else(||crate::c12::try_run_rows(x,&[&w.wq,&w.wk,&w.wv])).unwrap_or_else(||Tensor::cat(&[mm16(x,&w.wq),mm16(x,&w.wk),mm16(x,&w.wv)],1));
     let wall=w.convolution_weights();
     let (beta,decay,g2s)=gate_values(w,x,heads);
     let conv_chain=(x.device().is_cuda() && bounded_chain(parents) &&

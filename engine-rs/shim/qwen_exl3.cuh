@@ -70,7 +70,9 @@ __device__ __forceinline__ uint32_t decode_pair(uint32_t a, uint32_t b)
 }
 
 // CBK: codebook, 2 = mul1 (Qwen), 1 = mcg (GLM experts).
-template <int BITS, int CBK = 2>
+// OFF: word q of the tile is word q + OFF of the (r0, r1) pair (lane (q + OFF) & 31; r1 from q + OFF >= 32), for the
+// paired 64-byte-aligned loads of b = 3 / 5 (gemv_block); OFF = 0 is the plain layout.
+template <int BITS, int CBK = 2, int OFF = 0>
 __device__ __forceinline__ void decode_tile(uint32_t r0, uint32_t r1, int lane, uint32_t* b)
 {
     if constexpr (BITS == 4)
@@ -92,7 +94,7 @@ __device__ __forceinline__ void decode_tile(uint32_t r0, uint32_t r1, int lane, 
     #pragma unroll
     for (int j = 0; j < 3; ++j)
     {
-        int q = (i0 + j) % NW;
+        int q = (i0 + j) % NW + OFF;
         uint32_t v0 = __shfl_sync(0xffffffffu, r0, q & 31);
         uint32_t v1 = __shfl_sync(0xffffffffu, r1, q & 31);
         w[j] = q < 32 ? v0 : v1;
@@ -281,17 +283,22 @@ static __global__ void finish_silu_kernel(int M, const Multi ml, float* __restri
     }
 }
 
-// Block: WARPS warps x TPW n-tiles (16 cols each) over k-tiles [kt0, kt0 + kts); xh rows [M <= 16 MT, K] fp16.
+// Block: WARPS warps x TPW n-tiles (16 cols each) over k-tiles [kt0, kt0 + kts); xh rows [M <= 16 MT, K] fp16 (lda apart),
+// out rows ldo apart.
 // MT row tiles of 16 share each decoded B fragment (prefill: one weight decode per 16 MT rows).
 // APF: the A fragments are loaded PF k-tiles ahead together with the weights (same values; latency off the MMA chain).
-template <int BITS, int TPW = 2, int PF = 4, int WARPS = 4, int MT = 1, int CBK = 2, bool APF = false>
-__device__ __forceinline__ void gemv_block(const half* __restrict__ xh, const uint32_t* __restrict__ tr,
-                                           float* __restrict__ out, int M, int K, int N, int nblk, int kt0, int kts)
+// VAR (variable-width experts only): xh rows lda apart, out rows ldo apart, warps past N return. Without VAR the strides are
+// K and N and nothing else changes (the instructions of the original block).
+template <int BITS, int TPW = 2, int PF = 4, int WARPS = 4, int MT = 1, int CBK = 2, bool APF = false, bool VAR = false>
+__device__ __forceinline__ void gemv_block_ld(const half* __restrict__ xh, int64_t lda_, const uint32_t* __restrict__ tr,
+                                              float* __restrict__ out, int64_t ldo_, int M, int K, int N, int nblk, int kt0, int kts)
 {
+    const int64_t lda = VAR ? lda_ : (int64_t) K, ldo = VAR ? ldo_ : (int64_t) N;
     constexpr int NW = 8 * BITS;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int Nt = N / 16, Kt = K / 16;
     const int nt0 = nblk * (WARPS * TPW) + warp * TPW;
+    if constexpr (VAR) { if (nt0 >= Nt) return; }   // a warp past the N columns (variable-width experts; no block sync)
     const int kt1 = min(Kt, kt0 + kts);
     const int ar = lane >> 2, ak = (lane & 3) * 2;
     float c[MT][TPW][2][4] = {};
@@ -303,22 +310,37 @@ __device__ __forceinline__ void gemv_block(const half* __restrict__ xh, const ui
         for (int mt = 0; mt < MT; ++mt)
         {
             const int r0 = mt * 16 + ar;
-            const half* x0 = xh + (int64_t) r0 * K + kt * 16 + ak;
-            const half* x1 = x0 + (int64_t) 8 * K;
+            const half* x0 = xh + r0 * lda + kt * 16 + ak;
+            const half* x1 = x0 + 8 * lda;
             a[mt][0] = r0 < M ? *(const uint32_t*) x0 : 0u;
             a[mt][1] = r0 + 8 < M ? *(const uint32_t*) x1 : 0u;
             a[mt][2] = r0 < M ? *(const uint32_t*) (x0 + 8) : 0u;
             a[mt][3] = r0 + 8 < M ? *(const uint32_t*) (x1 + 8) : 0u;
         }
     };
+    // b = 3 / 5: tiles of 96 / 160 bytes straddle the 64-byte DRAM access granule, so per-tile loads move 128 / 192
+    // bytes per tile. Neighbouring tiles (t, t + 1) are loaded as one 192 / 320-byte run in 128-byte (+ 64-byte) pieces
+    // (tile index even: the run starts 64-byte aligned) and decoded from it with a word offset (decode_tile OFF).
+    constexpr bool PAIR = (BITS == 3 || BITS == 5) && TPW % 2 == 0;
     auto load = [&](int kt, uint32_t (&d)[TPW][2])
     {
         #pragma unroll
         for (int t = 0; t < TPW; ++t)
         {
             const uint32_t* p = tr + ((int64_t) kt * Nt + nt0 + t) * NW;
-            d[t][0] = __ldcs(p + lane);
-            d[t][1] = NW > 32 && lane + 32 < NW ? __ldcs(p + 32 + lane) : 0u;
+            if constexpr (PAIR)
+            {
+                if (t % 2) continue;
+                d[t][0] = __ldcs(p + lane);                                      // words 0..31 of the pair
+                d[t][1] = BITS == 5 || lane < 16 ? __ldcs(p + 32 + lane) : 0u;   // 32..63 (b = 3: 32..47)
+                d[t + 1][0] = BITS == 5 && lane < 16 ? __ldcs(p + 64 + lane) : 0u;   // b = 5: 64..79
+                d[t + 1][1] = 0u;
+            }
+            else
+            {
+                d[t][0] = NW >= 32 || lane < NW ? __ldcs(p + lane) : 0u;   // K = 3: 24 words per tile
+                d[t][1] = NW > 32 && lane + 32 < NW ? __ldcs(p + 32 + lane) : 0u;
+            }
         }
     };
     #pragma unroll
@@ -350,8 +372,8 @@ __device__ __forceinline__ void gemv_block(const half* __restrict__ xh, const ui
             for (int mt = 0; mt < MT; ++mt)
             {
                 const int r0 = mt * 16 + ar;
-                const half* x0 = xh + (int64_t) r0 * K + kt * 16 + ak;
-                const half* x1 = x0 + (int64_t) 8 * K;
+                const half* x0 = xh + r0 * lda + kt * 16 + ak;
+                const half* x1 = x0 + 8 * lda;
                 a[mt][0] = r0 < M ? *(const uint32_t*) x0 : 0u;
                 a[mt][1] = r0 + 8 < M ? *(const uint32_t*) x1 : 0u;
                 a[mt][2] = r0 < M ? *(const uint32_t*) (x0 + 8) : 0u;
@@ -362,7 +384,10 @@ __device__ __forceinline__ void gemv_block(const half* __restrict__ xh, const ui
             for (int t = 0; t < TPW; ++t)
             {
                 uint32_t b[4];
-                decode_tile<BITS, CBK>(cur[t][0], cur[t][1], lane, b);
+                if constexpr (!PAIR) decode_tile<BITS, CBK>(cur[t][0], cur[t][1], lane, b);
+                else if (t % 2 == 0) decode_tile<BITS, CBK>(cur[t][0], cur[t][1], lane, b);              // tile A: words 0..NW-1
+                else if constexpr (BITS == 5) decode_tile<BITS, CBK, 8>(cur[t - 1][1], cur[t][0], lane, b);   // B: 40..79
+                else decode_tile<BITS, CBK, 24>(cur[t - 1][0], cur[t - 1][1], lane, b);                 // B (b = 3): 24..47
                 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt)
                 {
@@ -382,9 +407,17 @@ __device__ __forceinline__ void gemv_block(const half* __restrict__ xh, const ui
             {
                 const int r0 = mt * 16 + ar;
                 int n = (nt0 + t) * 16 + h * 8 + (lane & 3) * 2;
-                if (r0 < M) { out[(int64_t) r0 * N + n] = c[mt][t][h][0]; out[(int64_t) r0 * N + n + 1] = c[mt][t][h][1]; }
-                if (r0 + 8 < M) { out[(int64_t) (r0 + 8) * N + n] = c[mt][t][h][2]; out[(int64_t) (r0 + 8) * N + n + 1] = c[mt][t][h][3]; }
+                if (r0 < M) { out[r0 * ldo + n] = c[mt][t][h][0]; out[r0 * ldo + n + 1] = c[mt][t][h][1]; }
+                if (r0 + 8 < M) { out[(r0 + 8) * ldo + n] = c[mt][t][h][2]; out[(r0 + 8) * ldo + n + 1] = c[mt][t][h][3]; }
             }
+}
+
+// gemv_block_ld with the rows of xh K apart and the rows of out N apart (the same instructions as before)
+template <int BITS, int TPW = 2, int PF = 4, int WARPS = 4, int MT = 1, int CBK = 2, bool APF = false>
+__device__ __forceinline__ void gemv_block(const half* __restrict__ xh, const uint32_t* __restrict__ tr,
+                                           float* __restrict__ out, int M, int K, int N, int nblk, int kt0, int kts)
+{
+    gemv_block_ld<BITS, TPW, PF, WARPS, MT, CBK, APF>(xh, K, tr, out, N, M, K, N, nblk, kt0, kts);
 }
 
 // grid (N / (16 WARPS TPW), S); slice s covers k-tiles [s*kts, (s+1)*kts); part [S, M, N]
@@ -447,7 +480,7 @@ __global__ __launch_bounds__(128) void gemv_fused_kernel(const float* __restrict
         for (int t = 0; t < TPW; ++t)
         {
             const uint32_t* p = tr + ((int64_t) kt * Nt + nt0 + t) * NW;
-            d[t][0] = __ldcs(p + lane);
+            d[t][0] = NW >= 32 || lane < NW ? __ldcs(p + lane) : 0u;   // K = 3: 24 words per tile
             d[t][1] = NW > 32 && lane + 32 < NW ? __ldcs(p + 32 + lane) : 0u;
         }
     };
@@ -683,6 +716,45 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem)
 }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+
+// decode_tile's generic path (b != 4) for a tile in shared memory: each lane reads its three words directly instead of
+// shuffling both register halves (6 shuffles); the same states, codebook and fragment order (bitwise equal b).
+// The lane's window start s0 & 31 varies with the lane for b != 4, so the 96-bit window is first funnel-shifted to bit 0
+// (two runtime shifts); the 8 state extractions then use compile-time offsets (j b + 16 <= 51 < 64 bits) instead of
+// runtime 64-bit shifts and a hi / lo select each.
+template <int BITS, int CBK>
+__device__ __forceinline__ void decode_tile_sm(const uint32_t* t, int lane, uint32_t* b)
+{
+    constexpr int NW = 8 * BITS, L = 256 * BITS;
+    const int s0 = ((8 * lane + 1) * BITS - 16 + L) % L;
+    const int i0 = s0 >> 5, o = s0 & 31;
+    const uint32_t w0 = t[i0], w1 = t[(i0 + 1) % NW], w2 = t[(i0 + 2) % NW];
+    half v[8];
+    if constexpr (BITS == 3)   // measured faster with the original runtime-shift extraction (the prefill gate/up kernel)
+    {
+        const uint64_t hi = ((uint64_t) w0 << 32) | w1, lo = ((uint64_t) w1 << 32) | w2;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+        {
+            const int rel = o + j * BITS;
+            const uint32_t st = rel <= 48 ? (uint32_t) (hi >> (48 - rel)) & 0xffffu : (uint32_t) (lo >> (80 - rel)) & 0xffffu;
+            v[j] = CBK == 1 ? mcg_decode(st) : mul1_decode(st);
+        }
+    }
+    else
+    {
+        const uint32_t a0 = __funnelshift_l(w1, w0, o), a1 = __funnelshift_l(w2, w1, o);   // bits [o, o + 64) of w0 w1 w2
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+        {
+            const int r = j * BITS;
+            const uint32_t st = r + 16 <= 32 ? (a0 >> (16 - r)) & 0xffffu : r >= 32 ? (a1 >> (48 - r)) & 0xffffu : __funnelshift_l(a1, a0, r) >> 16;
+            v[j] = CBK == 1 ? mcg_decode(st) : mul1_decode(st);
+        }
+    }
+    b[0] = pack2(v[0], v[1]); b[1] = pack2(v[2], v[3]);
+    b[2] = pack2(v[4], v[5]); b[3] = pack2(v[6], v[7]);
+}
 
 template <int BITS>
 __device__ __forceinline__ void decode_tile_smem(const uint32_t* t, int lane, uint32_t* b)

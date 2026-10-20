@@ -165,7 +165,7 @@ __global__ void draft_attn_combine(const float* __restrict__ part_o,const float*
 }
 extern "C" int glm53_draft_attn_dev_cuda(const void* q,const void* sk,const void* sv,const void* nk,const void* nv,const long long* meta,
     float* part_o,float* part_ml,void* out,int kvh,cudaStream_t s){
-    if(kvh!=8&&kvh!=4)return int(cudaErrorInvalidValue);
+    if(kvh<1||kvh>8)return int(cudaErrorInvalidValue);   // any KV-group count (TP1 8, TP2 4, TP3 3 / 2): grid and strides follow kvh
     const char* pf=std::getenv("GLM53_DRAFT_ATTN_PREFETCH");
     if(pf&&pf[0]=='1')draft_attn_split_pf<<<dim3(DA_CHUNKS,kvh),256,0,s>>>((const __nv_bfloat16*)q,(const __nv_bfloat16*)sk,(const __nv_bfloat16*)sv,(const __nv_bfloat16*)nk,(const __nv_bfloat16*)nv,meta,part_o,part_ml,kvh);
     else draft_attn_split<<<dim3(DA_CHUNKS,kvh),256,0,s>>>((const __nv_bfloat16*)q,(const __nv_bfloat16*)sk,(const __nv_bfloat16*)sv,(const __nv_bfloat16*)nk,(const __nv_bfloat16*)nv,meta,part_o,part_ml,kvh);

@@ -35,7 +35,7 @@ except ImportError as _e:           # text-only front end
 
 EOS = [154820, 154827, 154829]
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
-VERSION = "spark-engine M3 (openai-compatible front end)"
+VERSION = "spark-engine glm-5.3-flash (openai-compatible front end)"
 
 
 class ApiError(Exception):
@@ -414,7 +414,9 @@ class App:
         env.filters["tojson"] = lambda v, ensure_ascii=True, indent=None, **_: json.dumps(v, ensure_ascii=ensure_ascii, indent=indent)
         env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(jinja2.TemplateError(msg))
         tpl = Path(args.chat_template) if args.chat_template else d / "chat_template.jinja"
-        self.template = env.from_string(tpl.read_text())
+        # optional for front ends that build prompts themselves (ds41_server: the checkpoint's encoding.py; the
+        # DeepSeek-V4.1-Flash-1017 repo ships no chat_template.jinja)
+        self.template = env.from_string(tpl.read_text()) if args.chat_template or tpl.exists() else None
         self.media = None
         if args.vision == "on":
             if media_mod is None:
@@ -426,7 +428,7 @@ class App:
                                   video_fps=args.video_fps, video_max_frames=args.video_max_frames, detail_low_tokens=args.detail_low_tokens)
             self.media = media_mod.Media(media_mod.CanvasStore(args.canvas_dir, args.canvas_cache_mb << 20), pol, opts)
             self.media_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="media")
-        print(f"[openai-server] template {tpl}; vision {'on' if self.media else 'off'}", flush=True)
+        print(f"[openai-server] template {tpl if self.template else 'none (front end builds prompts)'}; vision {'on' if self.media else 'off'}", flush=True)
         self.name, self.max_len, self.default_max = args.model_name, args.max_model_len, args.max_tokens
         self.metrics = Metrics(self.name)
         self.max_seqs = int(os.environ.get("GLM53_SERVE_MAX_SEQS", "4"))
@@ -675,7 +677,7 @@ class App:
     def model_card(self):
         return {"id": self.name, "object": "model", "created": self.started, "owned_by": "spark-engine",
                 "root": self.name, "parent": None, "max_model_len": self.max_len,
-                "permission": [{"id": "modelperm-glm53", "object": "model_permission", "created": self.started,
+                "permission": [{"id": "modelperm-spark-engine", "object": "model_permission", "created": self.started,
                                 "allow_create_engine": False, "allow_sampling": True, "allow_logprobs": False,
                                 "allow_search_indices": False, "allow_view": True, "allow_fine_tuning": False,
                                 "organization": "*", "group": None, "is_blocking": False}]}
@@ -685,7 +687,7 @@ class App:
 def make_handler(app):
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
-        server_version = "glm53-openai"
+        server_version = "spark-engine"
 
         def log_message(self, fmt, *a):
             pass
@@ -943,7 +945,7 @@ def main():
     p.add_argument("--model-dir", required=True)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8888)
-    p.add_argument("--model-name", default="GLM-5.3-Flash-EXL3")
+    p.add_argument("--model-name", default="GLM-5.3-Flash")
     p.add_argument("--max-model-len", type=int, default=1048576, help="must match the engine KV budget (GLM53_SERVE_KV_TOKENS)")
     p.add_argument("--max-tokens", type=int, default=8192, help="default max_tokens when the request omits it")
     p.add_argument("--chat-template", default=None, help="chat template file (default: the model's; serve/chat_template_mm.jinja adds media)")

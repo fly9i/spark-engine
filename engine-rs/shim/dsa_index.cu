@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include "topk_select.cuh"
 
 __global__ void dsa_index_mask(const float* scores,const int64_t* pos,float* masked,int pools) {
     const int i=blockIdx.x*blockDim.x+threadIdx.x;
@@ -223,37 +224,17 @@ __device__ __forceinline__ unsigned long long dsa_sortkey(unsigned key,unsigned 
 }
 __global__ void __launch_bounds__(1024) dsa_topk_rows(const float* __restrict__ masked,const int64_t* __restrict__ pos,
     int64_t* __restrict__ selected,int pools,int k){
-    __shared__ unsigned hist[256];__shared__ unsigned long long cand[512];__shared__ unsigned wsum[32];
-    __shared__ unsigned s_prefix,s_mask;__shared__ int s_need,s_gt,s_taken;
+    __shared__ TopkSelectSmem ts;__shared__ unsigned long long cand[512];__shared__ unsigned wsum[32];
+    __shared__ int s_gt,s_taken;
     const int r=blockIdx.x,tid=threadIdx.x,lane=tid&31,warp=tid>>5;
     const unsigned* row=reinterpret_cast<const unsigned*>(masked+(int64_t)r*pools);
     const int64_t complete=(pos[r]+1)/4;
     const int n=(int)(complete<0?0:(complete>pools?pools:complete)),pad=pools-n;
     const unsigned kp=dsa_ordkey(0xff7fffffu);
-    if(tid==0){s_prefix=0;s_mask=0;s_need=k;s_gt=0;s_taken=0;}
-    for(int d=3;d>=0;--d){
-        if(tid<256)hist[tid]=0;
-        __syncthreads();
-        const unsigned prefix=s_prefix,mask=s_mask;const int sh=8*d;
-        for(int i=tid;i<n;i+=1024){const unsigned key=dsa_ordkey(__ldg(row+i));if((key&mask)==prefix)atomicAdd(&hist[(key>>sh)&255u],1u);}
-        if(tid==0&&pad>0&&(kp&mask)==prefix)atomicAdd(&hist[(kp>>sh)&255u],(unsigned)pad);
-        __syncthreads();
-        if(warp==0){
-            // lane l owns digits 255-8l .. 248-8l (descending); find the digit where the running count reaches need.
-            unsigned c[8];unsigned s=0;
-#pragma unroll
-            for(int j=0;j<8;++j){c[j]=hist[255-8*lane-j];s+=c[j];}
-            unsigned inc=s;
-#pragma unroll
-            for(int off=1;off<32;off<<=1){const unsigned v=__shfl_up_sync(0xffffffffu,inc,off);if(lane>=off)inc+=v;}
-            const unsigned exc=inc-s;const unsigned need=(unsigned)s_need;
-            const unsigned hit=__ballot_sync(0xffffffffu,inc>=need);const int first=__ffs(hit)-1;
-            if(lane==first){unsigned run=exc;int j=0;for(;j<8;++j){if(run+c[j]>=need)break;run+=c[j];}
-                const unsigned digit=255u-8u*lane-j;s_prefix=prefix|(digit<<sh);s_mask=mask|(255u<<sh);s_need=(int)(need-run);}
-        }
-        __syncthreads();
-    }
-    const unsigned T=s_prefix;const int need=s_need;const int gt=k-need;
+    if(tid==0){s_gt=0;s_taken=0;}
+    unsigned T;int need;
+    topk_threshold<4,1024>(ts,[&](int i){return dsa_ordkey(__ldg(row+i));},n,k,pad,kp,T,need);   // (topk_select.cuh)
+    const int gt=k-need;
     // keys above T (order irrelevant: the sort below is total)
     for(int i=tid;i<n;i+=1024){const unsigned key=dsa_ordkey(__ldg(row+i));
         if(key>T){const int at=atomicAdd(&s_gt,1);cand[at]=dsa_sortkey(key,(unsigned)i,true);}}

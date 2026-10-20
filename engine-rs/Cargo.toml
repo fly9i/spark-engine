@@ -2,7 +2,7 @@
 name = "spark-engine"
 version = "0.1.0"
 edition = "2021"
-description = "Inference engine for GLM-5.3-Flash (TP2) and Qwen3.8-Flash-Next on NVIDIA DGX Spark (GB10)"
+description = "Inference engine for GLM-5.3-Flash (TP2/TP3), DeepSeek-V4.1-Flash (TP3) and Qwen3.8-Flash-Next on NVIDIA DGX Spark (GB10)"
 license = "MIT"
 repository = "https://github.com/fly9i/spark-engine"
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Package a release: dist/spark-engine-<version>-linux-aarch64-cu130-sm121.tar.gz (+ .sha256).
 # Contents: bin/spark-engine, lib/libexllamav3_ext.so (exllamav3, MIT; its LICENSE alongside), the serve scripts,
-# profiles, runtime env script, Qwen assets, benchmarks, docs and licenses. PyTorch, CUDA and models are not included.
+# profiles, runtime env script, Qwen assets, the DeepSeek Engram hash export, benchmarks, docs and licenses. PyTorch, CUDA and models are not included.
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ver=${1:-$(git -C "$root" describe --tags --always 2>/dev/null || echo dev)}
@@ -15,6 +15,7 @@ cp -r "$root/engine-rs/serve" "$root/engine-rs/profiles" "$out/engine-rs/"
 find "$out/engine-rs/serve" -name __pycache__ -prune -exec rm -rf {} +
 cp "$root/scripts/env.sh" "$root/scripts/fetch_ablit_transplant.py" "$root/scripts/download-models.sh" "$out/scripts/"
 cp -r "$root/assets" "$root/bench" "$root/docs" "$out/"
+mkdir -p "$out/reference" && cp -r "$root/reference/ds41" "$out/reference/"   # DeepSeek Engram hash export (deployment step)
 cp "$root/README.md" "$root/README.zh-CN.md" "$root/LICENSE" "$root/THIRD_PARTY.md" "$root/spark.env.example" "$out/"
 sed -i "s|^SPARK_BIN=.*|SPARK_BIN=\$SPARK_HOME/bin/spark-engine|" "$out/spark.env.example"
 (cd "$root/dist" && tar czf "$name.tar.gz" "$name" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")

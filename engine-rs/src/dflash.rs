@@ -20,6 +20,7 @@ fn int4_linear(x:&Tensor,w:&Tensor,partial:bool)->Option<Tensor> {
     Some(if partial{y}else{y.to_kind(Kind::BFloat16)})
 }
 fn linear(x:&Tensor,w:&Tensor)->Tensor {
+    crate::spx_dhess::tap(x,w);
     if let Some(y)=int4_linear(x,w,false){return y;}
     if let Some(y)=crate::dense_fp8::try_bf16(x,w,false){return y;}
     assert!(!w.stride().iter().all(|&s|s==0),"FP8-freed drafter weight reached a non-FP8 path");
@@ -260,7 +261,7 @@ impl Drafter {
         let mut draft=if std::env::var("GLM53_DRAFT_HEAD_SHARD_LOAD").as_deref()==Ok("1") {
             assert!(head_tp(), "sharded drafter head requires TP execution");
             let shard=target.vocab_shard.expect("sharded drafter head requires vocab TP");
-            let mut draft=Self::load(dir,&target.lm_head);draft.head_shard=Some(shard);draft
+            let mut draft=Self::load(dir,&target.head_dense());draft.head_shard=Some(shard);draft
         } else {Self::load(dir,&target.drafter_head())};
         if std::env::var("GLM53_DRAFT_MLP_SHARD_LOAD").as_deref()==Ok("1") {
             assert!(mlp_tp());let tp=crate::tp::world();
@@ -272,15 +273,17 @@ impl Drafter {
             }
             draft.mlp_sharded=true;
         }
-        // C3 (GLM53_DRAFT_ATTN_TP=1, TP2): attention head-parallel. q/k/v keep this rank's heads (rows), o its
-        // input columns; the o projection's FP32 partials are summed across ranks. Slot KV holds local heads.
+        // C3 (GLM53_DRAFT_ATTN_TP=1): attention head-parallel by KV group (4 q heads + 1 kv head; TP2 4/4 groups, TP3 3/3/2).
+        // q/k/v keep this rank's heads (rows), o its input columns; the o projection's FP32 partials are summed across
+        // ranks. Slot KV holds local heads.
         if std::env::var("GLM53_DRAFT_ATTN_TP").as_deref()==Ok("1") {
-            let tp=crate::tp::world();assert!(tp.world==2,"drafter attention TP is TP2 only");
-            let (qh,kvh)=(32/tp.world as i64,8/tp.world as i64);
+            let tp=crate::tp::world();
+            let g=crate::tp::Part::of(8,tp.rank,tp.world,0);
+            let (qh,kvh)=(4*g.n,g.n);
             for layer in &mut draft.layers {
-                layer.q=layer.q.narrow(0,tp.rank as i64*qh*128,qh*128).copy();
-                layer.k=layer.k.narrow(0,tp.rank as i64*kvh*128,kvh*128).copy();layer.v=layer.v.narrow(0,tp.rank as i64*kvh*128,kvh*128).copy();
-                layer.o=layer.o.narrow(1,tp.rank as i64*qh*128,qh*128).copy();
+                layer.q=layer.q.narrow(0,4*g.start*128,qh*128).copy();
+                layer.k=layer.k.narrow(0,g.start*128,kvh*128).copy();layer.v=layer.v.narrow(0,g.start*128,kvh*128).copy();
+                layer.o=layer.o.narrow(1,4*g.start*128,qh*128).copy();
             }
             draft.qh=qh;draft.kvh=kvh;draft.attn_tp=true;
         }
@@ -301,12 +304,25 @@ impl Drafter {
         }
         crate::weights::release_load_buffer();
         crate::host_memory::finish_loading("drafter-load");
+        if crate::spx_dhess::enabled() {
+            // SPX1 drafter calibration: name the tensors the GEMM entries receive (v / up alias k / gate).
+            for (i,layer) in draft.layers.iter().enumerate() {
+                let p=format!("layers.{i}");
+                for (w,n) in [(&layer.q,"self_attn.q_proj"),(&layer.k,"self_attn.k_proj"),(&layer.o,"self_attn.o_proj"),
+                              (&layer.gate,"mlp.gate_proj"),(&layer.down,"mlp.down_proj"),
+                              (&layer.attn_conv.projection,"attention_conv.kernel_projection"),(&layer.mlp_conv.projection,"mlp_conv.kernel_projection")] {
+                    crate::spx_dhess::name(w,&format!("{p}.{n}.weight"));
+                }
+            }
+            crate::spx_dhess::name(&draft.fc,"fc.weight");
+        }
         draft.prepare_head_int4();
         draft
     }
     /// Attention output projection; with head-parallel attention the rank partials are summed in FP32 first.
     fn o_proj(&self,x:&Tensor,w:&Tensor)->Tensor {
         if !self.attn_tp {return linear(x,w);}
+        crate::spx_dhess::tap(x,w);
         let y=int4_linear(x,w,true).or_else(||crate::dense_fp8::try_bf16(x,w,true)).unwrap_or_else(||x.to_kind(Kind::BFloat16).matmul(&w.transpose(0,1)).to_kind(Kind::Float));
         crate::tp::allreduce(&y);y.to_kind(Kind::BFloat16)
     }
@@ -325,6 +341,7 @@ impl Drafter {
                 extern "C"{fn rs_draft_silu_mul(g:*const std::ffi::c_void,u:*const std::ffi::c_void,out:*mut std::ffi::c_void,n:i64)->i32;}
                 assert_eq!(unsafe{rs_draft_silu_mul(g.data_ptr(),u.data_ptr(),out.data_ptr(),g.numel() as i64)},0);out
             } else {(linear(z,&gate).to_kind(Kind::Float).silu()*linear(z,&up).to_kind(Kind::Float)).to_kind(Kind::BFloat16).contiguous()};
+            crate::spx_dhess::tap(&activation,&down);
             let out=if let Some(y)=crate::dense_fp8::try_bf16(&activation,&down,true){y}else{
             let out=Tensor::empty([z.size()[0],down.size()[0]],(Kind::Float,z.device()));
             extern "C" {fn rs_bf16_partial(x:*const u8,w:*const u8,y:*mut f32,m:i32,n:i32,k:i32,ldw:i32)->i32;}
@@ -362,17 +379,21 @@ impl Drafter {
             let total=self.lm_head.size()[0];let count=total/tp.world as i64;let start=count*tp.rank as i64;(start,total,self.lm_head.narrow(0,start,count))};
         let (q,s)=crate::dense_fp8::quant_of_bf16(&weight)?;
         let (n,k)=(q.size()[0],q.size()[1]);let m=hidden.size()[0];
-        if !(1..=8).contains(&m) || k%1024!=0 || hidden.size()[1]!=k {return None;}
+        if !(1..=32).contains(&m) || k%1024!=0 || hidden.size()[1]!=k || (m>8 && n%8!=0) {return None;}
         let (q4,s4)=head4_of(&q,&s)?;
         let x=hidden.to_kind(Kind::BFloat16).contiguous();
         let coarse=Tensor::empty([m,n],(Kind::Float,x.device()));
         extern "C"{fn rs_draft_head_int4(x:*const std::ffi::c_void,q4:*const std::ffi::c_void,s:*const f32,y:*mut f32,m:i32,n:i32,k:i32)->i32;}
         assert_eq!(unsafe{rs_draft_head_int4(x.data_ptr(),q4.data_ptr(),s4.data_ptr().cast(),coarse.data_ptr().cast(),m as i32,n as i32,k as i32)},0,"INT4 draft head");
         let (_,cand)=coarse.topk(64,-1,true,false);
-        let flat=cand.reshape([-1]);
-        let wq=q.index_select(0,&flat);let ws=s.index_select(0,&flat);
-        let y=crate::dense_fp8::run_bf16(&x,&wq,&ws,false).to_kind(Kind::Float);       // [m, m*64]
-        let own=y.view([m,m,64]).diagonal(0,0,1).transpose(0,1);                      // [m, 64]: row r's own candidates
+        // Rescore in groups of <= 8 rows, each against its own rows' candidates only (batched drafting has up to 32 rows;
+        // the per-row values do not depend on the group, so m <= 8 is the former single pass).
+        let own=Tensor::cat(&(0..m).step_by(8).map(|r0|{let g=(m-r0).min(8);
+            let cg=cand.narrow(0,r0,g);let flat=cg.reshape([-1]);
+            let wq=q.index_select(0,&flat);let ws=s.index_select(0,&flat);
+            let y=crate::dense_fp8::run_bf16(&x.narrow(0,r0,g),&wq,&ws,false).to_kind(Kind::Float);   // [g, g*64]
+            y.view([g,g,64]).diagonal(0,0,1).transpose(0,1)                                           // [g, 64]: own candidates
+        }).collect::<Vec<_>>(),0);
         let (values,pos)=own.topk(16,-1,true,true);
         Some((start,total,values,cand.gather(-1,&pos,false)))
     }
@@ -672,7 +693,7 @@ impl Drafter {
     /// Fixed-shape body: device-side anchor, positions and history range only.
     fn propose_body(&self,slot:&DraftSlot,target:&crate::weights::ModelWeights)->(Tensor,Tensor,Tensor,Tensor,Tensor,bool,bool,usize,usize) {
         let n=8i64;let dev=target.device;
-        let mut x=target.embed_tokens(&slot.ids).to_kind(Kind::BFloat16);
+        let mut x=target.embed_raw(&slot.ids).to_kind(Kind::BFloat16);
         let positions=self.positions(n)+slot.meta.narrow(0,0,1);
         let rotary=Some(rope_tables(&positions,Some(&self.rotary_inv)));
         let mut residual:Option<Tensor>=None;let mut conv=crate::draft_conv::Dispatch::new();
@@ -773,7 +794,7 @@ impl Drafter {
     fn propose_many_body(&self,slots:&[std::rc::Rc<DraftSlot>],target:&crate::weights::ModelWeights)->(Vec<(Tensor,Tensor,Tensor,Tensor,Tensor,Tensor,bool)>,usize,usize) {
         let s=slots.len();let n=8i64;let rows=s as i64*n;let dev=target.device;
         let ids_in=Tensor::cat(&slots.iter().map(|sl|sl.ids.shallow_clone()).collect::<Vec<_>>(),0);
-        let mut x=target.embed_tokens(&ids_in).to_kind(Kind::BFloat16);
+        let mut x=target.embed_raw(&ids_in).to_kind(Kind::BFloat16);
         let positions=Tensor::cat(&slots.iter().map(|sl|self.positions(n)+sl.meta.narrow(0,0,1)).collect::<Vec<_>>(),0);
         let rotary=Some(rope_tables(&positions,Some(&self.rotary_inv)));
         let mut residual:Option<Tensor>=None;let mut conv=crate::draft_conv::Dispatch::new();
@@ -873,7 +894,7 @@ impl Drafter {
         for (slot,meta) in slots.iter().zip(&metas) {slot.meta.shallow_clone().copy_(&Tensor::from_slice(meta));}
         let n=8i64;let rows=s as i64*n;let dev=target.device;
         let mut ids=Vec::with_capacity(rows as usize);for &a in anchors {ids.push(a);ids.extend(std::iter::repeat(self.mask_id).take(7));}
-        let mut x=target.embed_tokens(&Tensor::from_slice(&ids).to_device(dev)).to_kind(Kind::BFloat16);
+        let mut x=target.embed_raw(&Tensor::from_slice(&ids).to_device(dev)).to_kind(Kind::BFloat16);
         let positions=Tensor::cat(&contexts.iter().map(|c|self.positions(n)+c.len).collect::<Vec<_>>(),0);
         let rotary=Some(rope_tables(&positions,Some(&self.rotary_inv)));
         let mut residual:Option<Tensor>=None;let mut conv=crate::draft_conv::Dispatch::new();
@@ -945,7 +966,7 @@ impl Drafter {
         if graph_enabled() { if let Some(c)=self.propose_graph(context,anchor,target) {return c;} }
         let n=self.block_size;let dev=target.device;
         let mut ids=vec![self.mask_id;n as usize];ids[0]=anchor;
-        let mut x=target.embed_tokens(&Tensor::from_slice(&ids).to_device(dev)).to_kind(Kind::BFloat16);
+        let mut x=target.embed_raw(&Tensor::from_slice(&ids).to_device(dev)).to_kind(Kind::BFloat16);
         let positions=self.positions(n)+context.len;
         let rotary=rope_cache().then(||rope_tables(&positions,Some(&self.rotary_inv)));
         let keys_pos=self.positions(context.len-context.start+n)+context.start;
@@ -1237,3 +1258,26 @@ pub fn head_probe() {
     let a=full().sort(-1,false).0;let b=two().sort(-1,false).0;
     eprintln!("[head-probe] top-16 id sets equal in {}/{} rows",i64::try_from(a.eq_tensor(&b).all_dim(-1,false).sum(Kind::Int64)).unwrap(),m);
 }
+
+/// `draft-head32-test` (single GPU): the 9..32-row INT4 head kernel equals the 8-row kernel run on groups of 8 rows,
+/// bitwise, on random weights of the per-rank head shape [77440, 4096]; plus timings.
+pub fn head32_test() {
+    let dev=Device::Cuda(0);let _g=tch::no_grad_guard();
+    let (n,k)=(77440i64,4096i64);
+    let q4=Tensor::randint(256,[n,k/2],(Kind::Uint8,dev));let s4=Tensor::rand([n,k/128],(Kind::Float,dev))*0.01;
+    extern "C"{fn rs_draft_head_int4(x:*const std::ffi::c_void,q4:*const std::ffi::c_void,s:*const f32,y:*mut f32,m:i32,n:i32,k:i32)->i32;
+        fn rs_draft_head4_tile(q4:*mut std::ffi::c_void,n:i32,k:i32)->i32;}
+    assert_eq!(unsafe{rs_draft_head4_tile(q4.data_ptr(),n as i32,k as i32)},0);
+    for m in [9i64,12,16,17,24,28,32] {
+        let x=(Tensor::randn([m,k],(Kind::Float,dev))*2.0).to_kind(Kind::BFloat16);
+        let y=Tensor::empty([m,n],(Kind::Float,dev));
+        assert_eq!(unsafe{rs_draft_head_int4(x.data_ptr(),q4.data_ptr(),s4.data_ptr().cast(),y.data_ptr().cast(),m as i32,n as i32,k as i32)},0);
+        let r=Tensor::cat(&(0..m).step_by(8).map(|r0|{let g=(m-r0).min(8);let xg=x.narrow(0,r0,g).contiguous();let yg=Tensor::empty([g,n],(Kind::Float,dev));
+            assert_eq!(unsafe{rs_draft_head_int4(xg.data_ptr(),q4.data_ptr(),s4.data_ptr().cast(),yg.data_ptr().cast(),g as i32,n as i32,k as i32)},0);yg}).collect::<Vec<_>>(),0);
+        let diff=y.view_dtype(Kind::Int).ne_tensor(&r.view_dtype(Kind::Int)).sum(Kind::Int64).int64_value(&[]);
+        let time=|f:&dyn Fn()|{for _ in 0..3{f();}tch::Cuda::synchronize(0);let t=std::time::Instant::now();for _ in 0..20{f();}tch::Cuda::synchronize(0);t.elapsed().as_secs_f64()*1e6/20.};
+        let t32=time(&||{unsafe{rs_draft_head_int4(x.data_ptr(),q4.data_ptr(),s4.data_ptr().cast(),y.data_ptr().cast(),m as i32,n as i32,k as i32)};});
+        eprintln!("[head32] rows {m}: mismatches vs 8-row groups {diff}; one launch {t32:.0} us (8-row kernel x{} groups)",(m+7)/8);
+    }
+}
+

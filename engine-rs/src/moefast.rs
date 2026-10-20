@@ -106,7 +106,9 @@ pub struct MoeFast {
     // Calls on one pool must be serialized on the same CUDA stream. The engine
     // already requires this; graph capture/replay retains these stable addresses.
     scratch: Option<Scratch>,
-    own_tables:HashMap<usize,Tensor>,
+    own_tables:HashMap<usize,(Tensor,i32)>,
+    /// zero-scale dummies of the experts another rank holds (TP3; install_dummy), by (layer, trellis widths)
+    dummies:HashMap<(usize,Vec<usize>),Vec<Tensor>>,
     shared_input:Vec<SharedInputCertificate>,
     resident_per_layer:Vec<usize>,
     tp: crate::tp::Tp,
@@ -115,37 +117,64 @@ pub struct MoeFast {
 
 type RawProj = (Vec<i16>, Vec<i64>, Vec<f32>, Vec<f32>); // (trellis, shape, suh, svh)
 
+/// TP placement of routed expert `e` of `layer`: the part of its 16 Hadamard blocks of 128 (the intermediate 2048) this rank
+/// holds, None when it holds none. TP2: the halves (rank r: blocks 8r..8r+8). TP3 (docs/06-TP3.md §13): 6/5/5 blocks, the 6
+/// rotating with (e + layer), every expert on every rank (768 or 640 wide: the variable-width kernels, moe_exl3.cuh
+/// GlmMoe3), so a routed set costs every rank the same within a block per expert. GLM53_TP3_EXPERTS=holders: the first TP3
+/// version (two holders at the TP2 width, all ranks but (e + layer) % 3, half j to the j-th holder; the third points the
+/// expert at a zero-scale dummy, `install_dummy`, which the kernel skips): balanced only in expectation.
+pub(crate) fn tp3_holders() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| match std::env::var("GLM53_TP3_EXPERTS").as_deref() { Ok("holders") => true, Ok("split") | Err(_) => false,
+        Ok(v) => panic!("GLM53_TP3_EXPERTS must be split or holders, not {v}") })
+}
+pub(crate) fn expert_part(layer: usize, e: usize, tp: crate::tp::Tp) -> Option<crate::tp::Part> {
+    use crate::tp::Part;
+    match tp.world {
+        1 => Some(Part::full(16)),
+        2 => Some(Part::of(16, tp.rank, 2, 0)),
+        3 if tp3_holders() => { let skip = (e + layer) % 3;
+            (tp.rank != skip).then(|| Part { start: 8 * (0..tp.rank).filter(|&r| r != skip).count() as i64, n: 8, units: 16 }) }
+        3 => Some(Part::of(16, tp.rank, 3, e + layer)),
+        w => panic!("routed experts: TP world {w} is not supported"),
+    }
+}
+/// The experts of this rank have their own widths (TP3 split): the 11-row tables of the variable-width kernels.
+pub(crate) fn variable_widths(tp: crate::tp::Tp) -> bool { tp.world == 3 && !tp3_holders() }
+
 /// 纯读取(可 rayon 并行):页缓存/NVMe 页入在这里发生。
 /// TP 分片(对齐 exllamav3 TP 规则):gate/up 列切(N 半),down 行切(K 半);
 /// suh 按输入维切、svh 按输出维切。
 pub(crate) fn load_expert_raw(idx: &ShardIndex, layer: usize, e: usize, tp: crate::tp::Tp) -> [RawProj; 3] {
     let p = format!("model.language_model.layers.{layer}.mlp.experts.{e}");
-    let (rank, world) = (tp.rank, tp.world);
+    let part = expert_part(layer, e, tp).unwrap_or_else(|| panic!("layer {layer} expert {e}: not held by rank {}", tp.rank));
     return ["gate_proj", "up_proj", "down_proj"].map(|w| {
         let tr = idx.get_i16(&format!("{p}.{w}.trellis")).expect("tr");
         let s = idx.entries[&format!("{p}.{w}.trellis")].shape.clone();
         let (suh, _) = idx.get_f32(&format!("{p}.{w}.suh")).expect("suh");
         let (svh, _) = idx.get_f32(&format!("{p}.{w}.svh")).expect("svh");
-        if world == 1 {
+        if part.is_full() {
             return (tr, s.iter().map(|&d| d as i64).collect(), suh, svh);
         }
         let (kt, nt, wd) = (s[0], s[1], s[2]);
+        // the intermediate's 16-tile trellis rows / columns of this rank's blocks (16 blocks of 128 = 8 tiles each for 2048)
+        let tiles = if w == "down_proj" { kt } else { nt };
+        assert_eq!(tiles % part.units as usize, 0, "{p}.{w}: {tiles} tiles over {} blocks", part.units);
+        let (lo, cnt) = { let (a, b) = part.range(tiles as i64); (a as usize, b as usize) };
         if w == "down_proj" {
-            // 行切:K 维(trellis 第 0 维)取半
-            let kth = kt / world;
-            let lo = rank * kth;
+            // 行切:K 维(trellis 第 0 维)取本 rank 的块
+            let kth = cnt;
             let tr2 = tr[lo * nt * wd..(lo + kth) * nt * wd].to_vec();
-            let suh2 = suh[rank * kth * 16..(rank + 1) * kth * 16].to_vec();
+            let suh2 = suh[lo * 16..(lo + kth) * 16].to_vec();
             (tr2, vec![kth as i64, nt as i64, wd as i64], suh2, svh)
         } else {
-            // 列切:N 维(trellis 第 1 维)取半
-            let nth = nt / world;
-            let lo = rank * nth;
+            // 列切:N 维(trellis 第 1 维)取本 rank 的块
+            let nth = cnt;
             let mut tr2 = Vec::with_capacity(kt * nth * wd);
             for r in 0..kt {
                 tr2.extend_from_slice(&tr[(r * nt + lo) * wd..(r * nt + lo + nth) * wd]);
             }
-            let svh2 = svh[rank * nth * 16..(rank + 1) * nth * 16].to_vec();
+            let svh2 = svh[lo * 16..(lo + nth) * 16].to_vec();
             (tr2, vec![kt as i64, nth as i64, wd as i64], suh, svh2)
         }
     });
@@ -182,6 +211,7 @@ impl MoeFast {
             scratch_mode: ScratchMode::from_env(),
             scratch: None,
             own_tables:HashMap::new(),
+            dummies:HashMap::new(),
             shared_input:(0..n_layers).map(|_|SharedInputCertificate::new(n_experts)).collect(),
             resident_per_layer:vec![0;n_layers],
             tp,
@@ -205,11 +235,19 @@ impl MoeFast {
         (0..).take_while(|e|self.where_.contains_key(&(layer,*e)))
             .map(|e|self.alive[self.where_[&(layer,e)]].as_ref().unwrap().iter().map(Tensor::shallow_clone).collect()).collect()
     }
-    /// moe_exl3.cuh pointer table [9, 288] of one layer (cached; the pool is fully resident).
+    /// moe_exl3.cuh pointer table [10, 288] of one layer and its K mask (cached; the pool is fully resident): 9 rows of
+    /// pointers and row 9 the experts' trellis widths K (mixed-K layers: K in 3..6 per expert, gate/up/down equal).
     /// Built for every resident layer on first use, from the host-side pointers of the resident tensors (no device
     /// work: safe before any capture; a miss during capture is an error).
-    fn own_table(&mut self,layer:usize)->Tensor {
-        if let Some(t)=self.own_tables.get(&layer){return t.shallow_clone();}
+    /// Every resident expert's trellis is K=4 (the only K the mgemm path decodes). Computed once.
+    fn all_k4(&self)->bool {
+        thread_local!{static ALL_K4:std::cell::Cell<Option<bool>>=const{std::cell::Cell::new(None)};}
+        if let Some(v)=ALL_K4.with(|c|c.get()) {return v;}
+        let v=self.alive.iter().flatten().all(|t|[0,3,6].iter().all(|&j|crate::moe_own::trellis_bits(&t[j])==4));
+        ALL_K4.with(|c|c.set(Some(v)));v
+    }
+    pub(crate) fn own_table(&mut self,layer:usize)->(Tensor,i32) {
+        if let Some((t,m))=self.own_tables.get(&layer){return (t.shallow_clone(),*m);}
         assert!(self.assume_hot,"own MoE requires a fully resident pool");
         assert!(!crate::tp::graph::capturing(),"own MoE table cache miss during graph capture");
         let dev=self.slot_table.device();
@@ -217,25 +255,40 @@ impl MoeFast {
         for l in layers {
             let n=(0..).take_while(|e|self.where_.contains_key(&(l,*e))).count();
             assert_eq!(n,288,"own MoE: layer {l} has {n} resident experts");
-            let mut host=vec![0i64;9*n];
+            // TP3 split: row 10 holds every expert's width (the variable-width kernels)
+            let rows=if variable_widths(self.tp) {11} else {10};
+            let mut host=vec![0i64;rows*n];
             for (row,&j) in [0usize,3,6,1,4,7,2,5,8].iter().enumerate() {
                 for e in 0..n {host[row*n+e]=self.alive[self.where_[&(l,e)]].as_ref().unwrap()[j].data_ptr() as i64;}
             }
-            self.own_tables.insert(l,Tensor::from_slice(&host).view([9,n as i64]).to_device(dev));
+            for e in 0..n {
+                let t=self.alive[self.where_[&(l,e)]].as_ref().unwrap();
+                let k=crate::moe_own::trellis_bits(&t[0]);
+                assert!(crate::moe_own::trellis_bits(&t[3])==k && crate::moe_own::trellis_bits(&t[6])==k,"layer {l} expert {e}: gate/up/down trellis K differ");
+                // (an expert another rank holds, TP3 holders layout: its dummy, the trellis K of the expert's shapes)
+                host[9*n+e]=k;
+            }
+            if rows==11 {for e in 0..n {host[10*n+e]=self.alive[self.where_[&(l,e)]].as_ref().unwrap()[0].size()[1]*16;}}
+            let held:Vec<i64>=host[9*n..10*n].iter().copied().filter(|&k|k!=0).collect();
+            let kmask=crate::moe_own::kmask(&held);
+            if kmask!=1<<4 {eprintln!("[moefast] layer {l}: mixed expert K (mask {kmask:#x})");}
+            self.own_tables.insert(l,(Tensor::from_slice(&host).view([rows as i64,n as i64]).to_device(dev),kmask));
         }
-        self.own_tables[&layer].shallow_clone()
+        let (t,m)=&self.own_tables[&layer];(t.shallow_clone(),*m)
     }
     /// Prepare the per-layer expert tables before graph capture.
     pub(crate) fn prepare_layer(&mut self,layer:usize) {let _=self.own_table(layer);}
     /// Routed experts of decode / verify rows (moe_exl3.cuh): x [R, 4096] fp16, ids [R, 8], weights [R, 8] -> [R, 4096] FP32.
     pub fn expert_cooperative(&mut self,layer:usize,x:&Tensor,ids:&Tensor,weights:&Tensor)->Tensor {
         let out=Tensor::empty([x.size()[0],4096],(Kind::Float,x.device()));
-        crate::moe_own::run_into(&self.own_table(layer),x,ids,weights,&out,None,None);crate::ablate::apply(layer,&out);out
+        let (tab,kmask)=self.own_table(layer);
+        crate::moe_own::run_into(&tab,kmask,x,ids,weights,&out,None,None);crate::ablate::apply(layer,&out);out
     }
     /// expert_cooperative into a caller-provided contiguous FP32 [rows, 4096] (e.g. the first half of a packed
     /// collective buffer). The kernel assigns every output element, so `out` needs no initialization.
     pub fn expert_cooperative_into(&mut self,layer:usize,x:&Tensor,ids:&Tensor,weights:&Tensor,out:&Tensor) {
-        crate::moe_own::run_into(&self.own_table(layer),x,ids,weights,out,None,None);crate::ablate::apply(layer,out);
+        let (tab,kmask)=self.own_table(layer);
+        crate::moe_own::run_into(&tab,kmask,x,ids,weights,out,None,None);crate::ablate::apply(layer,out);
     }
 
     /// Prefill-only expert grouping. Host routing transfer happens once per
@@ -247,24 +300,28 @@ impl MoeFast {
     /// `add` (P3b): FP32 [rows,4096] partial added after the fixed-order routed reduction, inside
     /// the reduce kernel (fl(routed+add), same as the separate add). Fat path only.
     pub fn expert_grouped_add(&mut self,layer:usize,x:&Tensor,ids:&Tensor,weights:&Tensor,reconstruct:bool,add:Option<&Tensor>)->Tensor {
-        assert!(self.assume_hot);assert_eq!(self.tp.world,2);
+        assert!(self.assume_hot);assert!(self.tp.world>=2);
         let rows=x.size()[0];assert_eq!(ids.size(),[rows,8]);
         // The grouped GEMM path of moe_exl3.cuh in launches of PREFILL_ROWS rows, the shared partial `add` added after the
         // fixed-order slot sum. GLM53_PREFILL_GROUPED=recon keeps the reconstruct tier (decoded weights + cuBLAS).
         if !reconstruct || std::env::var("GLM53_MOE_RECON").as_deref()!=Ok("1") {
-            let tab=self.own_table(layer);
+            let (tab,kmask)=self.own_table(layer);
             // shared-input layers: expert 0's gate suh stands for all (proven equal at load)
             let suh0=(self.shared_input_verified(layer)&&std::env::var("GLM53_MOE_NO_SHARED").is_err()).then(||self.alive[self.where_[&(layer,0)]].as_ref().unwrap()[1].shallow_clone());
             let x=x.to_kind(Kind::Half).contiguous();let ids=ids.contiguous();
             let out=Tensor::empty([rows,4096],(Kind::Float,x.device()));
+            // SPARK_ABLATE: the shared partial `add` was projected where it was produced (SPX writer), so it joins after the
+            // routed output's projection (projecting the sum again would remove more than SPARK_ABLATE_SCALE of it).
+            let late=crate::ablate::get().is_some_and(|a|a.covers(layer));
             let mut r0=0;
             while r0<rows {
                 let n=(rows-r0).min(crate::moe_own::PREFILL_ROWS);
-                let a=add.map(|a|a.narrow(0,r0,n).contiguous());
-                crate::moe_own::run_into(&tab,&x.narrow(0,r0,n),&ids.narrow(0,r0,n),&weights.narrow(0,r0,n),&out.narrow(0,r0,n),a.as_ref(),suh0.as_ref());
+                let a=if late {None} else {add.map(|a|a.narrow(0,r0,n).contiguous())};
+                crate::moe_own::run_into(&tab,kmask,&x.narrow(0,r0,n),&ids.narrow(0,r0,n),&weights.narrow(0,r0,n),&out.narrow(0,r0,n),a.as_ref(),suh0.as_ref());
                 r0+=n;
             }
             crate::ablate::apply(layer,&out);
+            if late {if let Some(a)=add {let _=out.shallow_clone().g_add_(a);}}
             return out;
         }
         let host:Vec<i64>=Vec::try_from(&ids.reshape([-1]).to_device(Device::Cpu)).unwrap();
@@ -430,10 +487,27 @@ impl MoeFast {
         let _ = self.slot_table.copy_(&Tensor::from_slice(&st).view([nl, ne]).to_device(dev));
     }
 
+    /// Expert `e` of `layer` held by another rank (expert_part None): its slot points at the layer's zero-scale dummy of the
+    /// same shapes and K (trellis 0, suh = svh = 0: every product is an exact zero), shared by all such experts of the layer.
+    fn install_dummy(&mut self, layer: usize, e: usize, dev: Device) -> i64 {
+        let p = format!("model.language_model.layers.{layer}.mlp.experts.{e}");
+        let shapes: Vec<Vec<usize>> = ["gate_proj", "up_proj", "down_proj"].iter().map(|w| self.idx.entries[&format!("{p}.{w}.trellis")].shape.clone()).collect();
+        let key = (layer, shapes.iter().map(|s| s[2]).collect::<Vec<_>>());
+        let ts: Vec<Tensor> = self.dummies.entry(key).or_insert_with(|| shapes.iter().enumerate().flat_map(|(pi, s)| {
+            let (kt, nt, wd) = (s[0] as i64, s[1] as i64, s[2] as i64);
+            let (tr, suh, svh) = if pi == 2 { ([kt / 2, nt, wd], kt / 2 * 16, nt * 16) } else { ([kt, nt / 2, wd], kt * 16, nt / 2 * 16) };
+            [Tensor::zeros(tr, (Kind::Int16, dev)), Tensor::zeros([suh], (Kind::Half, dev)), Tensor::zeros([svh], (Kind::Half, dev))]
+        }).collect()).iter().map(Tensor::shallow_clone).collect();
+        let slot = self.claim_slot(layer, e);
+        self.commit_slot(layer, e, slot, ts, true);
+        slot as i64
+    }
+
     fn ensure(&mut self, layer: usize, e: usize, dev: Device) -> i64 {
         if let Some(&s) = self.where_.get(&(layer, e)) {
             return s as i64;
         }
+        if expert_part(layer, e, self.tp).is_none() { return self.install_dummy(layer, e, dev); }
         let raw = load_expert_raw(&self.idx, layer, e, self.tp);
         self.install(layer, e, raw, dev)
     }
@@ -460,6 +534,9 @@ impl MoeFast {
             return;
         }
         let tp = self.tp;
+        let (held, other): (Vec<usize>, Vec<usize>) = missing.iter().partition(|&&e| expert_part(layer, e, tp).is_some());
+        for e in other { self.install_dummy(layer, e, dev); }
+        let missing = held;
         let raws: Vec<(usize, [RawProj; 3])> = missing
             .par_iter()
             .map(|&e| (e, load_expert_raw(&self.idx, layer, e, tp)))
@@ -501,7 +578,7 @@ impl MoeFast {
                 for (e, (g, u)) in got.suh.iter().enumerate() {
                     self.shared_input[l].observe(e, g, u);
                     let slot = self.claim_slot(l, e);
-                    self.commit_slot(l, e, slot, r.views(&got.arena, e), false);
+                    self.commit_slot(l, e, slot, r.views(&got.arena, l, e), false);
                 }
                 view_s += t.elapsed().as_secs_f64();
             }
@@ -617,6 +694,10 @@ impl MoeFast {
     /// Each slot has its own input, Hadamard scratch and output; weights remain EXL3.
     /// Kept opt-in because auto tile/grid selection changes with matrix batch size.
     pub fn expert_multi_sel(&mut self,x16:&Tensor,sel_t:&Tensor,wts:&Tensor,dev:Device)->Tensor {
+        // rs_exl3_mgemm2 decodes every selected expert at trellis K=4 (k_words below): any other K reads the wrong
+        // number of bits per weight (K=3: past the end of the expert). Mixed-K checkpoints use the own kernel
+        // (expert_cooperative / expert_grouped); refuse here instead of computing garbage.
+        assert!(self.all_k4(),"mgemm expert path needs K=4 experts only; mixed-K checkpoints must use the own MoE kernel (GLM53_MOE_COOP=1)");
         let tokens=x16.size()[0];let per_token=sel_t.size()[1];
         assert!((1..=16).contains(&tokens));assert_eq!(sel_t.size()[0],tokens);
         assert_eq!(wts.numel() as i64,tokens*per_token);

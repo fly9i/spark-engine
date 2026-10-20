@@ -940,3 +940,153 @@ extern "C" int glm53_gumbel_argmax_packet_cuda(const float* values,int rows,int 
   gumbel_argmax_packet<<<1,256,0,s>>>(part_v,part_i,nb,rows,world,rank,start,packet);
   return int(cudaGetLastError());
 }
+
+// ---- GLM53_MLA_DECODE_TC=1: tensor-core decode attention over the FP8 latent cache (L1) ----
+// latent_tc16's CTA layout (one query x 16 heads, warp w owns latent dims [128w, 128w+128)) split over the enumerated key
+// list (blockIdx.z, merge_latent combines). FP8 values are exact in the FP16 tile and the per-128 scale (one per warp)
+// multiplies scores and probabilities in FP32; Q and probabilities enter m16n8k16 as hi + lo FP16 (~22-bit operands),
+// FP32 accumulation: |out - sparse_latent| ~1e-5 (summation order). The scalar sparse_latent re-reads every selected row
+// per head; this reads it once per 16 heads and does the dot products / PV on tensor cores (2-4x faster at 2-16 rows).
+__device__ __forceinline__ void tch_split2(float a,float b,uint32_t& hi,uint32_t& lo){
+  const half2 h=__floats2half2_rn(a,b);hi=*reinterpret_cast<const uint32_t*>(&h);
+  const half2 l=__floats2half2_rn(a-__low2float(h),b-__high2float(h));lo=*reinterpret_cast<const uint32_t*>(&l);}
+template<bool FP8=false>
+__global__ void __launch_bounds__(128) latent_tc16_dec(const float* __restrict__ q,const half* __restrict__ latent,
+    const long long* __restrict__ selected,float* __restrict__ out,int heads,int queries,int slots,int query_stride,int splits){
+  const int part=blockIdx.z,query=blockIdx.x,h0=blockIdx.y*16,warp=threadIdx.x>>5,lane=threadIdx.x&31,g=lane>>2,t=lane&3,tid=threadIdx.x;
+  __shared__ __align__(16) half keys[TCL_KEYS*TCL_LD];
+  __shared__ float spart[4][16][TCL_KEYS+1];
+  __shared__ float prob[16][TCL_KEYS+4];
+  __shared__ long long pos[TCL_KEYS];
+  __shared__ float ksc[TCL_KEYS][4];
+  __shared__ float rowscale[16];
+  __shared__ int full_count;
+  // valid prefix length (DSA emits valid pools first): counted in parallel instead of a serial binary search
+  if(tid==0)full_count=0;
+  __syncthreads();
+  {int cnt=0;for(int s=tid;s<slots-3;s+=128)cnt+=selected[(long long)query*slots+s]>=0;
+   for(int o2=16;o2;o2>>=1)cnt+=__shfl_xor_sync(0xffffffff,cnt,o2);if(lane==0&&cnt)atomicAdd(&full_count,cnt);}
+  const int dbase=warp*128;
+  uint32_t qa[8][4],ql[8][4];   // hi / lo A fragments over this warp's 128 dims: 8 k16-steps
+  {const float* q0=q+(long long)(h0+g)*query_stride+(long long)query*512+dbase;const float* q1=q0+8LL*query_stride;
+#pragma unroll
+   for(int s=0;s<8;++s){const int k=s*16+2*t;
+     tch_split2(q0[k],q0[k+1],qa[s][0],ql[s][0]);tch_split2(q1[k],q1[k+1],qa[s][1],ql[s][1]);
+     tch_split2(q0[k+8],q0[k+9],qa[s][2],ql[s][2]);tch_split2(q1[k+8],q1[k+9],qa[s][3],ql[s][3]);}}
+  float o[16][4];
+#pragma unroll
+  for(int n=0;n<16;++n){o[n][0]=o[n][1]=o[n][2]=o[n][3]=0.f;}
+  float maximum=-CUDART_INF_F,total=0.f;
+  __syncthreads();
+  const int nkeys=full_count+3;
+  // key range of this split: whole TCL_KEYS tiles of the enumerated (prefix + tail) key list
+  const int chunk=((nkeys+splits-1)/splits+TCL_KEYS-1)/TCL_KEYS*TCL_KEYS,kbeg=part*chunk,kend=min(nkeys,kbeg+chunk);
+  if(kbeg>=kend){   // no keys in this split: statistics only (merge_latent_nz skips it)
+    if(tid<16){float* b=out+((long long)(part*heads+h0+tid)*queries+query)*514;b[512]=-CUDART_INF_F;b[513]=0.f;}
+    return;}
+  for(int base=kbeg;base<kend;base+=TCL_KEYS){
+    if(tid<TCL_KEYS){const int key=base+tid;const int slot=key<full_count?key:slots-3+key-full_count;
+      pos[tid]=key<kend?selected[(long long)query*slots+slot]:-1;}
+    __syncthreads();
+    if constexpr(FP8){
+      const uint8_t* lat8=reinterpret_cast<const uint8_t*>(latent);
+      for(int i=tid;i<TCL_KEYS*64;i+=128){const int key=i>>6,col=(i&63)*8;const long long p=pos[key];
+        half hv[8];
+        if(p>=0){const uint8_t* row=lat8+p*KV8_ROW;const float sc=reinterpret_cast<const float*>(row+512)[col>>7];
+          const uint2 raw=*reinterpret_cast<const uint2*>(row+col);const uint8_t* b=reinterpret_cast<const uint8_t*>(&raw);
+#pragma unroll
+          for(int e=0;e<8;++e){__nv_fp8_e4m3 v;v.__x=b[e];hv[e]=__float2half_rn(float(v));}
+          if((i&15)==0)ksc[key][col>>7]=sc;}
+        else{
+#pragma unroll
+          for(int e=0;e<8;++e)hv[e]=__float2half_rn(0.f);
+          if((i&15)==0)ksc[key][col>>7]=0.f;}
+        *reinterpret_cast<uint4*>(keys+key*TCL_LD+col)=*reinterpret_cast<const uint4*>(hv);}
+    }else{
+      for(int i=tid;i<TCL_KEYS*64;i+=128){const int key=i>>6,col=(i&63)*8;const long long p=pos[key];
+        *reinterpret_cast<uint4*>(keys+key*TCL_LD+col)=p>=0?*reinterpret_cast<const uint4*>(latent+p*512+col):make_uint4(0,0,0,0);}
+    }
+    __syncthreads();
+    float c[4][4];
+#pragma unroll
+    for(int j=0;j<4;++j){c[j][0]=c[j][1]=c[j][2]=c[j][3]=0.f;}
+#pragma unroll
+    for(int s=0;s<8;++s){
+#pragma unroll
+      for(int j=0;j<4;++j){const half* kr=keys+(j*8+g)*TCL_LD+dbase+s*16+2*t;
+        const uint32_t b0=*reinterpret_cast<const uint32_t*>(kr),b1=*reinterpret_cast<const uint32_t*>(kr+8);
+        tch_mma16(c[j],qa[s][0],qa[s][1],qa[s][2],qa[s][3],b0,b1);tch_mma16(c[j],ql[s][0],ql[s][1],ql[s][2],ql[s][3],b0,b1);}
+    }
+#pragma unroll
+    for(int j=0;j<4;++j){const float s0=ksc[j*8+2*t][warp],s1=ksc[j*8+2*t+1][warp];
+      spart[warp][g][j*8+2*t]=c[j][0]*s0;spart[warp][g][j*8+2*t+1]=c[j][1]*s1;
+      spart[warp][g+8][j*8+2*t]=c[j][2]*s0;spart[warp][g+8][j*8+2*t+1]=c[j][3]*s1;}
+    __syncthreads();
+    {const int r=tid>>3,k0=(tid&7)*4;float sc[4],tmax=-CUDART_INF_F;
+#pragma unroll
+     for(int i=0;i<4;++i){const int k=k0+i;
+       sc[i]=pos[k]>=0?((spart[0][r][k]+spart[1][r][k])+(spart[2][r][k]+spart[3][r][k]))*(1.f/16.f):-CUDART_INF_F;
+       tmax=fmaxf(tmax,sc[i]);}
+     tmax=fmaxf(tmax,__shfl_xor_sync(0xffffffff,tmax,1));tmax=fmaxf(tmax,__shfl_xor_sync(0xffffffff,tmax,2));
+     tmax=fmaxf(tmax,__shfl_xor_sync(0xffffffff,tmax,4));
+     const float next=fmaxf(maximum,tmax),old_scale=total>0.f?expf(maximum-next):0.f;
+     float psum=0.f;
+#pragma unroll
+     for(int i=0;i<4;++i){const float p=pos[k0+i]>=0?expf(sc[i]-next):0.f;prob[r][k0+i]=p;psum+=p;}
+     psum+=__shfl_xor_sync(0xffffffff,psum,1);psum+=__shfl_xor_sync(0xffffffff,psum,2);psum+=__shfl_xor_sync(0xffffffff,psum,4);
+     total=total*old_scale+psum;if(next>-CUDART_INF_F)maximum=next;
+     if((tid&7)==0)rowscale[r]=old_scale;}
+    __syncthreads();
+    {const float s0=rowscale[g],s1=rowscale[g+8];
+#pragma unroll
+     for(int n=0;n<16;++n){o[n][0]*=s0;o[n][1]*=s0;o[n][2]*=s1;o[n][3]*=s1;}}
+#pragma unroll
+    for(int ks=0;ks<TCL_KEYS;ks+=16){
+      const float c0=ksc[ks+2*t][warp],c1=ksc[ks+2*t+1][warp],c8=ksc[ks+2*t+8][warp],c9=ksc[ks+2*t+9][warp];
+      uint32_t a0,a1,a2,a3,l0,l1,l2,l3;
+      tch_split2(prob[g][ks+2*t]*c0,prob[g][ks+2*t+1]*c1,a0,l0);tch_split2(prob[g+8][ks+2*t]*c0,prob[g+8][ks+2*t+1]*c1,a1,l1);
+      tch_split2(prob[g][ks+2*t+8]*c8,prob[g][ks+2*t+9]*c9,a2,l2);tch_split2(prob[g+8][ks+2*t+8]*c8,prob[g+8][ks+2*t+9]*c9,a3,l3);
+      const half* v0=keys+(ks+2*t)*TCL_LD+dbase+g;
+#pragma unroll
+      for(int n=0;n<16;++n){const half* v=v0+n*8;
+        const uint32_t b0=tch_pack_h(v[0],v[TCL_LD]),b1=tch_pack_h(v[8*TCL_LD],v[9*TCL_LD]);
+        tch_mma16(o[n],a0,a1,a2,a3,b0,b1);tch_mma16(o[n],l0,l1,l2,l3,b0,b1);}
+    }
+    __syncthreads();
+  }
+  __shared__ float rtotal[16],rmax[16];
+  if((tid&7)==0){rtotal[tid>>3]=total;rmax[tid>>3]=maximum;}
+  __syncthreads();
+  if(splits==1){
+    const float i0=1.f/rtotal[g],i1=1.f/rtotal[g+8];
+    float* out0=out+((long long)(h0+g)*queries+query)*512+dbase+2*t;
+    float* out1=out+((long long)(h0+g+8)*queries+query)*512+dbase+2*t;
+#pragma unroll
+    for(int n=0;n<16;++n){*reinterpret_cast<float2*>(out0+n*8)=make_float2(o[n][0]*i0,o[n][1]*i0);
+      *reinterpret_cast<float2*>(out1+n*8)=make_float2(o[n][2]*i1,o[n][3]*i1);}
+  }else{
+    // unnormalized partial + (max, total) in merge_latent's scratch layout
+    float* out0=out+((long long)(part*heads+h0+g)*queries+query)*514+dbase+2*t;
+    float* out1=out+((long long)(part*heads+h0+g+8)*queries+query)*514+dbase+2*t;
+#pragma unroll
+    for(int n=0;n<16;++n){*reinterpret_cast<float2*>(out0+n*8)=make_float2(o[n][0],o[n][1]);
+      *reinterpret_cast<float2*>(out1+n*8)=make_float2(o[n][2],o[n][3]);}
+    if(tid<16){float* b=out+((long long)(part*heads+h0+tid)*queries+query)*514;b[512]=rmax[tid];b[513]=rtotal[tid];}
+  }
+}
+
+// merge_latent that skips empty splits (total 0: their partial rows were never written)
+__global__ void merge_latent_nz(const float* partial,float* out,int heads,int queries,int splits){
+    int row=blockIdx.x;float maximum=-CUDART_INF_F;
+    for(int s=0;s<splits;++s)maximum=fmaxf(maximum,partial[(s*heads*queries+row)*514+512]);
+    float scale[8],denom=0.f;
+    for(int s=0;s<splits;++s){int base=(s*heads*queries+row)*514;scale[s]=partial[base+513]>0.f?expf(partial[base+512]-maximum):0.f;denom+=partial[base+513]*scale[s];}
+    for(int j=0;j<4;++j){int dim=threadIdx.x+j*128;float value=0.f;for(int s=0;s<splits;++s)if(scale[s]>0.f)value+=partial[(s*heads*queries+row)*514+dim]*scale[s];out[row*512+dim]=value/denom;}
+}
+extern "C" int glm53_latent_attention_fp8_tc_cuda(const float* q,const void* latent,const long long* selected,
+    float* out,float* scratch,int heads,int queries,int slots,int query_stride,int splits,cudaStream_t stream) {
+    if(heads%16 || queries<1 || slots<4 || splits<1 || splits>8)return int(cudaErrorInvalidValue);
+    latent_tc16_dec<true><<<dim3(queries,heads/16,splits),128,0,stream>>>(q,(const half*)latent,selected,splits>1?scratch:out,heads,queries,slots,query_stride,splits);
+    if(splits>1)merge_latent_nz<<<heads*queries,128,0,stream>>>(scratch,out,heads,queries,splits);
+    return int(cudaGetLastError());
+}

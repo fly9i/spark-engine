@@ -55,6 +55,8 @@ pub(crate) fn store_rows_at(latent:&Tensor,rows:&Tensor,start:i64) {
 }
 /// Selected rows follow DSA layout: valid full-pool slots, invalid padding,
 /// then three independent tail slots. Arbitrary holes are not accepted.
+/// GLM53_MLA_DECODE_TC=1: FP8-latent sparse attention on tensor cores (L1, off by default).
+pub(crate) fn decode_tc()->bool {static ON:std::sync::OnceLock<bool>=std::sync::OnceLock::new();*ON.get_or_init(||std::env::var("GLM53_MLA_DECODE_TC").as_deref()==Ok("1"))}
 pub(crate) fn node_batch_enabled()->bool {std::env::var("GLM53_MLA_NODE_BATCH").as_deref()==Ok("1")}
 pub(crate) fn sparse_attention(q:&Tensor,latent:&Tensor,selected:&Tensor)->Tensor {sparse_attention_splits(q,latent,selected,None)}
 /// `splits`: None = the size rule below; Some(n) forces n (batched chain nodes keep the per-node split count).
@@ -66,6 +68,14 @@ pub(crate) fn sparse_attention_splits(q:&Tensor,latent:&Tensor,selected:&Tensor,
     assert!(selected.is_contiguous());assert_eq!(selected.kind(),Kind::Int64);
     let slots=selected.numel() as i64/queries;assert_eq!(selected.numel() as i64,queries*slots);
     let out=Tensor::empty([heads,queries,512],(Kind::Float,q.device()));
+    if is_fp8(latent) && heads%16==0 && decode_tc() {
+        // tensor-core decode attention (L1): a forced split count is kept (capped at merge_latent's 8)
+        let splits=splits.unwrap_or(if queries<=4{8}else{4}).clamp(1,8);
+        let scratch=Tensor::empty([if splits>1{splits*heads*queries*514}else{0}],(Kind::Float,q.device()));
+        extern "C" {fn rs_latent_attention_fp8_tc(q:*const f32,c:*const std::ffi::c_void,ids:*const i64,out:*mut f32,scratch:*mut f32,h:i32,t:i32,s:i32,stride:i32,splits:i32)->i32;}
+        assert_eq!(unsafe{rs_latent_attention_fp8_tc(q.data_ptr().cast(),latent.data_ptr(),selected.data_ptr().cast(),out.data_ptr().cast(),scratch.data_ptr().cast(),heads as i32,queries as i32,slots as i32,q.stride()[0] as i32,splits as i32)},0,"latent attention (TC)");
+        return out;
+    }
     let splits=splits.unwrap_or(if queries*heads<192{8}else{1});
     let scratch=Tensor::empty([if splits>1{splits*heads*queries*514}else{0}],(Kind::Float,q.device()));
     extern "C" {fn rs_latent_attention(q:*const f32,c:*const std::ffi::c_void,ids:*const i64,out:*mut f32,scratch:*mut f32,h:i32,t:i32,s:i32,stride:i32,splits:i32)->i32;
@@ -399,11 +409,12 @@ pub fn chunk(w:&MlaWeights,x:&Tensor,st:&mut State)->Tensor {
         let rows:Vec<_>=(0..t).map(|i|step(w,&x.narrow(0,i,1),st)).collect();
         return Tensor::cat(&rows,0);
     }
+    crate::spx_hess::add(crate::spx_hess::MLA_IN,x);
     let heads=w.q_b.size()[0]/256;
-    let (qa_out,kva_out)=qa_kva(w,x);let cq=norm(qa_out,&w.q_a_ln);
+    let (qa_out,kva_out)=qa_kva(w,x);let cq=norm(qa_out,&w.q_a_ln);crate::spx_hess::add(crate::spx_hess::MLA_QB,&cq);
     let strided=prefill_strided() && st.wk.is_contiguous() && st.wv.is_contiguous() && st.wk.kind()==Kind::Float && st.wv.kind()==Kind::Float;
     let qb=mm16(&cq,&w.q_b);let q=qb.view([t,heads,256]).transpose(0,1);
-    let latent=norm(kva_out,&w.kv_a_ln).to_kind(Kind::Half);
+    let latent=crate::spx_hess::tap(crate::spx_hess::MLA_KVB,&norm(kva_out,&w.kv_a_ln)).to_kind(Kind::Half);
     let index=w.indexer.as_ref().unwrap();let projected=index.project(x,&cq);
     // GLM53_MLA_PREFILL_STRIDED=1 (L1): q read in place ([t, heads*256], batch stride 256) by a strided TF32 GEMM.
     let absorbed=if strided && qb.is_contiguous() {let a=Tensor::empty([heads,t,512],(Kind::Float,x.device()));
@@ -427,16 +438,16 @@ pub fn chunk(w:&MlaWeights,x:&Tensor,st:&mut State)->Tensor {
         if t>128 && std::env::var("GLM53_PREFILL_MLA_HALF_OUT").as_deref()==Ok("1") && w.wo.kind()==Kind::Half {
             let y=attended.bmm(&st.wv);
             let hidden=Tensor::empty([t,heads,256],(Kind::Half,y.device()));let _=hidden.shallow_clone().copy_(&y.transpose(0,1));
-            return row_mm16(&hidden.view([t,heads*256]),&w.wo);
+            return row_mm16(crate::spx_hess::tap(crate::spx_hess::MLA_O,&hidden.view([t,heads*256])),&w.wo);
         }
         if strided && attended.is_contiguous() && attended.size()==[heads,t,512] && attended.kind()==Kind::Float {
             // the expand written straight into o_proj's [t, heads*256] layout (no transpose/reshape copy)
             let hidden=Tensor::empty([t,heads*256],(Kind::Float,x.device()));
             bmm_tf32(&attended,512,t*512,&st.wv,256,512*256,&hidden,heads*256,256,t,256,512,heads);
-            return row_mm16(&hidden,&w.wo);
+            return row_mm16(crate::spx_hess::tap(crate::spx_hess::MLA_O,&hidden),&w.wo);
         }
         let hidden=attended.bmm(&st.wv).transpose(0,1).reshape([t,heads*256]);
-        return row_mm16(&hidden,&w.wo);
+        return row_mm16(crate::spx_hess::tap(crate::spx_hess::MLA_O,&hidden),&w.wo);
     }
     let mut rows=Vec::new();
     for i in 0..t {
@@ -454,7 +465,7 @@ pub fn chunk(w:&MlaWeights,x:&Tensor,st:&mut State)->Tensor {
         st.len.copy_(&(&st.len+1));
     }
     let hidden=Tensor::cat(&rows,1).bmm(&st.wv).transpose(0,1).reshape([t,heads*256]);
-    row_mm16(&hidden,&w.wo)
+    row_mm16(crate::spx_hess::tap(crate::spx_hess::MLA_O,&hidden),&w.wo)
 }
 
 /// Every branch inherits only its ancestors' latent/indexer state.
@@ -951,4 +962,28 @@ fn mla_taps(cq:&Tensor,qb:&Tensor,absorbed:&Tensor,latent:&Tensor,projected:Opti
     use crate::forward::probe_inner as tap;
     tap("mla_cq",cq);tap("mla_qb",qb);tap("mla_absorbed",&absorbed.transpose(0,1));tap("mla_latent",latent);
     if let Some(p)=projected {tap("mla_idx_q",&p.q);tap("mla_idx_k",&p.k);tap("mla_idx_gate",&p.gate);tap("mla_idx_mixing",&p.mixing);}
+}
+
+/// `mla-tc-test`: tensor-core decode attention vs sparse_latent on a random FP8 latent cache (max |diff|, timing).
+pub fn tc_test() {
+    let dev=tch::Device::Cuda(0);let _g=tch::no_grad_guard();
+    extern "C" {fn rs_latent_attention_fp8(q:*const f32,c:*const std::ffi::c_void,ids:*const i64,out:*mut f32,scratch:*mut f32,h:i32,t:i32,s:i32,stride:i32,splits:i32)->i32;
+        fn rs_latent_attention_fp8_tc(q:*const f32,c:*const std::ffi::c_void,ids:*const i64,out:*mut f32,scratch:*mut f32,h:i32,t:i32,s:i32,stride:i32,splits:i32)->i32;}
+    let (heads,ctx,slots)=(32i64,8192i64,2051i64);
+    let latent=Tensor::randint(120,[ctx,528],(Kind::Uint8,dev));
+    let _=latent.narrow(1,512,16).copy_(&(Tensor::rand([ctx,4],(Kind::Float,dev))*0.05+0.01).view_dtype(Kind::Uint8).reshape([ctx,16]));
+    for &m in &[1i64,2,4,8,16] { for &valid in &[2048i64,700,5] {
+        let q=Tensor::randn([heads,m,512],(Kind::Float,dev))*0.3;
+        let sel=Tensor::randint(ctx,[m,slots],(Kind::Int64,dev));
+        let _=sel.narrow(1,valid.min(slots-3),slots-3-valid.min(slots-3)).fill_(-1);
+        for &sp in &[1i64,4,8] {
+            let o0=Tensor::empty([heads,m,512],(Kind::Float,dev));let o1=o0.empty_like();let scr=Tensor::empty([8*heads*m*514],(Kind::Float,dev));
+            let run=|tc:bool,o:&Tensor|{let f=if tc{rs_latent_attention_fp8_tc}else{rs_latent_attention_fp8};
+                assert_eq!(unsafe{f(q.data_ptr().cast(),latent.data_ptr(),sel.data_ptr().cast(),o.data_ptr().cast(),scr.data_ptr().cast(),heads as i32,m as i32,slots as i32,q.stride()[0] as i32,sp as i32)},0);};
+            let time=|tc:bool,o:&Tensor|{for _ in 0..3{run(tc,o);}tch::Cuda::synchronize(0);let t=std::time::Instant::now();for _ in 0..20{run(tc,o);}tch::Cuda::synchronize(0);t.elapsed().as_secs_f64()*1e6/20.0};
+            let (t0,t1)=(time(false,&o0),time(true,&o1));
+            let d=(&o1-&o0).abs().max().double_value(&[]);let a=o0.abs().max().double_value(&[]);
+            eprintln!("[mla-tc] rows {m} valid {valid} splits {sp}: max|diff| {d:.2e} (|ref| {a:.2}) sparse_latent {t0:.1} us, tc {t1:.1} us");
+        }
+    }}
 }

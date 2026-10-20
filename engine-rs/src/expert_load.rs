@@ -3,7 +3,8 @@
 //!
 //! Every MoE layer's experts are laid out, for this rank, as one arena: per expert, per projection
 //! (gate, up, down) the rank slice of the trellis, then suh, then svh (the same TP split as
-//! moefast::load_expert_raw). A reader thread fills one pinned host buffer per layer from the checkpoint
+//! moefast::load_expert_raw). Records are back to back; their sizes may differ per expert (mixed-K
+//! checkpoints: the trellis width is 16 K), so each layer has its own record offsets. A reader thread fills one pinned host buffer per layer from the checkpoint
 //! shards (one O_DIRECT read per expert of its contiguous ~10 MiB region, slices copied out on a small
 //! worker pool). An upload thread copies each buffer to one device arena with an SM copy kernel (the
 //! pinned buffer is the same DRAM on GB10, read at device-memory speed) and recycles it. The serve path starts both at
@@ -44,7 +45,7 @@ fn mem_available() -> i64 {
 /// Source entries of one expert projection.
 struct ProjPlan { tr: Entry, suh: Entry, svh: Entry, down: bool }
 
-/// This rank's slice geometry, identical for every expert of every MoE layer.
+/// This rank's slice geometry of one expert record.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct Layout {
     pub tr_shape: [[usize; 3]; 3],
@@ -53,35 +54,62 @@ pub(crate) struct Layout {
     /// Byte offsets of (trellis, suh, svh) of each projection inside an expert record.
     pub offs: [[usize; 3]; 3],
     pub expert_bytes: usize,
-    pub n_experts: usize,
-    pub layer_bytes: usize,
 }
 
 impl Layout {
-    fn of(p: &[ProjPlan; 3], tp: Tp, n_experts: usize) -> Layout {
-        let w = tp.world;
+    /// The record of one expert holding `part` of its intermediate (crate::moefast::expert_part: TP2 halves, TP3 6/5/5).
+    fn of(p: &[ProjPlan; 3], part: crate::tp::Part) -> Layout {
         let mut tr_shape = [[0; 3]; 3];
         let (mut suh_len, mut svh_len, mut offs) = ([0; 3], [0; 3], [[0; 3]; 3]);
         let mut at = 0;
+        let cut = |n: usize| part.range(n as i64).1 as usize;
         for (pi, q) in p.iter().enumerate() {
             let s = &q.tr.shape;
             let (suh, svh) = (q.suh.nbytes / 2, q.svh.nbytes / 2);
-            (tr_shape[pi], suh_len[pi], svh_len[pi]) = if w == 1 { ([s[0], s[1], s[2]], suh, svh) }
-                else if q.down { ([s[0] / w, s[1], s[2]], suh / w, svh) }
-                else { ([s[0], s[1] / w, s[2]], suh, svh / w) };
+            (tr_shape[pi], suh_len[pi], svh_len[pi]) = if part.is_full() { ([s[0], s[1], s[2]], suh, svh) }
+                else if q.down { ([cut(s[0]), s[1], s[2]], cut(suh), svh) }
+                else { ([s[0], cut(s[1]), s[2]], suh, cut(svh)) };
             let sizes = [tr_shape[pi].iter().product::<usize>() * 2, suh_len[pi] * 2, svh_len[pi] * 2];
             for (j, n) in sizes.into_iter().enumerate() { offs[pi][j] = at; at += pad(n, SEG_ALIGN); }
         }
-        Layout { tr_shape, suh_len, svh_len, offs, expert_bytes: at, n_experts, layer_bytes: pad(at * n_experts, ALIGN) }
+        Layout { tr_shape, suh_len, svh_len, offs, expert_bytes: at }
     }
     fn seg_len(&self, pi: usize, j: usize) -> usize {
         [self.tr_shape[pi].iter().product::<usize>(), self.suh_len[pi], self.svh_len[pi]][j] * 2
     }
 }
 
-/// Owned per-expert source plan; None when the checkpoint lacks the expected tensors or dtypes, or the
-/// geometry is not uniform (the caller then keeps the old path).
-struct Plan { layers: Vec<usize>, experts: Vec<Vec<[ProjPlan; 3]>>, layout: Layout }
+/// One layer arena: the expert records back to back from offset 0 (`at[e]`), the arena padded to ALIGN. With
+/// equal records this is exactly the former uniform layout (record e at e * expert_bytes).
+#[derive(Clone, Debug)]
+pub(crate) struct LayerLayout { pub recs: Vec<Layout>, pub at: Vec<usize>, pub bytes: usize }
+
+impl LayerLayout {
+    fn of(recs: Vec<Layout>) -> Self {
+        let mut at = Vec::with_capacity(recs.len());
+        let mut o = 0;
+        for r in &recs { at.push(o); o += r.expert_bytes; }
+        Self { recs, at, bytes: pad(o, ALIGN) }
+    }
+    /// Bytes of the records of experts e0..e0+n.
+    fn span(&self, e0: usize, n: usize) -> usize {
+        let end = if e0 + n < self.at.len() { self.at[e0 + n] } else { self.at[e0 + n - 1] + self.recs[e0 + n - 1].expert_bytes };
+        end - self.at[e0]
+    }
+    fn mixed(&self) -> bool { self.recs.iter().any(|r| *r != self.recs[0]) }
+}
+
+/// Split the front of `buf` into the records of experts e0..e0+n.
+fn split_records<'a>(ll: &LayerLayout, e0: usize, n: usize, buf: &'a mut [u8]) -> Vec<&'a mut [u8]> {
+    let mut rest = &mut buf[..ll.span(e0, n)];
+    let mut v = Vec::with_capacity(n);
+    for e in e0..e0 + n { let (a, b) = std::mem::take(&mut rest).split_at_mut(ll.recs[e].expert_bytes); v.push(a); rest = b; }
+    v
+}
+
+/// Owned per-expert source plan; None when the checkpoint lacks the expected tensors or dtypes, or a slice
+/// does not split evenly over the ranks (the caller then keeps the old path).
+struct Plan { layers: Vec<usize>, experts: Vec<Vec<[ProjPlan; 3]>>, parts: Vec<Vec<crate::tp::Part>>, layouts: Vec<LayerLayout> }
 
 fn plan(idx: &ShardIndex, n_layers: usize, n_experts: usize, tp: Tp) -> Option<Plan> {
     let layers: Vec<usize> = (0..n_layers)
@@ -103,11 +131,15 @@ fn plan(idx: &ShardIndex, n_layers: usize, n_experts: usize, tp: Tp) -> Option<P
         }
         experts.push(v);
     }
-    let layout = Layout::of(experts.first()?.first()?, tp, n_experts);
-    let divisible = |p: &ProjPlan| tp.world == 1 || if p.down { p.tr.shape[0] % tp.world == 0 && p.suh.nbytes % (2 * tp.world) == 0 }
-        else { p.tr.shape[1] % tp.world == 0 && p.svh.nbytes % (2 * tp.world) == 0 };
-    if !experts.iter().flatten().all(|p| p.iter().all(divisible) && Layout::of(p, tp, n_experts) == layout) { return None; }
-    Some(Plan { layers, experts, layout })
+    experts.first()?.first()?;
+    // every expert's part on this rank (an expert held elsewhere, the TP3 holders layout: not covered here)
+    let mut parts = Vec::with_capacity(layers.len());
+    for &l in &layers { parts.push((0..n_experts).map(|e| crate::moefast::expert_part(l, e, tp)).collect::<Option<Vec<_>>>()?); }
+    let divisible = |p: &ProjPlan, part: &crate::tp::Part| { let u = part.units as usize;
+        if p.down { p.tr.shape[0] % u == 0 && (p.suh.nbytes / 2) % u == 0 } else { p.tr.shape[1] % u == 0 && (p.svh.nbytes / 2) % u == 0 } };
+    if !experts.iter().zip(&parts).all(|(v, ps)| v.iter().zip(ps).all(|(p, part)| p.iter().all(|q| divisible(q, part)))) { return None; }
+    let layouts = experts.iter().zip(&parts).map(|(v, ps)| LayerLayout::of(v.iter().zip(ps).map(|(p, part)| Layout::of(p, *part)).collect())).collect();
+    Some(Plan { layers, experts, parts, layouts })
 }
 
 /// Reusable host buffer with an ALIGN-aligned window (O_DIRECT source/destination).
@@ -223,18 +255,20 @@ fn read_full(f: &std::fs::File, dst: &mut [u8], at: u64) -> std::io::Result<usiz
 
 /// Write this rank's slices of one expert into `dst` (one expert record of the layout) from the shards.
 /// Each expert's trellis tensors are adjacent, so the pieces merge into one ~10 MiB read.
-fn fill_from_shards(files: &DirectFiles, p: &[ProjPlan; 3], lay: &Layout, tp: Tp, bufs: &mut Vec<AlignedBuf>, dst: &mut [u8]) {
+fn fill_from_shards(files: &DirectFiles, p: &[ProjPlan; 3], lay: &Layout, part: crate::tp::Part, bufs: &mut Vec<AlignedBuf>, dst: &mut [u8]) {
     const GAP: usize = 1 << 20;
-    let (rank, world) = (tp.rank, tp.world);
+    let full = part.is_full();
+    let lo = |n: usize| part.range(n as i64).0 as usize;   // first element of this rank's part in a dimension of n
     // Source byte range of every piece: (file, offset, len), in (tr, suh, svh) x projection order.
     let mut pieces: Vec<(&str, usize, usize)> = Vec::with_capacity(9);
     for (pi, q) in p.iter().enumerate() {
         let tr_len = lay.seg_len(pi, 0);
-        let tr_off = if q.down && world > 1 { q.tr.offset + rank * tr_len } else { q.tr.offset };
-        pieces.push((&q.tr.file, tr_off, if q.down || world == 1 { tr_len } else { q.tr.nbytes }));
+        let row_bytes = q.tr.shape[1] * q.tr.shape[2] * 2;
+        let tr_off = if q.down && !full { q.tr.offset + lo(q.tr.shape[0]) * row_bytes } else { q.tr.offset };
+        pieces.push((&q.tr.file, tr_off, if q.down || full { tr_len } else { q.tr.nbytes }));
         let (suh, svh) = (lay.seg_len(pi, 1), lay.seg_len(pi, 2));
-        pieces.push((&q.suh.file, q.suh.offset + if q.down && world > 1 { rank * suh } else { 0 }, suh));
-        pieces.push((&q.svh.file, q.svh.offset + if !q.down && world > 1 { rank * svh } else { 0 }, svh));
+        pieces.push((&q.suh.file, q.suh.offset + if q.down && !full { lo(q.suh.nbytes / 2) * 2 } else { 0 }, suh));
+        pieces.push((&q.svh.file, q.svh.offset + if !q.down && !full { lo(q.svh.nbytes / 2) * 2 } else { 0 }, svh));
     }
     let mut order: Vec<usize> = (0..pieces.len()).collect();
     order.sort_by_key(|&i| (pieces[i].0, pieces[i].1));
@@ -255,15 +289,15 @@ fn fill_from_shards(files: &DirectFiles, p: &[ProjPlan; 3], lay: &Layout, tp: Tp
     for (pi, q) in p.iter().enumerate() {
         let o = lay.offs[pi];
         let tr = src(pi * 3);
-        if q.down || world == 1 {
+        if q.down || full {
             dst[o[0]..o[0] + tr.len()].copy_from_slice(tr);
         } else {
-            // Column split: each of the kt rows keeps its nth-wide slice.
+            // Column split: each of the kt rows keeps this rank's nth-wide slice.
             let [kt, nth, wd] = lay.tr_shape[pi];
-            let (row, part) = (nth * world * wd * 2, nth * wd * 2);
+            let (row, width, c0) = (q.tr.shape[1] * wd * 2, nth * wd * 2, lo(q.tr.shape[1]) * wd * 2);
             for r in 0..kt {
-                let s = r * row + rank * part;
-                dst[o[0] + r * part..o[0] + (r + 1) * part].copy_from_slice(&tr[s..s + part]);
+                let s = r * row + c0;
+                dst[o[0] + r * width..o[0] + (r + 1) * width].copy_from_slice(&tr[s..s + width]);
             }
         }
         for j in 1..3 { let s = src(pi * 3 + j); dst[o[j]..o[j] + s.len()].copy_from_slice(s); }
@@ -281,17 +315,18 @@ fn read_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-/// Fill consecutive expert records (one per entry of `experts`) at the front of `buf` on the rayon pool.
-fn fill_records(files: &DirectFiles, experts: &[[ProjPlan; 3]], lay: &Layout, tp: Tp, buf: &mut [u8]) {
-    buf[..lay.expert_bytes * experts.len()].par_chunks_mut(lay.expert_bytes).zip(experts.par_iter())
-        .for_each_init(Vec::new, |bufs, (dst, p)| { dst.fill(0); fill_from_shards(files, p, lay, tp, bufs, dst) });
+/// Fill the records of experts e0..e0+experts.len() at the front of `buf` on the rayon pool.
+fn fill_records(files: &DirectFiles, experts: &[[ProjPlan; 3]], parts: &[crate::tp::Part], ll: &LayerLayout, e0: usize, buf: &mut [u8]) {
+    split_records(ll, e0, experts.len(), buf).into_par_iter().zip(experts.par_iter()).enumerate()
+        .for_each_init(Vec::new, |bufs, (i, (dst, p))| { dst.fill(0); fill_from_shards(files, p, &ll.recs[e0 + i], parts[i], bufs, dst) });
 }
 
 /// GLM53_LOAD_CHECK=1: each of the `n` records at the front of `buf` (experts e0..e0+n of `layer`) must equal
 /// the old reader's upload values.
-fn check_records(idx: &ShardIndex, layer: usize, e0: usize, n: usize, lay: &Layout, tp: Tp, buf: &[u8]) {
-    buf[..lay.expert_bytes * n].par_chunks(lay.expert_bytes).enumerate().for_each(|(i, rec)| {
+fn check_records(idx: &ShardIndex, layer: usize, e0: usize, n: usize, ll: &LayerLayout, tp: Tp, buf: &mut [u8]) {
+    split_records(ll, e0, n, buf).into_par_iter().enumerate().for_each(|(i, rec)| {
         let e = e0 + i;
+        let lay = &ll.recs[e];
         let old = crate::moefast::load_expert_raw(idx, layer, e, tp);
         for (pi, (tr, shape, suh, svh)) in old.iter().enumerate() {
             let ctx = format!("GLM53_LOAD_CHECK: layer {layer} expert {e} projection {pi}");
@@ -309,7 +344,7 @@ fn check_records(idx: &ShardIndex, layer: usize, e0: usize, n: usize, lay: &Layo
 }
 
 /// Experts e0..e0+n of one layer in a pinned staging buffer, with their gate/up suh values.
-struct Chunk { layer: usize, e0: usize, n: usize, buf: HostBuf, suh: Vec<(Vec<f32>, Vec<f32>)> }
+struct Chunk { li: usize, layer: usize, e0: usize, n: usize, buf: HostBuf, suh: Vec<(Vec<f32>, Vec<f32>)> }
 
 /// Staging chunk size: pinned host memory is not reclaimable, so it stays small (two ~256 MiB buffers rather than
 /// two whole ~1.8 GB layers) to keep the load's peak under the serving footprint.
@@ -319,7 +354,7 @@ const CHUNK_BYTES: usize = 256 << 20;
 pub(crate) struct Loaded { pub layer: usize, pub arena: Tensor, pub suh: Vec<(Vec<f32>, Vec<f32>)> }
 
 #[derive(Default)]
-struct Stats { read_s: f64, upload_s: f64, alloc_s: f64, alloc_wait_s: f64, gate_s: f64, wait_s: f64, pinned: usize, direct: String }
+struct Stats { read_s: f64, upload_s: f64, alloc_s: f64, alloc_wait_s: f64, gate_s: f64, wait_s: f64, pinned: usize, direct: String, mixed: usize }
 
 /// Background expert reader + uploader; consumed layer by layer by MoeFast::preload_all_with.
 pub struct ExpertReader {
@@ -330,7 +365,7 @@ pub struct ExpertReader {
     pub(crate) layers: Vec<usize>,
     pub(crate) n_experts: usize,
     pub(crate) tp: Tp,
-    pub(crate) layout: Layout,
+    pub(crate) layouts: Vec<LayerLayout>,
     t0: Instant,
 }
 
@@ -343,12 +378,25 @@ impl ExpertReader {
         let idx = ShardIndex::scan(dir).ok()?;
         let plan = plan(&idx, n_layers, n_experts, tp)?;
         let files = DirectFiles::open(&idx.dir, &plan);
-        let (layers, layout) = (plan.layers.clone(), plan.layout.clone());
+        let (layers, layouts) = (plan.layers.clone(), plan.layouts.clone());
+        assert!(layouts.iter().flat_map(|l| &l.recs).all(|r| r.expert_bytes % 16 == 0), "expert record size must be 16-byte aligned for the upload kernel");
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Mutex::new(Stats {
-            direct: format!("O_DIRECT {}/{} shards", files.direct(), files.files.len()), ..Default::default() }));
-        // Two pinned chunk buffers: the reader fills one while the uploader copies the other.
-        let per_chunk = (CHUNK_BYTES / layout.expert_bytes).clamp(1, layout.n_experts);
+            direct: format!("O_DIRECT {}/{} shards", files.direct(), files.files.len()),
+            mixed: layouts.iter().filter(|l| l.mixed()).count(), ..Default::default() }));
+        // Chunks (layer index, first expert, count): consecutive experts up to CHUNK_BYTES (at least one). Two pinned
+        // buffers of the largest chunk: the reader fills one while the uploader copies the other.
+        let mut chunks = Vec::new();
+        for (li, ll) in layouts.iter().enumerate() {
+            let mut e0 = 0;
+            while e0 < n_experts {
+                let mut n = 1;
+                while e0 + n < n_experts && ll.span(e0, n + 1) <= CHUNK_BYTES { n += 1; }
+                chunks.push((li, e0, n));
+                e0 += n;
+            }
+        }
+        let buf_bytes = chunks.iter().map(|&(li, e0, n)| layouts[li].span(e0, n)).max().unwrap_or(0);
         let (free_tx, free_rx) = sync_channel::<HostBuf>(2);
         let (full_tx, full_rx) = sync_channel::<Chunk>(1);
         let (out_tx, out_rx) = std::sync::mpsc::channel::<Loaded>();
@@ -358,19 +406,20 @@ impl ExpertReader {
         // (76 GB) pushed the prefetched non-expert pages out of the page cache before the main thread read them.
         let (arena_tx, arena_rx) = sync_channel::<Tensor>(1);
         let allocator = {
-            let (stop, stats, n, bytes, after) = (stop.clone(), stats.clone(), layers.len(), layout.layer_bytes as i64, after.clone());
+            let (stop, stats, after) = (stop.clone(), stats.clone(), after.clone());
+            let sizes: Vec<i64> = layouts.iter().map(|l| l.bytes as i64).collect();
             std::thread::spawn(move || {
                 // Not during process-group setup (driver work at process start slowed it 2.4 -> 7 s).
                 for a in &after { a.wait(); }
                 const MARGIN: i64 = 6 << 30;
-                for i in 0..n {
+                for i in 0..sizes.len() {
                     if stop.load(Ordering::Relaxed) { return; }
                     // Leave the not-yet-read prefetched pages alone: MemAvailable counts them as reclaimable, and read-once
                     // pages are the kernel's first victims. Each pending byte also becomes about one byte of non-expert
                     // device memory when the main thread uploads it, so allocate only while MemAvailable minus twice the
                     // pending bytes still fits every remaining arena (plus a margin for staging); otherwise wait.
                     let tg = Instant::now();
-                    let remaining = (n - i) as i64 * bytes;
+                    let remaining: i64 = sizes[i..].iter().sum();
                     loop {
                         let pending = crate::weights::cache_pending_bytes();
                         if pending <= 0 || mem_available() - 2 * pending > remaining + MARGIN || stop.load(Ordering::Relaxed) { break; }
@@ -378,62 +427,60 @@ impl ExpertReader {
                     }
                     stats.lock().unwrap().gate_s += tg.elapsed().as_secs_f64();
                     let t = Instant::now();
-                    let a = Tensor::empty([bytes], (Kind::Uint8, dev));
+                    let a = Tensor::empty([sizes[i]], (Kind::Uint8, dev));
                     stats.lock().unwrap().alloc_s += t.elapsed().as_secs_f64();
                     if arena_tx.send(a).is_err() { return; }
                 }
             })
         };
         let reader = {
-            let (stop, stats, lay) = (stop.clone(), stats.clone(), layout.clone());
+            let (stop, stats, lays) = (stop.clone(), stats.clone(), layouts.clone());
             std::thread::spawn(move || {
                 // Disk and host memory go to the (smaller, earlier-needed) non-expert prefetch first.
                 for a in &after { a.wait(); }
                 stats.lock().unwrap().wait_s = t0.elapsed().as_secs_f64();
                 let mut made = 0;
                 let f32s = |b: &[u8]| b.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect::<Vec<f32>>();
-                for (li, &layer) in plan.layers.iter().enumerate() {
-                    for e0 in (0..lay.n_experts).step_by(per_chunk) {
-                        if stop.load(Ordering::Relaxed) { return; }
-                        let n = per_chunk.min(lay.n_experts - e0);
-                        let mut buf = if made < 2 { made += 1; let b = HostBuf::pinned(per_chunk * lay.expert_bytes); stats.lock().unwrap().pinned += b.pinned as usize; b }
-                            else { match free_rx.recv() { Ok(b) => b, Err(_) => return } };
-                        let t = Instant::now();
-                        read_pool().install(|| fill_records(&files, &plan.experts[li][e0..e0 + n], &lay, tp, buf.bytes_mut()));
-                        if check { check_records(&idx, layer, e0, n, &lay, tp, buf.bytes()); }
-                        let suh = buf.bytes()[..lay.expert_bytes * n].chunks(lay.expert_bytes).map(|r| {
-                            let g = &r[lay.offs[0][1]..lay.offs[0][1] + lay.seg_len(0, 1)];
-                            let u = &r[lay.offs[1][1]..lay.offs[1][1] + lay.seg_len(1, 1)];
-                            (f32s(g), f32s(u))
-                        }).collect();
-                        stats.lock().unwrap().read_s += t.elapsed().as_secs_f64();
-                        if full_tx.send(Chunk { layer, e0, n, buf, suh }).is_err() { return; }
-                    }
+                for (li, e0, n) in chunks {
+                    if stop.load(Ordering::Relaxed) { return; }
+                    let (layer, ll) = (plan.layers[li], &lays[li]);
+                    let mut buf = if made < 2 { made += 1; let b = HostBuf::pinned(buf_bytes); stats.lock().unwrap().pinned += b.pinned as usize; b }
+                        else { match free_rx.recv() { Ok(b) => b, Err(_) => return } };
+                    let t = Instant::now();
+                    read_pool().install(|| fill_records(&files, &plan.experts[li][e0..e0 + n], &plan.parts[li][e0..e0 + n], ll, e0, buf.bytes_mut()));
+                    if check { check_records(&idx, layer, e0, n, ll, tp, buf.bytes_mut()); }
+                    let suh = (e0..e0 + n).map(|e| {
+                        let (r, lay) = (&buf.bytes()[ll.at[e] - ll.at[e0]..], &ll.recs[e]);
+                        let g = &r[lay.offs[0][1]..lay.offs[0][1] + lay.seg_len(0, 1)];
+                        let u = &r[lay.offs[1][1]..lay.offs[1][1] + lay.seg_len(1, 1)];
+                        (f32s(g), f32s(u))
+                    }).collect();
+                    stats.lock().unwrap().read_s += t.elapsed().as_secs_f64();
+                    if full_tx.send(Chunk { li, layer, e0, n, buf, suh }).is_err() { return; }
                 }
             })
         };
         let uploader = {
             let (stop, stats) = (stop.clone(), stats.clone());
-            let layout = layout.clone();
+            let lays = layouts.clone();
             std::thread::spawn(move || {
                 let _guard = tch::no_grad_guard();
                 // Own non-blocking stream: the copies neither wait for nor stall the main thread's work on the
                 // default stream. Each arena is complete (stream synchronized) before it is handed over.
                 let mut stream = std::ptr::null_mut();
                 assert_eq!(unsafe { cudaStreamCreateWithFlags(&mut stream, 1) }, 0, "upload stream");
-                let eb = layout.expert_bytes;
-                assert_eq!(eb % 16, 0, "expert record size must be 16-byte aligned for the upload kernel");
                 let mut cur: Option<(Tensor, Vec<(Vec<f32>, Vec<f32>)>)> = None;
                 for c in full_rx {
                     if stop.load(Ordering::Relaxed) { break; }
                     let t = Instant::now();
                     if c.e0 == 0 {
                         let Ok(arena) = arena_rx.recv() else { break };
-                        cur = Some((arena, Vec::with_capacity(layout.n_experts)));
+                        cur = Some((arena, Vec::with_capacity(n_experts)));
                     }
                     stats.lock().unwrap().alloc_wait_s += t.elapsed().as_secs_f64();
                     let (arena, suh) = cur.as_mut().expect("chunks arrive in order");
-                    let (dst, len) = (unsafe { arena.data_ptr().cast::<u8>().add(c.e0 * eb) }, c.n * eb);
+                    let ll = &lays[c.li];
+                    let (dst, len) = (unsafe { arena.data_ptr().cast::<u8>().add(ll.at[c.e0]) }, ll.span(c.e0, c.n));
                     if c.buf.pinned {
                         extern "C" { fn rs_pinned_to_device(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, bytes: u64, stream: *mut std::ffi::c_void) -> i32; }
                         assert_eq!(unsafe { rs_pinned_to_device(dst.cast(), c.buf.ptr.cast(), len as u64, stream) }, 0, "expert upload kernel");
@@ -445,7 +492,7 @@ impl ExpertReader {
                     stats.lock().unwrap().upload_s += t.elapsed().as_secs_f64();
                     let _ = free_tx.send(c.buf);
                     suh.extend(c.suh);
-                    if c.e0 + c.n == layout.n_experts {
+                    if c.e0 + c.n == n_experts {
                         let (arena, suh) = cur.take().unwrap();
                         if out_tx.send(Loaded { layer: c.layer, arena, suh }).is_err() { break; }
                     }
@@ -453,20 +500,20 @@ impl ExpertReader {
                 unsafe { cudaStreamDestroy(stream) };
             })
         };
-        Some(Self { rx: Some(out_rx), handles: vec![reader, uploader, allocator], stop, stats, layers, n_experts, tp, layout, t0 })
+        Some(Self { rx: Some(out_rx), handles: vec![reader, uploader, allocator], stop, stats, layers, n_experts, tp, layouts, t0 })
     }
 
     pub(crate) fn recv(&self) -> Loaded { self.rx.as_ref().unwrap().recv().expect("expert reader stopped (see the panic above)") }
 
     pub(crate) fn summary(&self) -> String {
         let s = self.stats.lock().unwrap();
-        format!("{}, pinned buffers {}/2, reader started after {:.1}s, read {:.1}s, upload {:.1}s (of which waiting for arenas {:.1}s; arena allocation {:.1}s on its own thread, held back {:.1}s for the prefetched pages), pool reached {:.1}s after start", s.direct, s.pinned, s.wait_s, s.read_s, s.upload_s, s.alloc_wait_s, s.alloc_s, s.gate_s, self.t0.elapsed().as_secs_f64())
+        format!("{}, {} layers with mixed expert records, pinned buffers {}/2, reader started after {:.1}s, read {:.1}s, upload {:.1}s (of which waiting for arenas {:.1}s; arena allocation {:.1}s on its own thread, held back {:.1}s for the prefetched pages), pool reached {:.1}s after start", s.direct, s.mixed, s.pinned, s.wait_s, s.read_s, s.upload_s, s.alloc_wait_s, s.alloc_s, s.gate_s, self.t0.elapsed().as_secs_f64())
     }
 
-    /// Views of expert `e`'s nine tensors (tr, suh, svh x gate/up/down) in a layer arena.
-    pub(crate) fn views(&self, arena: &Tensor, e: usize) -> Vec<Tensor> {
-        let lay = &self.layout;
-        let base = e * lay.expert_bytes;
+    /// Views of expert `e`'s nine tensors (tr, suh, svh x gate/up/down) in the arena of `layer`.
+    pub(crate) fn views(&self, arena: &Tensor, layer: usize, e: usize) -> Vec<Tensor> {
+        let ll = &self.layouts[self.layers.iter().position(|&l| l == layer).expect("reader layer")];
+        let (lay, base) = (&ll.recs[e], ll.at[e]);
         let mut v = Vec::with_capacity(9);
         for pi in 0..3 {
             let seg = |j: usize, kind: Kind| arena.narrow(0, (base + lay.offs[pi][j]) as i64, lay.seg_len(pi, j) as i64).view_dtype(kind);
@@ -486,5 +533,44 @@ impl Drop for ExpertReader {
             // A reader panic already reached the consumer as a closed channel; do not panic again in drop.
             let _ = h.join();
         }
+    }
+}
+
+/// `expert-load-test DIR [N_LAYERS]`: the fast reader for the MoE layers below N_LAYERS (default 8) on every rank of TP2 (or TP3),
+/// GLM53_LOAD_CHECK on (every record compared with the old reader in host memory), then every resident view compared
+/// with moefast::load_expert_raw on the device (trellis shape and bytes, Half suh/svh).
+pub fn load_test(dir: &Path, n_layers: usize) {
+    std::env::set_var("GLM53_LOAD_CHECK", "1");
+    let _g = tch::no_grad_guard();
+    let dev = Device::Cuda(0);
+    let idx = ShardIndex::scan(dir).expect("scan");
+    let n_experts = 288;
+    // GLM53_LOAD_TEST_WORLD (2): 3 checks the TP3 6/5/5 parts
+    let world = std::env::var("GLM53_LOAD_TEST_WORLD").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize);
+    for rank in 0..world {
+        let tp = Tp { rank, world };
+        let t = Instant::now();
+        let r = ExpertReader::start(dir, n_layers, n_experts, tp, dev, Vec::new()).expect("fast reader declined this checkpoint");
+        let mut bad = 0;
+        let mut ks = std::collections::BTreeMap::<i64, usize>::new();
+        for &l in &r.layers.clone() {
+            let got = r.recv();
+            assert_eq!(got.layer, l);
+            for e in 0..n_experts {
+                let v = r.views(&got.arena, l, e);
+                let old = crate::moefast::load_expert_raw(&idx, l, e, tp);
+                for (pi, (tr, shape, suh, svh)) in old.iter().enumerate() {
+                    let tr0 = Tensor::from_slice(tr).view(shape.as_slice());
+                    let s0 = Tensor::from_slice(suh).to_kind(Kind::Half);
+                    let v0 = Tensor::from_slice(svh).to_kind(Kind::Half);
+                    let same = |a: &Tensor, b: &Tensor| a.size() == b.size() && a.to_device(Device::Cpu).view_dtype(Kind::Int16).equal(&b.view_dtype(Kind::Int16));
+                    if !(same(&v[pi * 3], &tr0) && same(&v[pi * 3 + 1], &s0) && same(&v[pi * 3 + 2], &v0)) { bad += 1; }
+                }
+                *ks.entry(crate::moe_own::trellis_bits(&v[0])).or_default() += 1;
+            }
+        }
+        eprintln!("[expert-load-test] rank {rank}: layers {:?}, {} ({:.1}s), K histogram {ks:?}, mismatching projections {bad}",
+            r.layers, r.summary(), t.elapsed().as_secs_f64());
+        assert_eq!(bad, 0);
     }
 }

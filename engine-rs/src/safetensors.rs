@@ -247,6 +247,12 @@ impl ShardIndex {
         unsafe { posix_fadvise(f.as_raw_fd(), e.offset as i64, e.nbytes as i64, 4) };
     }
 
+    /// The `__metadata__` map of one indexed file (re-reads its header; SPX reads its "spx1" entry once per file).
+    pub fn file_metadata(&self, file: &str) -> io::Result<serde_json::Map<String, serde_json::Value>> {
+        let (_, hdr) = read_header(&self.dir.join(file))?;
+        Ok(hdr.get("__metadata__").and_then(|v| v.as_object()).cloned().unwrap_or_default())
+    }
+
     /// 张量原始字节切片(零拷贝,供并行装载/H2D 直传)。
     pub fn get_bytes(&self, name: &str) -> io::Result<&[u8]> {
         let e = self

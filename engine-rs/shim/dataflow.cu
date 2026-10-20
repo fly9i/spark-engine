@@ -115,7 +115,7 @@ __device__ float warp_sum(float x){for(int s=16;s;s>>=1)x+=__shfl_down_sync(0xff
 __device__ float warp_max(float x){for(int s=16;s;s>>=1)x=fmaxf(x,__shfl_down_sync(0xffffffff,x,s));return x;}
 // Short-window tier. Read two segments directly, no cat, FP32 KV expansion,
 // score/probability global buffers, or repeated KV heads.
-// C3: kvh = KV heads held by this rank (8 full, 4 head-parallel TP2); query heads = 4*kvh.
+// C3: kvh = KV heads held by this rank (8 full, 4 head-parallel TP2, 3 / 2 TP3); query heads = 4*kvh.
 __global__ void draft_attention(const __nv_bfloat16* q,const __nv_bfloat16* ck,const __nv_bfloat16* cv,
     const __nv_bfloat16* k,const __nv_bfloat16* v,__nv_bfloat16* out,int history,int n,int kvh){
     const int H=4*kvh;int query=blockIdx.x/H,head=blockIdx.x%H,kvhead=head/4;
@@ -149,7 +149,7 @@ __global__ void draft_attention(const __nv_bfloat16* q,const __nv_bfloat16* ck,c
     out[(query*H+head)*128+threadIdx.x]=__float2bfloat16_rn(acc);
 }
 extern "C" int glm53_draft_attention_cuda(const void* q,const void* ck,const void* cv,const void* k,const void* v,void* out,int history,int n,int kvh,cudaStream_t stream){
-    if(history<0 || history>2048 || n<1 || n>8 || (kvh!=8&&kvh!=4))return int(cudaErrorInvalidValue);
+    if(history<0 || history>2048 || n<1 || n>8 || kvh<1 || kvh>8)return int(cudaErrorInvalidValue);   // TP3: 3 / 2 KV groups
     draft_attention<<<n*4*kvh,128,(history+n)*sizeof(float),stream>>>((const __nv_bfloat16*)q,(const __nv_bfloat16*)ck,(const __nv_bfloat16*)cv,(const __nv_bfloat16*)k,(const __nv_bfloat16*)v,(__nv_bfloat16*)out,history,n,kvh);
     return int(cudaGetLastError());
 }
@@ -388,7 +388,7 @@ __device__ __forceinline__ void router_select_row(int r,int lane,const float* __
     for(int j=0;j<10;++j){const int e=lane+32*j;
         if(e<experts){const float p0=CG?__ldcg(partial+((long long)r*experts+e)*2):partial[((long long)r*experts+e)*2];
             const float p1=CG?__ldcg(partial+((long long)r*experts+e)*2+1):partial[((long long)r*experts+e)*2+1];const float l=p0+p1;
-            score[j]=1.f/(1.f+expf(-l));sel[j]=score[j]+bias[e];}else{score[j]=0.f;sel[j]=-INFINITY;}}
+            score[j]=1.f/(1.f+expf(-l));sel[j]=score[j]+bias[e];if(sel[j]!=sel[j])sel[j]=-INFINITY;}else{score[j]=0.f;sel[j]=-INFINITY;}}   // NaN never wins; all -inf ties go to the lowest id, so ids stay < experts
     float chosen[8];int chosen_id[8];
     for(int n=0;n<8;++n){
         float best=-INFINITY;int bid=0x7fffffff;float bscore=0.f;
@@ -434,7 +434,7 @@ __global__ void router_select(const float* __restrict__ partial,const float* __r
     const int r=blockIdx.x,lane=threadIdx.x;float score[10],sel[10];
     for(int j=0;j<10;++j){const int e=lane+32*j;
         if(e<experts){const float l=router_logit<S>(partial+((long long)r*experts+e)*S);
-            score[j]=1.f/(1.f+expf(-l));sel[j]=score[j]+bias[e];}else{score[j]=0.f;sel[j]=-INFINITY;}}
+            score[j]=1.f/(1.f+expf(-l));sel[j]=score[j]+bias[e];if(sel[j]!=sel[j])sel[j]=-INFINITY;}else{score[j]=0.f;sel[j]=-INFINITY;}}   // NaN never wins; all -inf ties go to the lowest id, so ids stay < experts
     float chosen[8];int chosen_id[8];
     for(int n=0;n<8;++n){
         float best=-INFINITY;int bid=0x7fffffff;float bscore=0.f;
