@@ -5,7 +5,7 @@ into the residual stream along a "refusal direction". It changes the model's beh
 requests the original model declines, **including harmful ones**. Everything here is **off by default** and nothing in
 the engine enables it implicitly.
 
-The engine has three independent mechanisms, usable alone or together, both opt-in via environment variables:
+The engine has three independent mechanisms, usable alone or together, all opt-in via environment variables:
 
 | Mechanism | Switch | Models | What it does |
 | --- | --- | --- | --- |

@@ -1,6 +1,6 @@
 # GLM-5.3-Flash 引擎开关说明
 
-本文列出 `engine-rs/profiles/glm-tp2.env` 设置的 `GLM53_*` 开关。该 profile 用于在两台 DGX Spark 上（张量并行 2）服务 GLM-5.3-Flash，下表中的取值即调优后的默认值。大多数开关用于选择内核、数据布局或启动调度；保留为开关是为了能把每项改动与它替换的路径做 A/B 对比。取值为 0 表示保留替代路径以便对照，服务中不使用。
+本文列出 `engine-rs/profiles/glm.env` 设置的 `GLM53_*` 开关。该 profile 用于在两台或三台 DGX Spark 上（张量并行 2 或 3；两者共用同一 profile，各 world size 的传输设置在 `profiles/tp2-rdma.env` / `tp3-rdma.env`）服务 GLM-5.3-Flash，下表中的取值即调优后的默认值。大多数开关用于选择内核、数据布局或启动调度；保留为开关是为了能把每项改动与它替换的路径做 A/B 对比。取值为 0 表示保留替代路径以便对照，服务中不使用。
 
 精度等级（所列取值对输出的影响，相对于被替换的路径）：
 
@@ -16,7 +16,7 @@
 
 说明：
 
-- 服务启动脚本（`serve/glm-rank.sh`）先清除调用方的 `GLM53_*` 变量，再加载本 profile，然后应用 `spark.env`，其中的 `GLM53_*` 会覆盖 profile。脚本还会把 `GLM53_MAX_CONTEXT` 设为 KV token 预算。
+- 服务启动脚本（`serve/glm-rank.sh`）先清除调用方的 `GLM53_*` 变量，再加载本 profile，然后应用 `spark.env`，其中的 `GLM53_*` 会覆盖 profile，最后应用该 world size 的拓扑环境。脚本还会把 `GLM53_MAX_CONTEXT` 设为 KV token 预算。
 - `serve` 命令总是开启 `GLM53_MHC_FUSED`、`GLM53_KDA_FUSED`、`GLM53_MLA_LATENT` 与 `GLM53_PREFILL_BATCH`。
 - “行”指一次调用中的 token 行数：普通 decode 为 1，验证一条草稿链为 2..8，多序列批量验证最多 32，prefill 块为数百到数千。“decode 规模”指 1..32 行。
 - C12 是 Half 权重的无损 12 bit 编码；Q8 是 int8 加每 128 个输入一个 FP32 scale。路由专家始终使用 checkpoint 自带的 EXL3 4 bit 权重。
@@ -276,6 +276,34 @@
 
 | 变量 | 取值 | 含义 | 等级 |
 | --- | --- | --- | --- |
-| `GLM53_GRAPH` | `1` | decode/验证使用 CUDA Graph（设置即启用；仅支持 TP2，因为需要全部专家常驻）。 | L0 |
+| `GLM53_GRAPH` | `1` | decode/验证使用 CUDA Graph（设置即启用；需要全部专家常驻）。 | L0 |
 | `GLM53_GRAPH_SHARED_WS` | `1` | 所有图共用一个 cuBLAS/cuBLASLt workspace，而不是每个捕获流一个（每图约 32 MiB）。 | — |
 | `GLM53_STATIC_TENSORS` | `0` | 把常量张量（decay 基、卷积权重、DSA 常量）静态化；关闭（无可测收益）。 | L0（开启时） |
+
+## v0.2 新增 (5)
+
+| 变量 | 取值 | 含义 | 等级 |
+| --- | --- | --- | --- |
+| `GLM53_SERVE_FORK_CKPT` | `2048` | 分叉检查点：当提示词在与已缓存序列共享至少这么多 token 后分叉时，prefill 在分叉点停下并在该处保存检查点，下一个在同一位置分叉的请求从该检查点继续。0 = 关闭。 | — |
+| `GLM53_KV_VMM` | `1` | KV 存储建在 CUDA 虚拟内存上：存储原地增长（无需克隆，也无需连续区间），因此单个会话可以用满整个 KV 预算。 | — |
+| `GLM53_KV_HEADROOM_PCT` | `25` | 新建或扩大的 KV 存储额外预留的容量（百分比），使不断增长的对话不必每轮都重新扩容。 | — |
+| `GLM53_SERVE_PREWARM_LAZY` | `1` | 预热完存储 0 即报告就绪；存储 1.. 之后在空闲轮次中逐个预热（就绪约提前 10 s）。 | — |
+| `GLM53_MHC_SINKHORN_SPLIT` | `1` | mHC Sinkhorn 归一化在独立的 CTA 上执行，不走 collapse / RMS 路径。 | L0 |
+
+本 profile 中可用但关闭的：`GLM53_MLA_DECODE_TC=1`（MLA decode 注意力用张量核，L1，每轮 −0.2..−0.6 ms；仅用 SPX1
+checkpoint 验证过）、`GLM53_DEPTH_TABLE`（重新标定的投机深度表，JSON）。
+
+## 三节点（TP3）：`profiles/tp3-rdma.env`
+
+`GLM_WORLD=3` 时，引擎把 KDA 头按 22/21/21 切分，MLA 头按 32/16/16（latent 内核以 16 头为单位），共享专家按 1024/1024/0，
+每个路由专家的 16 个 Hadamard 块按 6/5/5（随专家轮换，因此每层每个节点的工作量相同）；prefill 为序列并行（行数填充到 3 的
+倍数，按行 reduce-scatter / all-gather）。两节点时每个切分都与之前逐位相同。拓扑环境设置：
+
+| 变量 | 取值 | 含义 | 等级 |
+| --- | --- | --- | --- |
+| `GLM53_RDMA_ARN_INIT` | `1` | 建立 N 路 RDMA all-reduce（`shim/rdma_arn.cu`）：按子网查找链路（每对节点一对直连 RoCE 端口），以 FP32 按 rank 顺序求和。 | L0（相对按 rank 顺序求和） |
+| `GLM53_RDMA_AR` | `1` | decode / 验证 / prefill 的集合通信走引擎的 RDMA 路径。 | L0 |
+| `GLM53_RDMA_AR_INIT`、`GLM53_TP_SMALL_COMM`、`GLM53_TP_SMALL_COMM_ACTIVE` | `0` | 关闭两 rank 传输。 | — |
+| `GLM53_RDMA_ARN_RS_BF16` | `1` | prefill 按行 reduce-scatter 以 BF16 传输对端部分和（本 rank 的行为 FP32，按 rank 顺序 FP32 求和）。 | L1 |
+| `GLM53_PREFILL_SP_HALF_Z` | `1` | prefill 的 z all-gather 用 Half。 | L1 |
+| `NCCL_SOCKET_IFNAME`、`NCCL_IB_DISABLE=1` | 取自 `SPARK_TP3_IFNAME` | NCCL 只通过 socket 引导进程组。 | — |

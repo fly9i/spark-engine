@@ -59,14 +59,15 @@ cd engine-rs && cargo build --release
 
 | 路径 | 内容 |
 | --- | --- |
-| `engine-rs/src` | 引擎（Rust）：加载、GLM 前向与投机解码、张量并行、服务循环；`src/qwen/` 为 Qwen3.8 模型、服务和草稿生成 |
-| `engine-rs/shim` | CUDA / C++ 内核和 libtorch 桥接；`moe_exl3.cuh`（两个模型共用的 EXL3 MoE）、`qwen_*.cu`、`glm_moe.cu`、`c12*`、`q8.cuh`、`rdma_*.cu` 等 |
-| `engine-rs/serve` | OpenAI 兼容前端（`openai_server.py`、`qwen_server.py`、媒体处理）和启动/停止脚本 |
-| `engine-rs/profiles` | `glm-tp2.env`：GLM 服务 profile（[开关说明](glm-switches.zh-CN.md)） |
+| `engine-rs/src` | 引擎（Rust）：加载、GLM 前向与投机解码、张量并行、服务循环；`src/qwen/` 为 Qwen3.8 模型、服务和草稿生成；`src/ds41/` 为 DeepSeek-V4.1-Flash（分片、模型、内核、投机、服务）；共用模块 `kv_pool.rs`、`mm_canvas.rs`、`pcache_core.rs` |
+| `engine-rs/shim` | CUDA / C++ 内核和 libtorch 桥接；`moe_exl3.cuh`（GLM 与 Qwen 共用的 EXL3 MoE）、`ds41*.cu`（`ds41_mx.cu` 需要架构专用的 `sm_121a` 目标）、`qwen_*.cu`、`glm_moe.cu`、`spx*`、`c12*`、`q8.cuh`、`rdma_*.cu`（`rdma_arn.cu`：N 路）、共用头文件 `pdl.cuh`、`topk_select.cuh`、`mhc_common.cuh` 等 |
+| `engine-rs/serve` | OpenAI 兼容前端（`openai_server.py`、`qwen_server.py`、`ds41_server.py`、媒体处理）和启动/停止脚本 |
+| `engine-rs/profiles` | `glm.env`：GLM 服务 profile（[开关说明](glm-switches.zh-CN.md)）；`tp2-rdma.env` / `tp3-rdma.env`：各 world size 的传输设置 |
+| `engine-rs/testdata` | 前缀缓存回归测试（`spark-engine pcache-golden`）的逐字节清单 |
 | `scripts` | 依赖拉取 / 构建、运行时环境、打包、模型下载 |
 | `patches` | 应用到拉取的 `torch-sys` 上的补丁 |
 | `bench` | 速度和文本一致性工具 |
-| `reference` | 用于验证内核的 Python 参考实现（开发者工具；需要额外的包） |
+| `reference` | 用于验证内核的 Python 参考实现（开发者工具；需要额外的包）；`reference/ds41/export_engram.py` 生成 DeepSeek 的 Engram 哈希文件（部署步骤） |
 | `assets` | Qwen MTP 草稿子词表 |
 
 ## 持续集成

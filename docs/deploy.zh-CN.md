@@ -1,10 +1,13 @@
 # 部署
 
+本页介绍 GLM-5.3-Flash（两节点或三节点）和 Qwen3.8-Flash-Next（单节点）。三节点运行 DeepSeek-V4.1-Flash 有单独的部署方法
+[ds41.zh-CN.md](ds41.zh-CN.md)，它以本页第 1、3、5 节为基础。
+
 ## 1. 硬件与系统
 
 | | GLM-5.3-Flash | Qwen3.8-Flash-Next |
 | --- | --- | --- |
-| 机器 | 2× DGX Spark（GB10），每台 128 GB 统一内存 | 1× DGX Spark |
+| 机器 | 2× DGX Spark（GB10），每台 128 GB 统一内存；或 3×（TP3） | 1× DGX Spark |
 | 互连 | 两台 Spark 的两个 ConnectX-7 QSFP 端口直连（2 × 200 Gb/s RoCE） | — |
 | 磁盘 | 每个节点约 170 GB（checkpoint 164 GB + 草稿模型 2.2 GB），两个节点路径相同 | 约 101 GB（含一个运行时从 NVMe 读取的 39 GB n-gram 嵌入表） |
 | 软件 | DGX OS 7 / Ubuntu 24.04 aarch64，支持 CUDA 13 的 NVIDIA 驱动，Python 3.12 | 同左 |
@@ -24,7 +27,7 @@ sudo sysctl --system
 引擎自身的 pinned 主机缓冲也避开了内存规整：它们是用 `cudaHostRegister` 注册的匿名页，内存规整从不隔离这类页（而
 `cudaHostAlloc` 的内存由共享内存支撑，会被隔离）。设 `GLM53_HOST_REGISTER=0` 可退回 `cudaHostAlloc`。
 
-## 2. GLM 的网络配置（双节点）
+## 2. GLM 的网络配置
 
 将每台 ConnectX-7 的 0 号端口连到另一台 Spark 的 0 号端口（如果有两根线缆，两个 QSFP 端口都连上）。为每个节点的两个接口配置点对点地址，例如：
 
@@ -37,6 +40,18 @@ sudo sysctl --system
 NCCL 和引擎自带的 RDMA all-reduce 会同时使用两个 RDMA 设备。
 
 节点 A 通过 ssh 在节点 B 上启动 rank 1：为运行服务的用户配置从 A 到 B 的密钥登录（示例使用 `root@10.0.1.1`）。在**两个节点的相同路径下**安装发布包、Python 环境和模型；如果两个节点的引擎二进制不一致，启动脚本会拒绝启动。
+
+### 三节点（GLM TP3）
+
+GLM-5.3-Flash 也可以用同一个二进制、同一个检查点和同一个 profile 在三台 Spark 上运行（`GLM_WORLD=3` 或
+`start.sh glm3`）：KDA 头按 22/21/21 切分，MLA 头按 32/16/16，每个路由专家的 16 个 Hadamard 块按 6/5/5 切分，prefill
+为序列并行。三个节点需要 ConnectX-7 端口全互连（每对节点一根线缆，每个 function 各用一个 /30），以及一个三台互相可达的
+局域网；布局以及引擎如何配对链路见 [ds41.zh-CN.md](ds41.zh-CN.md) §2，它使用同一个集群。在 `spark.env` 中设置
+`SPARK_WORKERS`、`SPARK_MASTER_ADDRS` 和 `SPARK_TP3_IFNAME`。
+
+TP3 是用本项目自己的 GLM-5.3-Flash SPX1 检查点（未公开）开发和验收的：投机解码比 TP2 快 21%（在本项目的混合基准上
+60.2 对 49.7 tok/s），prefill 快 4%，对 FP8 参考的 KL 不变（0.01370 对 0.01364）。使用公开的 EXL3 检查点时，TP3 走相同的
+代码路径，但**尚未实测**；对该检查点，TP2 仍是经过测试的配置。
 
 ## 3. 安装
 
@@ -69,15 +84,17 @@ PATH=/opt/spark-engine/.venv/bin:$PATH /opt/spark-engine/scripts/download-models
 cp spark.env.example spark.env
 ```
 
-编辑 `spark.env`（两个节点内容相同）：路径、工作节点的 ssh 目标、互连网络地址和 NCCL 接口名。每项设置在文件内和
-[configuration.zh-CN.md](configuration.zh-CN.md) 中都有说明。
+编辑 `spark.env`（每个节点内容相同）：路径、各工作节点的 ssh 目标（`SPARK_WORKERS`）、各 rank 看到的 rank 0 地址
+（`SPARK_MASTER_ADDRS`）和 NCCL 接口名。每项设置在文件内和 [configuration.zh-CN.md](configuration.zh-CN.md) 中都有说明。
 
 ## 6. 启动、使用、停止
 
 ```bash
-engine-rs/serve/start.sh glm      # on node A; about a minute (loading 82 GB per node)
+engine-rs/serve/start.sh glm      # on node A; about a minute (loading 82 GB per node); GLM_WORLD nodes
+engine-rs/serve/start.sh glm3     # GLM over three nodes
+engine-rs/serve/start.sh ds41     # DeepSeek-V4.1-Flash over three nodes (ds41.md)
 engine-rs/serve/start.sh qwen     # one node; about 50 s
-engine-rs/serve/start.sh status   # glm | qwen | none
+engine-rs/serve/start.sh status   # glm | ds41 | qwen | none
 engine-rs/serve/start.sh stop
 ```
 
@@ -94,14 +111,16 @@ curl http://<node-A>:8888/v1/chat/completions -H 'Content-Type: application/json
 Qwen 还接受 `"reasoning_effort": "none" | "low" | "medium" | "high"`。图像：在消息内容中放入 `{"type": "image_url",
 "image_url": {"url": "https://... or data:image/png;base64,..."}}`；视频：`"type": "video_url"`。
 
-日志：`/tmp/spark-glm-rank0.log`、`/tmp/spark-glm-rank1.log`（在节点 B 上）、`/tmp/spark-glm-front.log`、
+日志：`/tmp/spark-glm-rank0.log`、`/tmp/spark-glm-rank<r>.log`（在各工作节点上）、`/tmp/spark-glm-front.log`、
 `/tmp/spark-qwen-engine.log`、`/tmp/spark-qwen-front.log`。Prometheus 指标：`GET /metrics`。
 
 ## 7. 故障排查
 
 | 现象 | 原因 / 解决方法 |
 | --- | --- |
-| `engine binary differs between the nodes` | 在两个节点上安装同一个发布版本（相同的 `SPARK_BIN` 路径）。 |
+| `engine binary differs on rank N` | 在每个节点上安装同一个发布版本（相同的 `SPARK_BIN` 路径）。 |
+| `no address of rank 0 for rank N` / `no node for rank N` | `spark.env` 中 `SPARK_MASTER_ADDRS` / `SPARK_WORKERS` 列出的节点少于 world size。 |
+| `SPARK_TP3_IFNAME` 报错，或 TP3 下 rank 0 一直等待 | 把 `SPARK_TP3_IFNAME` 设为三个节点互相可达的接口。 |
 | `rank 0 exited` 并伴有 NCCL 错误 | 检查互连网络地址、`NCCL_SOCKET_IFNAME`、`NCCL_IB_HCA`、`ibv_devinfo` 端口状态，以及 rank 1 是否已启动（节点 B 上的 `/tmp/spark-glm-rank1.log`）。 |
 | 启动时内存不足 | 有其他进程占用 GPU 内存，或另一个模型仍在释放内存：执行 `start.sh stop`，等待后再启动。调低 `GLM_KV_TOKENS`（或 `QWEN_KV_TOKENS`）以缩小 KV 池。 |
 | 找不到 `libexllamav3_ext.so` / `libtorch_cuda.so` | 在 `SPARK_PYTHON` 指向装有 torch 2.13 cu130 的环境时 source `scripts/env.sh`。 |

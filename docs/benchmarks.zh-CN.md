@@ -6,9 +6,10 @@
 | --- | --- |
 | `bench/decode_bench.py [prose\|structured] [repeats] [max_tokens]` | 1、2、3、4 个并发流下的 decode 速度：贪心，关闭思考，32 token 预热，输出 400 个 token；单流速度为 `(completion_tokens - 1) / (t_last - t_first)`，总速度 = 全部 decode token / 墙钟时间窗口；取 `repeats` 次运行的中位数 |
 | `bench/prefill_bench.py TOKENS [SEED]` | 对约 `TOKENS` 个 token 的合成提示词做 prefill（随机单词，因此不同 seed 之间没有共享前缀）；输出引擎的 prefill 时间和 tok/s |
+| `bench/ds41_decode_bench.py [--url URL] [--types prose,structured,code] [--conc 1,2,4]` | DeepSeek-V4.1-Flash 的数据（[ds41.zh-CN.md](ds41.zh-CN.md#7-性能)）：采用 MiaAI-Lab 的 sparkDash DecodeBench 协议（贪心，关闭思考，32 token 预热，每流 256 个 token，prose / structured / code 提示词），便于与该模型在 DGX Spark 上的其他部署对比 |
 | `bench/text_check.py LABEL [BASELINE]` | 20 个固定提示词，每个贪心生成 256 个 token，逐个运行：比较两个构建或两组设置（回复是否一致、首个分歧点） |
 
-三个脚本都连接 `SPARK_URL`（默认 `http://127.0.0.1:8888`）。decode 测试使用两类提示词：
+`decode_bench.py`、`prefill_bench.py` 和 `text_check.py` 连接 `SPARK_URL`（默认 `http://127.0.0.1:8888`）。decode 测试使用两类提示词：
 
 - **散文（prose）**：一段长篇技术解释，典型的聊天输出；草稿接受率较低；
 - **结构化（structured）**：从 1 数到 200；几乎每个草稿 token 都被接受，体现投机解码的上限。

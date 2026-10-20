@@ -2,12 +2,13 @@
 
 "Abliteration" 通过编辑或投影那些沿"拒绝方向"写入残差流的权重/激活，移除模型拒绝请求的倾向。它会改变模型的行为：经过 abliteration 的模型会回答原始模型会拒绝的请求，**包括有害的请求**。这里的一切都**默认关闭**，引擎中没有任何东西会隐式启用它。
 
-引擎提供两种独立的机制，可以单独使用也可以一起使用，二者都通过环境变量选择性启用：
+引擎提供三种独立的机制，可以单独使用也可以一起使用，均通过环境变量选择性启用：
 
 | 机制 | 开关 | 模型 | 作用 |
 | --- | --- | --- | --- |
 | o_proj 移植 | `GLM53_ABLIT` | GLM-5.3-Flash | 从同一模型的一个经过 abliteration 的捐赠者检查点加载第 15–44 层注意力的 `o_proj`（逐字节复制，带校验），替代原始权重。 |
 | 方向消融 | `SPARK_ABLATE` | GLM, Qwen | 从每一层写入残差流的所有内容中移除一个或多个拒绝方向（由引擎从你自己的提示集计算得出）。 |
+| 条件钳制 | `SPARK_ABLATE_CLAMP`（DeepSeek：`DS41_ABLATE_CLAMP`） | GLM, DeepSeek-V4.1-Flash | 把每个子层输入沿少数几个拒绝方向的分量裁剪到普通文本所处的范围内；范围内的文本逐位不变。 |
 
 ## 1. o_proj 移植（GLM-5.3-Flash）
 
@@ -55,6 +56,30 @@ SPARK_ABLATE=/path/dirs.safetensors          # set in spark.env or the start scr
 ```
 
 单个方向往往较弱；通常需要一个小的子空间（例如 `subspace:16-40:8`）才能大幅降低拒绝率而不损害普通回答。请自行验证效果，并检查回答质量，而不仅仅是拒绝率。
+
+## 3. 条件钳制（`SPARK_ABLATE_CLAMP`，GLM 和 DeepSeek-V4.1-Flash）
+
+钳制不是处处移除方向，而只编辑落在普通文本范围之外的部分：对每个子层输入（注意力和 MLP，即 mHC pre 的输出）和最终隐藏
+状态，沿每个方向的分量 `c` 被裁剪到 `[tau_lo, tau]`（或移到可选的 `target`，例如无害样本的中位数）。普通文本处于阈值以内，
+不会被改变；残差流和草稿器的特征从不被编辑。计数门控（`SPARK_ABLATE_CLAMP_MIN=m`）只有在同一次前向中某个 token 已有 `m`
+个位置触发时才编辑该 token，因此普通文本中零星越过阈值的情况会原样通过。该编辑融合在 mHC pre 内核中。
+
+校准文件是一个 safetensors，包含 `directions` [k, hidden]（行正交归一）、`tau` / `tau_lo` [layers, 2, k]、
+`tau_final` / `tau_final_lo` [k]，以及可选的 `target` / `target_final`（格式细节见 `engine-rs/src/ablate.rs`）。
+`SPARK_ABLATE_CLAMP_STATS=<dir>` 记录一次 prefill 的原始投影，用于校准（取普通文本投影的高分位数）。本项目不分发任何校准文件。
+
+```bash
+# DeepSeek-V4.1-Flash (spark.env, same file on all three nodes; the file at the same path on every node)
+DS41_ABLATE_CLAMP=/models/ds41-clamp.safetensors
+DS41_ABLATE_MIN=12            # count gate (default 12)
+# GLM-5.3-Flash
+SPARK_ABLATE_CLAMP=/models/glm-clamp.safetensors
+SPARK_ABLATE_CLAMP_MIN=8
+```
+
+本项目在 DeepSeek-V4.1-Flash-1017 上的实测（TP3，m = 12，64 条有害和 64 条无害提示词）：有害提示词被拒 3/64，无害提示词
+被拒 2/64（未消融时，在原始 V4.1 发布版上为 62/64 和 1/64）；单流 decode 51.8 / 96.1 / 88.4 tok/s（prose / structured /
+code），处于未消融的范围内；草稿接受率未下降。钳制设置是前缀缓存身份的一部分，因此消融与未消融的运行从不共享缓存的前缀。
 
 ## 性能
 
