@@ -144,6 +144,32 @@ pub fn rows_async(ck: &Checkpoint, layer: usize, rows: Vec<i64>, head_dim: i64) 
     std::thread::spawn(move || gather(w, s, &rows, head_dim))
 }
 
+/// `rows` as the act_quant operands of their BF16 values (E4M3 bytes [n, head_dim], UE8M0 bytes [n, head_dim / 32]).
+pub fn rows_q(ck: &Checkpoint, layer: usize, rows: &[i64], head_dim: i64) -> (Tensor, Tensor) {
+    let (wbuf, sbuf) = match io::take(ck, layer, rows) {
+        Some(h) => h.join().expect("engram prefetch thread"),
+        None => { let (w, s) = tables(ck, layer); gather(w, s, rows, head_dim) }
+    };
+    upload_q(wbuf, sbuf, ck.dev)
+}
+
+/// The gathered bytes uploaded and requantized on the device (kern::requant_fp8): the bytes act_quant gives `upload`'s
+/// BF16 rows, with no FP32 / BF16 copy of them; the buffers go back to the pool.
+pub fn upload_q(wbuf: Vec<u8>, sbuf: Vec<u8>, dev: tch::Device) -> (Tensor, Tensor) {
+    let dev_bytes = |b: &Vec<u8>| unsafe { Tensor::from_blob(b.as_ptr(), &[b.len() as i64], &[], Kind::Uint8, tch::Device::Cpu) }.to_device(dev);
+    let (wd, sd) = (dev_bytes(&wbuf), dev_bytes(&sbuf));
+    give(wbuf);
+    give(sbuf);
+    super::kern::requant_fp8(&wd, &sd)
+}
+
+/// BF16 values of E4M3 bytes + E8M0 bytes per 32 ([.., K] and [.., K / 32]).
+pub fn dequant(q: &Tensor, s: &Tensor) -> Tensor {
+    let (r, k) = (q.size()[0], q.size()[1]);
+    let wt = q.contiguous().view_dtype(Kind::Float8e4m3fn).to_kind(Kind::Float).view([r, k / 32, 32]);
+    (wt * super::ops::e8m0(&s.contiguous()).view([r, k / 32, 1])).view([r, k]).to_kind(Kind::BFloat16)
+}
+
 /// Rows as BF16 [n, head_dim] on `dev` from the gathered FP8 bytes and E8M0 scales; the buffers go back to the pool.
 pub fn upload(wbuf: Vec<u8>, sbuf: Vec<u8>, n: i64, head_dim: i64, dev: tch::Device) -> Tensor {
     // straight from the buffers (no CPU tensor copy first); a blocking copy from pageable memory, so the buffers are free

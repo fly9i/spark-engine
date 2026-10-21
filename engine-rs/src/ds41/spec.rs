@@ -57,7 +57,19 @@ pub struct MtpGraph {
     pos: Tensor, h0: Tensor,
     s1: Vec<crate::tp::graph::Owned>, s3: Vec<crate::tp::graph::Owned>, fin: crate::tp::graph::Owned,
     mid: Vec<[Tensor; 2]>, obuf: Vec<Tensor>, xf: Tensor, logits: Tensor, _keep: Vec<Tensor>,
+    mk: Option<MarkovGraph>,
 }
+
+/// The sequential part of a draft (DS41_DRAFT_GRAPH, default on) as one graph per B on top of the body graph's head
+/// logits: for each of the `block` drafts the Markov bias of the previous token, the Gumbel top-1 of this rank's
+/// vocabulary slice (rs_gumbel_argmax_packet, bitwise the eager noise + max_dim), the cross-rank choice
+/// (head_select::choose) and the confidence. The tokens stay on the device from one step to the next, so a draft costs
+/// one parameter upload and one read-back instead of a host round trip (allreduce read + confidence read) per draft.
+static DRAFT_CHECK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DRAFT_CHECK_BAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub struct MarkovGraph { prev: Tensor, temps: Tensor, keys: Tensor, out: Tensor, g: crate::tp::graph::Owned, _keep: Vec<Tensor> }
+
+fn draft_graph_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_DRAFT_GRAPH").map_or(true, |v| v != "0")) }
 
 /// How many drafts to verify: the longest prefix whose estimated probability of being accepted entirely (product of
 /// sigmoid(confidence)) stays at or above DS41_SPEC_MIN_P (0.15), at most DS41_SPEC_D (all).
@@ -141,10 +153,10 @@ impl Model {
     /// Drafts for each sequence (toks[b] at position seqs[b].pos): (draft tokens, confidences), `block` each.
     pub fn mtp_draft(&self, seqs: &[&mut Seq], toks: &[i64], temps: &[f32], seeds: &[u64]) -> (Vec<Vec<i64>>, Vec<Vec<f32>>) {
         let _g = tch::no_grad_guard();
-        let mt = self.mtp.as_ref().expect("DSpark stages not loaded (DS41_MTP=1)");
+        assert!(self.mtp.is_some(), "DSpark stages not loaded (DS41_MTP=1)");
         let c = &self.c;
         let dev = self.dev;
-        let (bsz, blk, w) = (seqs.len(), c.dspark_block, c.window);
+        let blk = c.dspark_block;
         let mut ids = Vec::new();
         let mut posv = Vec::new();
         for (s, &t) in seqs.iter().zip(toks) {
@@ -154,7 +166,37 @@ impl Model {
         }
         let pos = Tensor::from_slice(&posv).to_device(dev);
         let e = self.embed(&Tensor::from_slice(&ids).to_device(dev));                        // [R, dim]
-        let (xf, logits) = if graph_on() { self.mtp_body_graph(seqs, &e, &pos) } else { self.mtp_body(seqs, &e, &pos, None) };
+        if graph_on() && draft_graph_on() && self.draft_debug.borrow().is_none() {
+            let out = self.mtp_draft_graph(seqs, &e, &pos, toks, temps, seeds);
+            if std::env::var("DS41_DRAFT_GRAPH_CHECK").as_deref() == Ok("1") {
+                // the eager loop on the same head logits (the body graph's outputs, untouched by the Markov graph)
+                let (xf, logits) = {
+                    let g = self.mtp_graphs.borrow();
+                    let g = &g[&seqs.len()];
+                    (g.xf.copy(), g.logits.copy())
+                };
+                let (d, cf) = self.markov_eager(seqs, &xf, &logits, toks, temps, seeds);
+                let bad_d = d.iter().zip(&out.0).map(|(a, b)| a.iter().zip(b).filter(|(x, y)| x != y).count()).sum::<usize>();
+                let bad_c = cf.iter().zip(&out.1).map(|(a, b)| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count()).sum::<usize>();
+                let n = DRAFT_CHECK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let bad = DRAFT_CHECK_BAD.fetch_add((bad_d + bad_c > 0) as usize, std::sync::atomic::Ordering::Relaxed) + (bad_d + bad_c > 0) as usize;
+                if bad_d + bad_c > 0 || n % 200 == 0 {
+                    eprintln!("[ds41-draft-check] round {n} B {}: {bad_d} draft / {bad_c} confidence mismatches (rounds with any: {bad})", seqs.len());
+                }
+            }
+            return out;
+        }
+        let (xf, logits) = if graph_on() { self.mtp_body_graph(seqs, &e, &pos, true) } else { self.mtp_body(seqs, &e, &pos, None) };
+        self.markov_eager(seqs, &xf, &logits, toks, temps, seeds)
+    }
+
+    /// The Markov / sampling / confidence steps of a draft with a host round trip per draft (DS41_DRAFT_GRAPH=0, the
+    /// draft probe's per-step logits, DS41_DRAFT_GRAPH_CHECK's reference).
+    fn markov_eager(&self, seqs: &[&mut Seq], xf: &Tensor, logits: &Tensor, toks: &[i64], temps: &[f32], seeds: &[u64]) -> (Vec<Vec<i64>>, Vec<Vec<f32>>) {
+        let mt = self.mtp.as_ref().unwrap();
+        let c = &self.c;
+        let dev = self.dev;
+        let (bsz, blk) = (seqs.len(), c.dspark_block);
         let mut drafts = vec![Vec::new(); bsz];
         let mut confs = vec![Vec::new(); bsz];
         let mut prev: Vec<i64> = toks.to_vec();
@@ -179,6 +221,92 @@ impl Model {
             prev = next;
         }
         (drafts, confs)
+    }
+
+    /// The drafts through the body graph and the Markov graph (MarkovGraph): same tokens and confidences as the eager
+    /// loop of mtp_draft.
+    fn mtp_draft_graph(&self, seqs: &[&mut Seq], e: &Tensor, pos: &Tensor, toks: &[i64], temps: &[f32], seeds: &[u64]) -> (Vec<Vec<i64>>, Vec<Vec<f32>>) {
+        use crate::tp::graph::{begin_pool, end, Owned};
+        let (bsz, blk, dev) = (seqs.len(), self.c.dspark_block as usize, self.dev);
+        assert!(bsz <= 64, "the Gumbel parameter rows hold 64 sequences");
+        let mut tv = vec![0f32; 64];
+        tv[..bsz].copy_from_slice(temps);
+        let mut kv = vec![0i64; blk * 64];
+        for j in 0..blk {
+            for (b, s) in seqs.iter().enumerate() { kv[j * 64 + b] = crate::sampling::key(seeds[b], (s.pos + j as i64 + 1) as u64) as i64; }
+        }
+        let _ = self.mtp_body_graph(seqs, e, pos, false);
+        let mut graphs = self.mtp_graphs.borrow_mut();
+        let g = graphs.get_mut(&bsz).expect("body graph");
+        if g.mk.is_none() {
+            super::mem::release();
+            let prev = Tensor::zeros([bsz as i64], (Kind::Int64, dev));
+            let tbuf = Tensor::zeros([64], (Kind::Float, dev));
+            let kbuf = Tensor::zeros([blk as i64 * 64], (Kind::Int64, dev));
+            let rows: Vec<Tensor> = (0..blk as i64).map(|j| Tensor::from_slice(&(0..bsz as i64).map(|b| b * blk as i64 + j).collect::<Vec<_>>()).to_device(dev)).collect();
+            tch::Cuda::synchronize(0);
+            begin_pool(super::mem::GRAPH_POOL).expect("capture begin");
+            let out = self.markov_steps(&g.xf, &g.logits, &prev, &tbuf, &kbuf, &rows);
+            end().expect("capture end");
+            let mut keep = rows;
+            keep.push(g.xf.shallow_clone());
+            keep.push(g.logits.shallow_clone());
+            g.mk = Some(MarkovGraph { prev, temps: tbuf, keys: kbuf, out, g: Owned::take(), _keep: keep });
+            super::mem::occupy();
+        }
+        let mk = g.mk.as_mut().unwrap();
+        let _ = mk.prev.copy_(&Tensor::from_slice(toks));
+        let _ = mk.temps.copy_(&Tensor::from_slice(&tv));
+        let _ = mk.keys.copy_(&Tensor::from_slice(&kv));
+        mk.g.replay();
+        let host: Vec<f32> = Vec::<f32>::try_from(mk.out.to_device(Device::Cpu).view(-1)).unwrap();   // [blk, B, 2]
+        let mut drafts = vec![Vec::with_capacity(blk); bsz];
+        let mut confs = vec![Vec::with_capacity(blk); bsz];
+        for j in 0..blk {
+            for b in 0..bsz {
+                drafts[b].push(host[(j * bsz + b) * 2] as i64);
+                confs[b].push(host[(j * bsz + b) * 2 + 1]);
+            }
+        }
+        (drafts, confs)
+    }
+
+    /// The Markov / sampling / confidence steps of a draft on the device (captured by mtp_draft_graph): prev [B] the
+    /// pending tokens, temps [64] and keys [block * 64] the Gumbel rows per draft, rows[j] the block rows of draft j.
+    /// -> [block, B, 2] FP32 (token id, confidence); ids below 2^24 are exact.
+    fn markov_steps(&self, xf: &Tensor, logits: &Tensor, prev: &Tensor, temps: &Tensor, keys: &Tensor, rows: &[Tensor]) -> Tensor {
+        extern "C" { fn rs_gumbel_argmax_packet(values: *const f32, rows: i32, width: i32, start: i64, temps: *const f32, keys: *const u64,
+                                                part_v: *mut f32, part_i: *mut i32, packet: *mut f32, world: i32, rank: i32) -> i32; }
+        let mt = self.mtp.as_ref().unwrap();
+        let c = &self.c;
+        let b = prev.size()[0];
+        let (world, rank) = (self.sp.world as i64, self.sp.rank as i64);
+        let conf_x = mt.conf.narrow(0, 0, c.dim);
+        let conf_m = mt.conf.narrow(0, c.dim, c.dspark_markov_rank);
+        let mut prev = prev.shallow_clone();
+        let mut outs = Vec::with_capacity(rows.len());
+        for (j, r) in rows.iter().enumerate() {
+            let emb = mt.markov_embed.index_select(0, &prev);                                         // [B, rank]
+            let bias = super::kern::bf16_gemv(&emb, &mt.markov_head);                                 // [B, v1 - v0]
+            let lg = (logits.index_select(0, r) + bias).to_kind(Kind::Float).contiguous();
+            let width = lg.size()[1];
+            let part_v = Tensor::empty([b * 32], (Kind::Float, self.dev));
+            let part_i = Tensor::empty([b * 32], (Kind::Int, self.dev));
+            let packet = Tensor::empty([world, b, 2], (Kind::Float, self.dev));
+            let kj = keys.narrow(0, j as i64 * 64, 64);
+            assert_eq!(unsafe { rs_gumbel_argmax_packet(lg.data_ptr().cast(), b as i32, width as i32, self.sp.v0, temps.data_ptr().cast(), kj.data_ptr().cast(),
+                                                        part_v.data_ptr().cast(), part_i.data_ptr().cast(), packet.data_ptr().cast(), world as i32, rank as i32) }, 0, "draft gumbel top-1");
+            let next = if world > 1 {
+                crate::tp::allreduce(&packet);
+                crate::head_select::choose(&packet)
+            } else {
+                packet.select(2, 1).get(0).to_kind(Kind::Int64)
+            };
+            let cf = xf.index_select(0, r).to_kind(Kind::Float).matmul(&conf_x) + emb.to_kind(Kind::Float).matmul(&conf_m);
+            outs.push(Tensor::stack(&[next.to_kind(Kind::Float), cf], 1));
+            prev = next;
+        }
+        Tensor::stack(&outs, 0)
     }
 
     /// What a verify of `n` rows from the current position changes (window ring slots), to roll back later.
@@ -233,7 +361,8 @@ impl Model {
     }
 
     /// The draft body through the per-B graphs (captured on first use).
-    fn mtp_body_graph(&self, seqs: &[&mut Seq], e: &Tensor, pos_now: &Tensor) -> (Tensor, Tensor) {
+    /// `copy_out` false: the graph's own output tensors (valid until its next replay).
+    fn mtp_body_graph(&self, seqs: &[&mut Seq], e: &Tensor, pos_now: &Tensor, copy_out: bool) -> (Tensor, Tensor) {
         use crate::tp::graph::{begin_pool, end, Owned};
         let mt = self.mtp.as_ref().unwrap();
         let c = &self.c;
@@ -251,7 +380,7 @@ impl Model {
                 g.s3[i].replay();
             }
             g.fin.replay();
-            return (g.xf.copy(), g.logits.copy());
+            return if copy_out { (g.xf.copy(), g.logits.copy()) } else { (g.xf.shallow_clone(), g.logits.shallow_clone()) };
         }
         super::mem::release();
         let pos = pos_now.copy();
@@ -295,8 +424,8 @@ impl Model {
         end().expect("capture end");
         let fin = Owned::take();
         fin.replay();
-        let out = (xf.copy(), logits.copy());
-        graphs.insert(bsz, MtpGraph { pos, h0, s1, s3, fin, mid, obuf, xf, logits, _keep: keep });
+        let out = if copy_out { (xf.copy(), logits.copy()) } else { (xf.shallow_clone(), logits.shallow_clone()) };
+        graphs.insert(bsz, MtpGraph { pos, h0, s1, s3, fin, mid, obuf, xf, logits, _keep: keep, mk: None });
         super::mem::occupy();
         out
     }

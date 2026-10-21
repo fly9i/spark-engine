@@ -26,7 +26,7 @@ fn packet(local:&Tensor,start:i64,total:i64,rank:usize,world:usize)->Tensor {
     result
 }
 
-fn choose(packets:&Tensor)->Tensor {
+pub(crate) fn choose(packets:&Tensor)->Tensor {
     // Non-owner lanes are zero before SUM. Each score (including NaN/Inf)
     // has exactly one owner: SUM never combines different ranks' head scores.
     // SUM can change -0 to +0, as full logits SUM can, without changing argmax.

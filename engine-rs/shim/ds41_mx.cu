@@ -289,6 +289,27 @@ __global__ void act_quant_fp8_kernel(const __nv_bfloat16* __restrict__ x, uint8_
   if (lane == 0) s[b] = (uint8_t)e;
 }
 
+// act_quant of rows stored as E4M3 bytes + E8M0 bytes per 32 (the engram tables): the value is the stored byte times
+// the scale built from its exponent bits (ops::e8m0: byte 0 gives 0), rounded to BF16 as engram::upload's dequantize
+// did, then act_quant_fp8_kernel's scale and byte. The prefill GEMM gets the operands act_quant gives the dequantized
+// BF16 rows, without that FP32 / BF16 round trip through memory (26 MB read + written per 4K-token engram layer
+// instead of ~450 MB).
+__global__ void requant_fp8_kernel(const uint8_t* __restrict__ wq, const uint8_t* __restrict__ ws, uint8_t* __restrict__ q,
+                                   uint8_t* __restrict__ s, long long blocks) {
+  pdl_entry();
+  const long long b = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  if (b >= blocks) return;
+  __nv_fp8_e4m3 f;
+  f.__x = wq[b * 32 + lane];
+  const float v = __bfloat162float(__float2bfloat16((float)f * __uint_as_float((uint32_t)ws[b] << 23)));
+  float a = fabsf(v);
+  for (int o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+  const uint32_t e = aq_scale(a);
+  q[b * 32 + lane] = aq_byte(v, e);
+  if (lane == 0) s[b] = (uint8_t)e;
+}
+
 // rows per work item: 16 for decode / verify, 32 otherwise
 
 // ---- FP8 GEMM on the block-scaled MMA (prefill linears): y [M, N] FP32 = A . W^T with A E4M3 [M, K] + UE8M0 [M, K/32]
@@ -833,6 +854,12 @@ int ds41_bf16_gemv_mx(const void* x, const void* w, float* y, int m, int n, int 
   if (m < 1 || m > 16 || k % 32 || n % 8) return 1;
   const int warps = 8;
   pdl_launch((bf16_gemv_mx<4>), dim3((n / 8 + warps - 1) / warps), dim3(32 * warps), 0, st, (const __nv_bfloat16*)x, (const __nv_bfloat16*)w, y, m, n, k);
+  return (int)cudaGetLastError();
+}
+int ds41_requant_fp8(const void* wq, const void* ws, void* q, void* s, long long numel, cudaStream_t st) {
+  if (numel % 32) return 1;
+  const long long blocks = numel / 32;
+  pdl_launch(requant_fp8_kernel, dim3((unsigned)((blocks + 7) / 8)), dim3(256), 0, st, (const uint8_t*)wq, (const uint8_t*)ws, (uint8_t*)q, (uint8_t*)s, blocks);
   return (int)cudaGetLastError();
 }
 int ds41_act_quant_fp8(const void* x, void* q, void* s, long long numel, cudaStream_t st) {

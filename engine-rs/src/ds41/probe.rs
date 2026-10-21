@@ -447,7 +447,30 @@ pub fn ckpt_test(ckpt: &Path, hash: &str, p: i64, len: i64) {
     c2.pos = p; c2.hw = p; c2.dec_pos = a.dec_pos;
     c2.ced_tail = Some((ch.shallow_clone(), cp.shallow_clone(), p));
     let rest = &ids[p as usize..(p + 300) as usize];
+    // a checkpoint with dec_pos + window <= p stores no decoder rings (Model::pcache_win): a restore leaves them as they
+    // were reset; filled with NaN instead, the continuation must give the same logits (never read)
+    let enc = (m.c.n_layers / 2) as usize;
+    let canary = (a.dec_pos + m.c.window <= p).then(|| {
+        let mut c3 = m.new_seq(cap);
+        for (l, w) in c3.win.iter_mut().enumerate() {
+            if l < enc { let _ = w.copy_(capt.win.get(&l).unwrap_or(&a.win[l])); } else { let _ = w.fill_(f64::NAN); }
+        }
+        for (s, (k, sc)) in c3.cstate.iter_mut() { let (ck, cs) = &capt.cs[s]; let _ = k.copy_(ck); let _ = sc.copy_(cs); }
+        for (s, t) in c3.ckv.iter_mut() { let r = m.c.compress[*s]; let _ = t.narrow(0, 0, p / r).copy_(&a.ckv[s].narrow(0, 0, p / r)); let _ = c3.ikv.get_mut(s).unwrap().narrow(0, 0, p / r).copy_(&a.ikv[s].narrow(0, 0, p / r)); }
+        for (i, w) in c3.mtp_win.iter_mut().enumerate() { let _ = w.copy_(&a.mtp_win[i]); }
+        c3.hist = a.hist[..p as usize].to_vec();
+        c3.pos = p; c3.hw = p; c3.dec_pos = a.dec_pos;
+        c3.ced_tail = Some((ch.shallow_clone(), cp.shallow_clone(), p));
+        let l3 = m.logits(&m.prefill_ced(&mut c3, rest, true).unwrap());
+        let bad = c3.win.iter().map(|w| w.isnan().sum(Kind::Int64).int64_value(&[])).sum::<i64>();
+        (l3, bad)
+    });
     let la = m.logits(&m.prefill_ced(&mut c2, rest, true).unwrap());
+    if let Some((l3, bad)) = &canary {
+        let d = (&la - l3).abs().max().double_value(&[]);
+        if tp.rank == 0 { eprintln!("[ds41-ckpt-test] NaN decoder rings (dec_pos {} <= p {p} - window): continued logits max |diff| {d:.3e}, NaN left in rings {bad}", a.dec_pos); }
+        assert!(d == 0.0 && *bad == 0, "decoder rings of a checkpoint without them were read");
+    }
     let lb = m.logits(&m.prefill_ced(&mut b, rest, true).unwrap());
     let ld = (&la - &lb).abs().max().double_value(&[]);
     // chunking noise: the same tokens in one chunk of p + 300

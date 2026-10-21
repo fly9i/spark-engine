@@ -286,6 +286,11 @@ class TextStream:
         self.reasoning, self.content = "", ""
         self.buf = ""                  # decoded but not yet classified
         self.stopped = False
+        self.think_close = THINK_CLOSE
+
+    def _decode(self, ids):
+        """Text of the generated ids (a front end may stand in for control tokens, see ds41_server.DsTextStream)."""
+        return self.tok.decode(ids, skip_special_tokens=False)
 
     def _holdback(self, s, markers):
         keep = 0
@@ -305,20 +310,20 @@ class TextStream:
                 break
             if t not in EOS:
                 self.ids.append(t)
-        text = self.tok.decode(self.ids, skip_special_tokens=False)
+        text = self._decode(self.ids)
         if not final and text.endswith("�"):          # incomplete UTF-8 sequence
             text = text[:-1]
         new, self.text_len = text[self.text_len:], max(self.text_len, len(text))
         self.buf += new
         r_out, c_out = "", ""
         if self.in_reasoning:
-            i = self.buf.find(THINK_CLOSE)
+            i = self.buf.find(self.think_close)
             if i >= 0:
                 r_out += self.buf[:i]
-                self.buf = self.buf[i + len(THINK_CLOSE):].lstrip("\n")
+                self.buf = self.buf[i + len(self.think_close):].lstrip("\n")
                 self.in_reasoning = False
             else:
-                keep = 0 if final else self._holdback(self.buf, [THINK_CLOSE])
+                keep = 0 if final else self._holdback(self.buf, [self.think_close])
                 r_out, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
         if not self.in_reasoning:
             for s in self.stops:
@@ -542,6 +547,13 @@ class App:
             raise ApiError(e.code, e.message, param="messages")
         specs[0]["prep_ms"] = (time.time() - t0) * 1000     # fetch + decode + canvas (cached items: lookup only)
         return ids, reasoning, specs, plain
+
+    def tool_parser(self, tools, body):
+        return ToolCalls(tools)
+
+    def text_stream(self, reasoning, stops, stop_ids, tools_parsed=False):
+        """The chat output stream; `tools_parsed`: its content goes through a tool parser."""
+        return TextStream(self.tok, reasoning, stops, stop_ids)
 
     def limits(self, body, n_prompt):
         if int(body.get("n", 1) or 1) != 1:
@@ -809,9 +821,9 @@ def make_handler(app):
             max_new, stops, stop_ids, samp = app.limits(body, len(ids))
             rid, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
             model = body.get("model") or app.name
-            ts = TextStream(app.tok, reasoning, stops, stop_ids)
             tools = body.get("tools") if body.get("tool_choice", "auto") != "none" else None
-            tp = ToolCalls(tools) if tools else None
+            tp = app.tool_parser(tools, body) if tools else None
+            ts = app.text_stream(reasoning, stops, stop_ids, tp is not None)
             if not body.get("stream"):
                 out, finish, usage, timing = app.run(ids, max_new, (stop_ids, samp), ts, None, self._alive, mm)
                 content, calls = ts.content, []

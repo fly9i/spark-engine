@@ -15,6 +15,7 @@ extern "C" {
     fn ds41_fp4_quant(x: *const std::ffi::c_void, y: *mut std::ffi::c_void, n: i64, block: i32, e4m3: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_swiglu_quant(gu: *const f32, out: *mut std::ffi::c_void, t: i32, i: i32, lim: f32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_act_quant_fp8(x: *const std::ffi::c_void, q: *mut std::ffi::c_void, s: *mut std::ffi::c_void, numel: i64, st: *mut std::ffi::c_void) -> i32;
+    fn ds41_requant_fp8(wq: *const std::ffi::c_void, ws: *const std::ffi::c_void, q: *mut std::ffi::c_void, s: *mut std::ffi::c_void, numel: i64, st: *mut std::ffi::c_void) -> i32;
     fn ds41_fp8_gemm_mx_ex(aq: *const std::ffi::c_void, as_: *const std::ffi::c_void, w: *const std::ffi::c_void, ws: *const std::ffi::c_void, y: *mut std::ffi::c_void,
                            m: i32, n: i32, k: i32, bf16out: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_fp8_gemm_mx(aq: *const std::ffi::c_void, as_: *const std::ffi::c_void, w: *const std::ffi::c_void, ws: *const std::ffi::c_void, y: *mut f32,
@@ -392,6 +393,16 @@ pub fn act_quant_fp8(x: &Tensor) -> (Tensor, Tensor) {
     assert_eq!(unsafe { ds41_act_quant_fp8(x.data_ptr(), q.data_ptr(), s.data_ptr(), x.numel() as i64, rs_current_stream()) }, 0, "ds41_act_quant_fp8");
     (q, s)
 }
+/// act_quant of rows stored as E4M3 + E8M0 per 32 (wq Uint8 [R, K], ws Uint8 [R, K / 32]): the bytes act_quant_fp8 gives
+/// their BF16 dequantization (E4M3 x 2^(s - 127), ops::e8m0), without materializing it.
+pub fn requant_fp8(wq: &Tensor, ws: &Tensor) -> (Tensor, Tensor) {
+    let (wq, ws) = (wq.contiguous(), ws.contiguous());
+    assert_eq!(wq.numel(), ws.numel() * 32);
+    let q = Tensor::empty_like(&wq);
+    let s = Tensor::empty_like(&ws);
+    assert_eq!(unsafe { ds41_requant_fp8(wq.data_ptr(), ws.data_ptr(), q.data_ptr(), s.data_ptr(), wq.numel() as i64, rs_current_stream()) }, 0, "ds41_requant_fp8");
+    (q, s)
+}
 /// FP8 GEMV for 1..16 rows on the block-scaled MMA: x BF16 [m, k] (act-quantized inside the kernel) . W^T -> FP32 [m, n].
 pub fn fp8_gemv_mx(x: &Tensor, w: &Tensor, ws: &Tensor) -> Tensor { gemv_mx(x, w, ws, false) }
 /// Kernel attributes the MX GEMV needs, set before any graph capture (Model::load).
@@ -415,6 +426,11 @@ fn gemv_mx(x: &Tensor, w: &Tensor, ws: &Tensor, ob16: bool) -> Tensor {
 /// with E8M0 per 32x32 -> FP32 [M, N].
 pub fn fp8_gemm_mx(x: &Tensor, w: &Tensor, ws: &Tensor) -> Tensor {
     let (xq, xs) = act_quant_fp8(x);
+    fp8_gemm_mx_q(&xq, &xs, w, ws)
+}
+/// `fp8_gemm_mx` of an already quantized input (xq E4M3 bytes [M, K], xs UE8M0 bytes [M, K / 32], as act_quant_fp8).
+pub fn fp8_gemm_mx_q(xq: &Tensor, xs: &Tensor, w: &Tensor, ws: &Tensor) -> Tensor {
+    let (xq, xs) = (xq.contiguous(), xs.contiguous());
     let (m, k) = (xq.size()[0], xq.size()[1]);
     let n = w.size()[0];
     let y = Tensor::empty([m, n], (Kind::Float, xq.device()));
@@ -676,6 +692,29 @@ pub fn test(ckpt: &std::path::Path) {
     let b = super::ops::act_quant(&x.to_kind(Kind::BFloat16), 32);
     assert!(a.equal(&b), "act_quant differs from ops::act_quant");
     eprintln!("[ds41-kernel-test] act_quant bitwise == ops::act_quant");
+    // requant_fp8 == act_quant_fp8 of engram::dequant (the BF16 rows the prefill GEMM used to quantize): random E4M3 bytes
+    // (no NaN) under every scale byte 0..=254, then real engram table rows when the checkpoint has them
+    {
+        let check = |name: &str, wq: &Tensor, ws: &Tensor| {
+            let (q1, s1) = requant_fp8(wq, ws);
+            let (q2, s2) = act_quant_fp8(&super::engram::dequant(wq, ws));
+            let (dq, ds) = (q1.ne_tensor(&q2).sum(Kind::Int64).int64_value(&[]), s1.ne_tensor(&s2).sum(Kind::Int64).int64_value(&[]));
+            eprintln!("[ds41-kernel-test] requant_fp8 {name}: {dq} byte / {ds} scale mismatches of {} / {}", q1.numel(), s1.numel());
+            assert!(dq == 0 && ds == 0, "requant_fp8 differs ({name})");
+        };
+        let r = 255 * 8;
+        let wq = Tensor::randint(0x7f, [r, 256], (Kind::Int64, dev));
+        let wq = (&wq + Tensor::randint(2, [r, 256], (Kind::Int64, dev)) * 128).to_kind(Kind::Uint8);   // sign bit
+        let ws = (Tensor::arange(r * 8, (Kind::Int64, dev)).remainder(255)).to_kind(Kind::Uint8).view([r, 8]);
+        check("random, scales 0..=254", &wq, &ws);
+        if ck.has("layers.1.engram.embed.weight") {
+            let (wb, sb) = (ck.bytes("layers.1.engram.embed.weight"), ck.bytes("layers.1.engram.embed.scale"));
+            let rows: Vec<i64> = (0..65536i64).map(|i| (i * 5_860_103) % (wb.len() as i64 / 256)).collect();
+            let (w, s) = super::engram::gather(wb, sb, &rows, 256);
+            let up = |b: &Vec<u8>| Tensor::from_slice(b).to_device(dev);
+            check("engram layer 1, 65536 rows", &up(&w).view([65536, 256]), &up(&s).view([65536, 8]));
+        }
+    }
     let report = |name: &str, fast: &Tensor, refv: &Tensor| {
         let rel = ((fast - refv).abs().max().double_value(&[])) / refv.abs().max().double_value(&[]).max(1e-30);
         eprintln!("[ds41-kernel-test] {name}: max |diff| / max |ref| = {rel:.2e}");

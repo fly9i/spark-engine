@@ -145,6 +145,13 @@ impl Fp8W {
         else if gemv_on() { super::kern::fp8_mm(&x, &self.w, &self.s) }
         else { x.to_kind(Kind::Float).matmul(&self.dequant().to_kind(Kind::Float).tr()) }
     }
+    /// `mm_f32` of the act_quant operands (xq E4M3 bytes [m, k], xs UE8M0 bytes [m, k / 32]) when mm_f32 would take the
+    /// block-scaled MMA GEMM for this shape (which quantizes its BF16 input into exactly these), else None.
+    pub fn mm_f32_q(&self, xq: &Tensor, xs: &Tensor) -> Option<Tensor> {
+        let (m, k) = (xq.size()[0], xq.size()[1]);
+        (gemv_on() && !mx_gemv_ok(m, k, self.n()) && m > 64 && moe_mx_on() && k % 64 == 0)
+            .then(|| super::kern::fp8_gemm_mx_q(xq, xs, &self.w, &self.s))
+    }
     /// x [m, k] BF16 -> act_quant(x) . W^T FP32 [m, n] (no output rounding: TP partial sums). The MMA paths quantize
     /// inside; act_quant is idempotent, so an already quantized x gives the same result.
     pub fn mm_f32(&self, x: &Tensor) -> Tensor {
@@ -232,6 +239,16 @@ fn vl_set(mask: Option<Tensor>) -> VlGuard { VL.with(|v| *v.borrow_mut() = mask)
 fn vl_rows(off: i64, n: i64, exact: bool) -> Option<Tensor> {
     VL.with(|v| v.borrow().as_ref().filter(|m| if exact { m.size()[0] == n } else { m.size()[0] >= off + n }).map(|m| m.narrow(0, off, n)))
 }
+/// Engram rows of a chunk: BF16, or the act_quant operands of its projection (E4M3 bytes [T, K], UE8M0 bytes [T, K / 32]).
+pub(super) enum ERows { Bf16(Tensor), Q(Tensor, Tensor) }
+impl ERows {
+    fn narrow(&self, r0: i64, n: i64) -> ERows {
+        match self { ERows::Bf16(r) => ERows::Bf16(r.narrow(0, r0, n)), ERows::Q(q, s) => ERows::Q(q.narrow(0, r0, n), s.narrow(0, r0, n)) }
+    }
+}
+/// DS41_ENGRAM_Q=0: prefill dequantizes the engram rows to BF16 first (the GEMM quantizes them again).
+fn engram_q_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_ENGRAM_Q").map_or(true, |v| v != "0")) }
+
 /// The engram leaves image rows unchanged (its gate is shut there): `out` with those rows of `h` put back.
 fn engram_skip_images(h: &Tensor, out: Tensor, off: i64) -> Tensor {
     match vl_rows(off, h.size()[0], false) { Some(m) => h.where_self(&m.view([-1, 1, 1]), &out), None => out }
@@ -584,7 +601,8 @@ impl Model {
     /// CED tail, n-gram history (host); pos, dec_pos, ced_end.
     pub fn pcache_fixed(&self, seq: &Seq) -> (Vec<(String, crate::pcache_core::Part)>, serde_json::Map<String, serde_json::Value>) {
         use crate::pcache_core::Part;
-        let mut f = vec![("win".to_string(), Part::Dev(Tensor::stack(&seq.win, 0)))];
+        let wins: Vec<Tensor> = seq.win.iter().map(|t| t.shallow_clone()).collect();
+        let mut f = vec![("win".to_string(), Part::Dev(self.pcache_win(&wins, seq.dec_pos, seq.pos)))];
         for s in self.kv_srcs() {
             if let Some((k, sc)) = seq.cstate.get(&s) { f.push((format!("csk.{s}"), Part::Dev(k.shallow_clone()))); f.push((format!("css.{s}"), Part::Dev(sc.shallow_clone()))); }
         }
@@ -609,7 +627,7 @@ impl Model {
         let (ch, cp) = cap.ced.as_ref()?;
         if p >= seq.pos || seq.dec_pos > p || (0..enc.min(self.layers.len())).any(|l| !cap.win.contains_key(&l)) { return None; }
         let win: Vec<Tensor> = (0..seq.win.len()).map(|l| cap.win.get(&l).map_or_else(|| seq.win[l].shallow_clone(), |t| t.shallow_clone())).collect();
-        let mut f = vec![("win".to_string(), Part::Dev(Tensor::stack(&win, 0)))];
+        let mut f = vec![("win".to_string(), Part::Dev(self.pcache_win(&win, seq.dec_pos, p)))];
         for s in self.kv_srcs() {
             if seq.cstate.contains_key(&s) { let (k, sc) = cap.cs.get(&s)?; f.push((format!("csk.{s}"), Part::Dev(k.shallow_clone()))); f.push((format!("css.{s}"), Part::Dev(sc.shallow_clone()))); }
         }
@@ -624,6 +642,15 @@ impl Model {
         f.push(("hist".into(), Part::Host { kind: Kind::Int64, shape: vec![p], bytes: std::sync::Arc::new(hb) }));
         Some((f, meta))
     }
+    /// The window rings a checkpoint at `p` stores (stacked): the encoder layers' only when the decoder last ran a full
+    /// window before p (dec_pos + window <= p). Its rings are then never read again: the next prompt's closing replay
+    /// starts at most a window before its end, i.e. after dec_pos, so it is the bounded one (window attention truncated
+    /// to the replayed rows) and rewrites them (prefill_ced). Saves the 20 decoder rings (2.6 MB) of most fork
+    /// checkpoints; a prompt's own end (dec_pos == pos) keeps all.
+    fn pcache_win(&self, win: &[Tensor], dec_pos: i64, p: i64) -> Tensor {
+        let enc = (self.c.n_layers / 2) as usize;
+        if dec_pos + self.c.window <= p && win.len() > enc { Tensor::stack(&win[..enc], 0) } else { Tensor::stack(win, 0) }
+    }
     /// Installs a restored checkpoint into `seq`, whose rows (pcache_rows) already hold the restored rows and were reset
     /// before (reset_seq).
     pub fn pcache_install(&self, seq: &mut Seq, l: crate::pcache_core::Loaded) -> Result<(), String> {
@@ -631,8 +658,12 @@ impl Model {
         let pos = l.meta["pos"].as_i64().ok_or("pos")?;
         if pos != l.ids.len() as i64 || pos >= seq.cap { return Err(format!("position {pos} for {} ids, capacity {}", l.ids.len(), seq.cap)); }
         let win = o.remove("win").ok_or("win")?;
-        if win.size()[0] != seq.win.len() as i64 { return Err("window layers".into()); }
-        for (i, w) in seq.win.iter_mut().enumerate() { let _ = w.copy_(&win.get(i as i64)); }
+        let dec_pos = l.meta["dec_pos"].as_i64().ok_or("dec_pos")?;
+        // all rings, or the encoder's (pcache_win) with the decoder's left as reset (never read before rewritten)
+        let enc = self.c.n_layers / 2;
+        let all = win.size()[0] == seq.win.len() as i64;
+        if !all && !(win.size()[0] == enc as i64 && dec_pos + self.c.window <= pos) { return Err("window layers".into()); }
+        for (i, w) in seq.win.iter_mut().enumerate().take(win.size()[0] as usize) { let _ = w.copy_(&win.get(i as i64)); }
         for (&s, (k, sc)) in seq.cstate.iter_mut() {
             let _ = k.copy_(&o.remove(&format!("csk.{s}")).ok_or("csk")?);
             let _ = sc.copy_(&o.remove(&format!("css.{s}")).ok_or("css")?);
@@ -645,7 +676,7 @@ impl Model {
         seq.hist = Vec::<i64>::try_from(o.remove("hist").ok_or("hist")?).map_err(|e| e.to_string())?;
         seq.pos = pos;
         seq.hw = pos;
-        seq.dec_pos = l.meta["dec_pos"].as_i64().ok_or("dec_pos")?;
+        seq.dec_pos = dec_pos;
         seq.ced_tail = match (o.remove("ced_h"), o.remove("ced_pm"), l.meta["ced_end"].as_i64()) {
             (Some(th), Some(tp), Some(end)) => Some((th, tp, end)),
             _ => None,
@@ -1089,7 +1120,7 @@ impl Model {
             let mut att: Vec<(Tensor, Option<i32>, Tensor, Tensor, Tensor, Tensor)> = Vec::new();
             // the engram rows of the whole chunk, gathered once
             let erows = match (&layer.engram, &self.hash) {
-                (Some(_), Some(hsh)) => { let li = hsh.layer_ids.iter().position(|&x| x == l).unwrap(); Some(self.engram_rows(l, &hashes[li], t)) }
+                (Some(_), Some(hsh)) => { let li = hsh.layer_ids.iter().position(|&x| x == l).unwrap(); Some(self.engram_rows_q(l, &hashes[li], t)) }
                 _ => None,
             };
             for b in 0..2 {
@@ -1104,7 +1135,7 @@ impl Model {
                 let n = rows[b].1;
                 if let (Some(e), Some(er)) = (&layer.engram, &erows) {
                     DEFER_AR.with(|d| d.set(false));
-                    hs[b] = prof("engram", || engram_skip_images(&hs[b], self.engram(e, &hs[b], &er.narrow(0, rows[b].0, n)), rows[b].0));
+                    hs[b] = prof("engram", || engram_skip_images(&hs[b], self.engram_q(e, &hs[b], &er.narrow(rows[b].0, n)), rows[b].0));
                     DEFER_AR.with(|d| d.set(true));
                 }
                 let residual = hs[b].shallow_clone();
@@ -1205,11 +1236,35 @@ impl Model {
         }
         engram::rows(&self.tables, l, hashes, hs.head_dim).view([t, hs.cols() as i64 * hs.head_dim])
     }
-    pub(super) fn engram(&self, e: &Engram, h: &Tensor, rows: &Tensor) -> Tensor {
+    /// The chunk's engram rows for prefill: the act_quant operands straight from the table bytes (DS41_ENGRAM_Q, default
+    /// on; engram::upload_q), else BF16 as engram_rows.
+    pub(super) fn engram_rows_q(&self, l: usize, hashes: &[i64], t: i64) -> ERows {
+        if !engram_q_on() { return ERows::Bf16(self.engram_rows(l, hashes, t)); }
+        let hs = self.hash.as_ref().unwrap();
+        let (n, w) = (t * hs.cols() as i64, hs.cols() as i64 * hs.head_dim);
+        let pending = ENGRAM_PENDING.with(|p| p.borrow_mut().remove(&l)).map(|h| h.join().expect("engram gather thread"));
+        let (q, s) = match pending {
+            Some((wb, sb)) if wb.len() as i64 == n * hs.head_dim => engram::upload_q(wb, sb, self.dev),
+            _ => engram::rows_q(&self.tables, l, hashes, hs.head_dim),
+        };
+        ERows::Q(q.view([t, w]), s.view([t, w / 32]))
+    }
+    pub(super) fn engram(&self, e: &Engram, h: &Tensor, rows: &Tensor) -> Tensor { self.engram_part(e, h, e.wkv.mm_f32(rows)) }
+    /// `engram` of the act_quant operands of the rows (ERows::Q) where the projection takes them directly.
+    pub(super) fn engram_q(&self, e: &Engram, h: &Tensor, rows: &ERows) -> Tensor {
+        match rows {
+            ERows::Bf16(r) => self.engram(e, h, r),
+            ERows::Q(q, s) => {
+                let part = e.wkv.mm_f32_q(q, s).unwrap_or_else(|| e.wkv.mm_f32(&engram::dequant(q, s)));
+                self.engram_part(e, h, part)
+            }
+        }
+    }
+    /// The engram after the projection: `part` this rank's wkv output rows (FP32).
+    fn engram_part(&self, e: &Engram, h: &Tensor, part: Tensor) -> Tensor {
         let c = &self.c;
         let t = h.size()[0];
         // this rank's output rows, zero-padded and summed over the ranks (exact), then rounded like the full Linear
-        let part = e.wkv.mm_f32(rows);
         let full = Tensor::zeros([t, (c.hc + 1) * c.dim], (Kind::Float, self.dev));
         let _ = full.narrow(1, e.row0, part.size()[1]).copy_(&part);
         // (prefill: BF16 transport, the same bits here: every element has one nonzero part and is rounded to BF16)
