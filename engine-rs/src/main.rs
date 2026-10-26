@@ -211,6 +211,8 @@ fn main() {
         Some("ds41-spec") => ds41::probe::spec(Path::new(&args[2]),&args[3],Path::new(&args[4]),args[5].parse().expect("n_new"),args.get(6).map_or(0.0,|v|v.parse().expect("temperature"))),
         Some("ds41-ar-bench") => ds41::probe::ar_bench(),
         Some("ds41-gemv-bench") => ds41::kern::gemv_bench(),
+        Some("ds41-gemm-bench") => ds41::kern::gemm_bench(),
+        Some("ds41-attn-bench") => ds41::kern::attn_bench(),
         Some("ds41-kernel-test") => ds41::kern::test(Path::new(&args[2])),
         Some("tp-rsag-probe") => tp::rsag_probe(Path::new(&args[2]),args.get(3).map_or(4096,|v|v.parse().unwrap()),args.get(4).map_or(4096,|v|v.parse().unwrap())),
         Some("ds41-vision-probe") => ds41::vision::probe(&args),

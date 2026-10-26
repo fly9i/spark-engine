@@ -1,3 +1,4 @@
+#include <type_traits>
 // SPDX-License-Identifier: MIT
 // N-way lean FP32 allreduce over RoCE RC queue pairs (GLM53_RDMA_ARN_INIT=1; TP3, docs/06-TP3.md §5.2).
 //
@@ -23,6 +24,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include "host_pin.cuh"
+#include "rdma_gid.h"
 #include <infiniband/verbs.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -369,6 +371,70 @@ __global__ void arn_rows_finish_bf16_kernel(float* out,const float* own,long lon
   __threadfence();__syncthreads();
   if(threadIdx.x==0&&atomicAdd(&st->fdone,1u)==gridDim.x-1){st->fdone=0;st->fseq=s;}
 }
+// The allreduce's BF16 sum as a row-block reduce-scatter (DS41 sequence-parallel prefill, glm53_rdma_arn_rows_bf16r_cuda):
+// every rank's FP32 partial rounded to BF16 (its own too), summed in rank order in FP32 and rounded to BF16 -- per
+// element exactly glm53_rdma_arn_big_bf16_cuda's value. `data` holds n_valid FP32 elements of world blocks of blk_f
+// (the rows past them, the last block's padding, read as zeros: no padded copy of the input).
+// T = Comb: the partial is a routed-expert call's combine computed here (y = add + sum_k out[pair (r, k)], each element
+// with combine_kernel's adds in its order, ds41_mx.cu): no FP32 y written and read back, and a chunk's combine runs
+// while the earlier chunks are on the wire
+struct Comb { const float* out; const int* pairmap; const float* add; int topk; int hcols; };
+__device__ __forceinline__ float comb1(const Comb& cb,long long g){
+  const long long r=g/cb.hcols;const int c=(int)(g%cb.hcols);
+  float acc=cb.add?cb.add[g]:0.f,s=0.f;
+  for(int k=0;k<cb.topk;++k)s+=cb.out[(long long)cb.pairmap[r*cb.topk+k]*cb.hcols+c];
+  return acc+s;
+}
+// T = __nv_bfloat16: the partial is already BF16 (its FP32 rounding is the value itself: the same bytes on the wire)
+template<class T>
+__global__ void arn_rows_send_bf16v_kernel(typename std::conditional<std::is_same<T,Comb>::value,Comb,const T*>::type data,long long blk_f,long long off_f,long long m_f,long long n_valid,int world,
+                                           unsigned long long flags,Host* h,DevState* st){
+  const unsigned long long s=st->seq+1;const int slot=(int)(s%NSLOT);
+  __nv_bfloat16* snd=reinterpret_cast<__nv_bfloat16*>(h->send[slot]);
+  const long long stride=(long long)gridDim.x*blockDim.x,first=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+  for(int j=0;j<world;++j){const long long base=(long long)j*blk_f+off_f;__nv_bfloat16* d=snd+(long long)j*m_f;
+    for(long long i=first;i<m_f/2;i+=stride){
+      if constexpr(std::is_same<T,Comb>::value){const long long g=base+2*i;
+        const float v0=g<n_valid?comb1(data,g):0.f,v1=g+1<n_valid?comb1(data,g+1):0.f;
+        reinterpret_cast<__nv_bfloat162*>(d)[i]=__floats2bfloat162_rn(v0,v1);}
+      else if constexpr(std::is_same<T,float>::value){const T* src=data+base;const float2 v=base+2*i+1<n_valid?reinterpret_cast<const float2*>(src)[i]:make_float2(base+2*i<n_valid?src[2*i]:0.f,0.f);
+        reinterpret_cast<__nv_bfloat162*>(d)[i]=__floats2bfloat162_rn(v.x,v.y);}
+      else{const T* src=data+base;const __nv_bfloat16 z=__float2bfloat16_rn(0.f);
+        reinterpret_cast<__nv_bfloat162*>(d)[i]=base+2*i+1<n_valid?reinterpret_cast<const __nv_bfloat162*>(src)[i]:__halves2bfloat162(base+2*i<n_valid?src[2*i]:z,z);}}}
+  __threadfence_system();__syncthreads();
+  if(threadIdx.x==0){
+    if(atomicAdd(&st->arrive,1u)==gridDim.x-1){st->arrive=0;h->ready_bytes[slot]=((unsigned long long)world*m_f*2)|flags;__threadfence_system();h->ready_seq[slot]=s;__threadfence_system();}
+    if(atomicAdd(&st->done,1u)==gridDim.x-1){st->done=0;st->seq=s;}
+  }
+}
+// out (BF16, this rank's block) chunk = BF16(sum in rank order of the BF16 partials of block `rank`); this rank's own is
+// read back from its send slot (the rounded values it sent)
+__global__ void arn_rows_finish_bf16r_kernel(__nv_bfloat16* out,long long m_f,long long off_f,int rank,int world,
+                                             const Host* h,DevState* st,unsigned long long split){
+  const unsigned long long s=st->fseq+1;const int slot=(int)(s%NSLOT);
+  if(threadIdx.x==0){
+    const bool two=split&&(unsigned long long)m_f*2>=split;
+    for(int r=0;r<world;++r){
+      if(r==rank)continue;
+      long long spins=0;
+      while(h->recv_flag[r][0][slot]!=s||(two&&h->recv_flag[r][1][slot]!=s)){if(++spins>(1ll<<34))__trap();}
+    }
+  }
+  __syncthreads();
+  const long long stride=(long long)gridDim.x*blockDim.x,first=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+  const __nv_bfloat162* mine=reinterpret_cast<const __nv_bfloat162*>(reinterpret_cast<const __nv_bfloat16*>(h->send[slot])+(long long)rank*m_f);
+  for(long long i=first;i<m_f/2;i+=stride){
+    float2 acc=make_float2(0.f,0.f);
+    for(int r=0;r<world;++r){
+      const __nv_bfloat162 b=r==rank?mine[i]:__ldcv(reinterpret_cast<const __nv_bfloat162*>(reinterpret_cast<const __nv_bfloat16*>(h->recv[r][slot])+(long long)rank*m_f)+i);
+      const float2 x=__bfloat1622float2(b);
+      if(r==0)acc=x;else{acc.x=__fadd_rn(acc.x,x.x);acc.y=__fadd_rn(acc.y,x.y);}
+    }
+    reinterpret_cast<__nv_bfloat162*>(out+off_f)[i]=__floats2bfloat162_rn(acc.x,acc.y);
+  }
+  __threadfence();__syncthreads();
+  if(threadIdx.x==0&&atomicAdd(&st->fdone,1u)==gridDim.x-1){st->fdone=0;st->fseq=s;}
+}
 // ag: `out` is the whole buffer, `own` this rank's block (copied into its place); else (FP32) `out` is this rank's block,
 // `own` the whole partial buffer: out chunk = sum over r in rank order of block `rank` of rank r's partial
 __global__ void arn_rows_finish_kernel(unsigned char* out,const unsigned char* own,long long blk,long long off,long long m,int rank,int world,
@@ -439,18 +505,7 @@ std::vector<DevInfo> local_devices(){
 }
 
 // The GID index holding the IPv4-mapped RoCE v2 address `ip`.
-int find_gid(ibv_context* ctx,const char* name,uint32_t ip){
-  if(const char* g=std::getenv("GLM53_RDMA_ARN_GID"))return std::atoi(g);
-  for(int i=0;i<64;++i){
-    ibv_gid gid;if(ibv_query_gid(ctx,1,i,&gid))break;
-    static const uint8_t v4[12]={0,0,0,0,0,0,0,0,0,0,0xff,0xff};
-    if(memcmp(gid.raw,v4,12)||memcmp(gid.raw+12,&ip,4))continue;
-    char path[256],type[32]={};snprintf(path,sizeof path,"/sys/class/infiniband/%s/ports/1/gid_attrs/types/%d",name,i);
-    if(FILE* f=fopen(path,"r")){if(fgets(type,sizeof type,f)){}fclose(f);}
-    if(strstr(type,"v2"))return i;
-  }
-  return -1;
-}
+int find_gid(ibv_context* ctx,const char* name,uint32_t ip){return rdma_ipv4_v2_gid(ctx,name,ip,"GLM53_RDMA_ARN_GID");}
 
 Dev* open_dev(const DevInfo& di){
   for(Dev* d:g_devs)if(d->name==di.name)return d;
@@ -667,6 +722,16 @@ extern "C" int glm53_rdma_arn_big_bf16_cuda(float* data,long long n,cudaStream_t
   }
   return (int)cudaGetLastError();
 }
+// Calls in flight of the row-block reduce-scatter / all-gather (one call per chunk, so at most about K unfinished, against
+// NSLOT 32 slots): GLM53_RDMA_ARN_ROWS_PIPE (3, at most 12; the large allreduce keeps GLM53_RDMA_ARN_PIPE <= 6: it has
+// ~4K unfinished). Every chunk's round trip (send kernel, proxy, RDMA write, flag, finish kernel) is a latency the deeper
+// pipeline hides: DS41 TP3 32k prefill (two 2048-row parts per pass) 3 -> 7018 ms, 6 6875, 8 6823, 12 6761 (10-26;
+// start-ds41.sh / bench/ds41/tp3-run.sh set 12); GLM TP2 prefill level within noise (8k 6390 / 6420 ms, 32k 25640 /
+// 25820 ms), so the default stays 3. The sums are per element in rank order whatever the chunking: the same bits.
+static int arn_rows_pipe(){
+  const char* e=std::getenv("GLM53_RDMA_ARN_ROWS_PIPE");
+  const int k=e?std::atoi(e):3;return k<1?1:(k>12?12:k);
+}
 // Fallback consumer of a send-only call: data = rank-ordered sum in place (optionally Half-rounded).
 // Row-block reduce-scatter (ag = 0: FP32; `in` world blocks of blk bytes, `out` this rank's block) or all-gather (ag = 1:
 // any element size; `in` this rank's block, `out` world blocks). blk: a multiple of 16 bytes. Chunks of up to a slot's
@@ -677,7 +742,7 @@ extern "C" int glm53_rdma_arn_rows_cuda(const void* in,void* out,long long blk,i
   if(!g_host||blk<16||blk%16)return 1;
   static const bool rs_bf16=[]{const char* e=std::getenv("GLM53_RDMA_ARN_RS_BF16");return e&&e[0]=='1';}();
   if(!ag&&rs_bf16)return glm53_rdma_arn_rows_bf16_cuda((const float*)in,(float*)out,blk,s);
-  static const int K=[]{const char* e=std::getenv("GLM53_RDMA_ARN_PIPE");int k=e?std::atoi(e):3;return k<1?1:(k>6?6:k);}();
+  static const int K=arn_rows_pipe();
   static const int nb=[]{const char* e=std::getenv("GLM53_RDMA_ARN_BIG_BLOCKS");int b=e?std::atoi(e):96;return b<1?1:b;}();
   const long long mmax=(long long)(SLOT_BYTES/g_world)/64*64,nch=(blk+mmax-1)/mmax;
   auto len=[&](long long i){return std::min(mmax,blk-i*mmax);};
@@ -697,7 +762,7 @@ extern "C" int glm53_rdma_arn_rows_cuda(const void* in,void* out,long long blk,i
 // to BF16, this rank's own stays FP32, the rank-ordered sum is FP32 (L1: GLM53_RDMA_ARN_RS_BF16=1).
 extern "C" int glm53_rdma_arn_rows_bf16_cuda(const float* in,float* out,long long blk,cudaStream_t s){
   if(!g_host||blk<16||blk%16)return 1;
-  static const int K=[]{const char* e=std::getenv("GLM53_RDMA_ARN_PIPE");int k=e?std::atoi(e):3;return k<1?1:(k>6?6:k);}();
+  static const int K=arn_rows_pipe();
   static const int nb=[]{const char* e=std::getenv("GLM53_RDMA_ARN_BIG_BLOCKS");int b=e?std::atoi(e):96;return b<1?1:b;}();
   const long long blk_f=blk/4,mmax=(long long)(SLOT_BYTES/2/g_world)/32*32,nch=(blk_f+mmax-1)/mmax;   // FP32 elements per region
   auto len=[&](long long i){return std::min(mmax,blk_f-i*mmax);};
@@ -709,6 +774,31 @@ extern "C" int glm53_rdma_arn_rows_bf16_cuda(const float* in,float* out,long lon
     if(a>=0)arn_rows_finish_bf16_kernel<<<blocks(len(a)),256,0,s>>>(out,in,blk_f,a*mmax,len(a),g_rank,g_world,g_host_dev,g_state,g_split);
   }
   return (int)cudaGetLastError();
+}
+// The BF16 allreduce's sum as a row-block reduce-scatter (arn_rows_finish_bf16r_kernel): `in` FP32, world blocks of blk_f
+// elements of which the first n_valid exist; `out` this rank's block as BF16. blk_f: a multiple of 8.
+template<class T> static int rows_bf16r(typename std::conditional<std::is_same<T,Comb>::value,Comb,const T*>::type in,void* out,long long blk_f,long long n_valid,cudaStream_t s){
+  if(!g_host||blk_f<8||blk_f%8)return 1;
+  static const int K=arn_rows_pipe();
+  static const int nb=[]{const char* e=std::getenv("GLM53_RDMA_ARN_BIG_BLOCKS");int b=e?std::atoi(e):96;return b<1?1:b;}();
+  const long long mmax=(long long)(SLOT_BYTES/2/g_world)/32*32,nch=(blk_f+mmax-1)/mmax;
+  auto len=[&](long long i){return std::min(mmax,blk_f-i*mmax);};
+  auto blocks=[&](long long m){long long b=(m/2+255)/256;return (int)std::max(1ll,std::min<long long>(nb,b));};
+  const unsigned long long flags=MODE_RS|MODE_BF16;
+  for(long long t=0;t<nch+K;++t){
+    if(t<nch)arn_rows_send_bf16v_kernel<T><<<blocks(len(t)),256,0,s>>>(in,blk_f,t*mmax,len(t),n_valid,g_world,flags,g_host_dev,g_state);
+    const long long a=t-K;
+    if(a>=0)arn_rows_finish_bf16r_kernel<<<blocks(len(a)),256,0,s>>>((__nv_bfloat16*)out,len(a),a*mmax,g_rank,g_world,g_host_dev,g_state,g_split);
+  }
+  return (int)cudaGetLastError();
+}
+extern "C" int glm53_rdma_arn_rows_bf16r_cuda(const float* in,void* out,long long blk_f,long long n_valid,cudaStream_t s){ return rows_bf16r<float>(in,out,blk_f,n_valid,s); }
+// the same with a BF16 partial (`in` BF16 values: bitwise the FP32 call on their FP32 copy)
+extern "C" int glm53_rdma_arn_rows_bf16r_b16_cuda(const void* in,void* out,long long blk_f,long long n_valid,cudaStream_t s){ return rows_bf16r<__nv_bfloat16>((const __nv_bfloat16*)in,out,blk_f,n_valid,s); }
+// the same of a routed-expert combine (Comb: `pairmap` / `add` at the part's first row, out [P, hcols] FP32)
+extern "C" int glm53_rdma_arn_rows_bf16r_comb_cuda(const float* pout,const int* pairmap,const float* add,int topk,int hcols,void* out,long long blk_f,long long n_valid,cudaStream_t s){
+  if(hcols%2)return 1;
+  return rows_bf16r<Comb>(Comb{pout,pairmap,add,topk,hcols},out,blk_f,n_valid,s);
 }
 extern "C" int glm53_rdma_arn_materialize_cuda(float* data,long long n,int round,cudaStream_t s){
   if(!g_host||n<1||(size_t)n*4>SLOT_BYTES)return 1;

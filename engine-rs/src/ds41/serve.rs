@@ -341,7 +341,10 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
     let vision = (tp.rank == 0 && super::vision::enabled()).then(|| super::vision::Vision::load(&m.tables, ckpt));
     let n_stores = env_i64("DS41_SERVE_STORES", 4) as usize;
     let granule = env_i64("DS41_KV_GRANULE", 256);
-    let chunk = env_i64("DS41_PREFILL_CHUNK", 4096) as usize;   // 8k-token prompt: 4096 1285 tok/s, 2048 1226, 8192 1159
+    // 8192: two 4096-token sub-chunks per step (Model::prefill_ced, DS41_CED_SUB), their routed experts in one call --
+    // the same bits as 4096-token chunks (10-25: cold ~29.6k-token prompts 7345 -> ~7120 ms; 8192 one-piece chunks were
+    // slower: 1285 vs 1159 tok/s at 8k, before the sub-chunks)
+    let chunk = env_i64("DS41_PREFILL_CHUNK", 8192) as usize;
     let eos: Vec<i64> = std::env::var("DS41_EOS").unwrap_or_else(|_| "1".into()).split(',').map(|v| v.parse().unwrap()).collect();
     // warm-up stores: their own small KV (the pool is sized after the warm-up)
     let warm_cap = (chunk as i64 + 1024 + granule - 1) / granule * granule;
@@ -536,6 +539,13 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
         pc_save_caps(&m, pc, stores, s);
         lg
     };
+    // DS41_MIX_DECODE_SHARE (0..0.9, default 0): while a prompt prefills and other sequences decode, the decode steps'
+    // share of the time (a prefill chunk of 8192 runs ~1.5 s; with the default one decode step follows each chunk, so a
+    // decoding stream gets a token or one speculative round per chunk). With a share f the next chunk waits until the
+    // decode steps since the last chunk took f / (1 - f) of its time. Only the timing changes (the chunks and every
+    // computation are the same), and a prompt prefilling alone is not affected.
+    let mix_share = std::env::var("DS41_MIX_DECODE_SHARE").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0).clamp(0.0, 0.9);
+    let (mut last_pf_ms, mut dec_since_pf_ms) = (0.0f64, 0.0f64);
     loop {
         let t_loop = Instant::now();
         if let Some(p) = pc.as_mut() { p.poll(); }
@@ -643,15 +653,24 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
         if active.is_empty() { continue; }
         // ---- one prefill chunk (prefilling sequences in turn)
         let pre: Vec<usize> = (0..active.len()).filter(|&i| active[i].done_prompt < active[i].prompt.len() && !active[i].cancelled).collect();
-        if !pre.is_empty() {
+        let decoding = active.iter().any(|a| !a.cancelled && a.done_prompt >= a.prompt.len() && !a.out.is_empty() && a.out.len() < a.max_new
+            && !eos.contains(a.out.last().unwrap()) && !a.stop_ids.contains(a.out.last().unwrap()));
+        let pf_turn = mix_share == 0.0 || !decoding || dec_since_pf_ms >= mix_share / (1.0 - mix_share) * last_pf_ms;
+        if !pre.is_empty() && pf_turn {
             turn = (turn + 1) % pre.len();
             let a = &mut active[pre[turn]];
             let t = Instant::now();
             // prefix cache: the snapshot is taken after all but the last prompt token (an identical prompt later still
             // has one token to run for its logits); the chunk is cut there
             let save_at = if pc.is_some() && a.prompt.len() >= pc_min { a.prompt.len() - 1 } else { usize::MAX };
-            let mut n = chunk.min(a.prompt.len() - a.done_prompt);
-            for cut in [a.fork_at, save_at] { if a.done_prompt < cut && a.done_prompt + n > cut { n = cut - a.done_prompt; } }
+            // the chunk starting at prompt position d (the next one's too: its engram prefetch must ask for exactly its
+            // rows, else layer 1 gathers them synchronously, a cold NVMe read for new text, +0.2-0.3 s at 32k)
+            let chunk_at = |d: usize| {
+                let mut n = chunk.min(a.prompt.len() - d);
+                for cut in [a.fork_at, save_at] { if d < cut && d + n > cut { n = cut - d; } }
+                n
+            };
+            let n = chunk_at(a.done_prompt);
             // checkpoints every DS41_PCACHE_EVERY (512) prompt tokens, captured inside the chunk (no cut: the chunk keeps its
             // size), so a later prompt sharing a prefix restores the last one on its first repeat (each adds the fixed-size
             // state, ~10 MB; the rows are the shared segments). Encoder-only chunks only (the prompt's last chunk replays the
@@ -671,7 +690,8 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
                 ctrl.send(&json!({"op": "pf", "prev": prev, "next": &ids}));
                 m.engram_prefetch(prev, &ids);
             }
-            let nxt = &a.prompt[a.done_prompt + n..(a.done_prompt + n + chunk).min(a.prompt.len())];
+            let d1 = a.done_prompt + n;
+            let nxt = &a.prompt[d1..if d1 < a.prompt.len() { d1 + chunk_at(d1) } else { d1 }];
             if !nxt.is_empty() {
                 ctrl.send(&json!({"op": "pf", "prev": &ids[ids.len().saturating_sub(3)..], "next": nxt}));
                 m.engram_prefetch(&ids, nxt);
@@ -691,8 +711,10 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
             }
             tch::Cuda::synchronize(0);
             a.prefill_ms += t.elapsed().as_secs_f64() * 1e3;
+            (last_pf_ms, dec_since_pf_ms) = (t.elapsed().as_secs_f64() * 1e3, 0.0);
             if std::env::var("DS41_PREFILL_STATS").is_ok_and(|v| v == "1") {
-                eprintln!("[ds41-serve] prefill chunk of {n} rows (last {}): {:.1} ms", a.done_prompt == a.prompt.len(), t.elapsed().as_secs_f64() * 1e3);
+                let (ar, af) = super::mem::alloc_stats();
+                eprintln!("[ds41-serve] prefill chunk of {n} rows (last {}): {:.1} ms (allocator retries {ar}, cudaFree {af})", a.done_prompt == a.prompt.len(), t.elapsed().as_secs_f64() * 1e3);
             }
         }
         // ---- one decode step of every decoding sequence, batched (ascending store index on every rank)
@@ -759,7 +781,7 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
                 a.out.push(sample(&lg.narrow(0, k as i64, 1), a.temp, a.seed, pos));
             }
         }
-        if !dec.is_empty() { step_stats(t_loop, t_dec, dec.len()); }
+        if !dec.is_empty() { step_stats(t_loop, t_dec, dec.len()); dec_since_pf_ms += t_dec.elapsed().as_secs_f64() * 1e3; }
         // ---- deltas, stop conditions, retirement
         let mut i = 0;
         while i < active.len() {

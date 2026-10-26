@@ -180,9 +180,15 @@ __device__ __forceinline__ uint32_t e4m3x2_bf16(uint16_t two,float s){
   __nv_bfloat162 r=__floats2bfloat162_rn(f.x*s,f.y*s);
   return *reinterpret_cast<uint32_t*>(&r);
 }
+// B16: BF16 output (the FP32 sum rounded to nearest even, as converting it); xs / ys: input / output row strides
+// (elements); grid z: groups of a grouped weight (group z: input elements [z k, +k) of each row, weight rows [z n, +n),
+// output columns [z n, +n))
+template<bool B16>
 __global__ __launch_bounds__(128) void fp8_mm(const __nv_bfloat16* __restrict__ x,const uint8_t* __restrict__ w,
-    const uint8_t* __restrict__ ws,float* __restrict__ y,int m,int n,int k){
+    const uint8_t* __restrict__ ws,void* __restrict__ yv,int m,int n,int k,int xs,int ys){
   const int lane=threadIdx.x&31,warp=threadIdx.x>>5,g=lane>>2,q=lane&3;
+  x+=(long long)blockIdx.z*k;w+=(long long)blockIdx.z*n*k;ws+=(long long)blockIdx.z*(n>>5)*(k>>5);
+  const long long y0=(long long)blockIdx.z*n;
   const int r0=blockIdx.x*64,n0=blockIdx.y*128+warp*32;
   const uint8_t* wr[4];const uint8_t* sr[4];bool nok[4];
   for(int t=0;t<4;++t){
@@ -190,7 +196,7 @@ __global__ __launch_bounds__(128) void fp8_mm(const __nv_bfloat16* __restrict__ 
     wr[t]=w+(long long)rr*k+q*16;sr[t]=ws+(long long)(rr>>5)*(k>>5);
   }
   const __nv_bfloat16* xr[4][2];
-  for(int mt=0;mt<4;++mt)for(int hh=0;hh<2;++hh){const int r=r0+mt*16+hh*8+g;xr[mt][hh]=x+(long long)(r<m?r:0)*k+q*16;}
+  for(int mt=0;mt<4;++mt)for(int hh=0;hh<2;++hh){const int r=r0+mt*16+hh*8+g;xr[mt][hh]=x+(long long)(r<m?r:0)*xs+q*16;}
   float acc[4][4][4];
   for(int a=0;a<4;++a)for(int b=0;b<4;++b)for(int c=0;c<4;++c)acc[a][b][c]=0.f;
   for(int s=0;s<k/64;++s){
@@ -212,7 +218,8 @@ __global__ __launch_bounds__(128) void fp8_mm(const __nv_bfloat16* __restrict__ 
     const int r=r0+mt*16+hh*8+g;if(r>=m)continue;
     for(int t=0;t<4;++t){
       const int c=n0+8*t+2*q;if(!nok[t])continue;
-      *reinterpret_cast<float2*>(y+(long long)r*n+c)=make_float2(acc[mt][t][hh*2],acc[mt][t][hh*2+1]);
+      if(B16)*reinterpret_cast<__nv_bfloat162*>((__nv_bfloat16*)yv+y0+(long long)r*ys+c)=__floats2bfloat162_rn(acc[mt][t][hh*2],acc[mt][t][hh*2+1]);
+      else *reinterpret_cast<float2*>((float*)yv+y0+(long long)r*ys+c)=make_float2(acc[mt][t][hh*2],acc[mt][t][hh*2+1]);
     }
   }
 }
@@ -253,7 +260,14 @@ extern "C" int ds41_bf16_gemv(const void* x,const void* w,float* y,int m,int n,i
 
 extern "C" int ds41_fp8_mm(const void* x,const void* w,const void* ws,float* y,int m,int n,int k,cudaStream_t st){
   if(m<1||k%64!=0||n%8!=0)return 1;
-  fp8_mm<<<dim3((m+63)/64,(n+127)/128),128,0,st>>>((const __nv_bfloat16*)x,(const uint8_t*)w,(const uint8_t*)ws,y,m,n,k);
+  fp8_mm<false><<<dim3((m+63)/64,(n+127)/128),128,0,st>>>((const __nv_bfloat16*)x,(const uint8_t*)w,(const uint8_t*)ws,y,m,n,k,k,n);
+  return (int)cudaGetLastError();
+}
+// grouped (wo_a): y BF16 [m, groups n] = per group g: x[:, g k .. +k] (row stride xs) . W[g n .. +n]^T, rounded to BF16
+// (each output the same MMA sequence as ds41_fp8_mm on that group's contiguous input, then the BF16 conversion)
+extern "C" int ds41_fp8_mm_grouped_bf16(const void* x,const void* w,const void* ws,void* y,int m,int n,int k,int groups,int xs,cudaStream_t st){
+  if(m<1||k%64!=0||n%32!=0||groups<1||xs<groups*k)return 1;
+  fp8_mm<true><<<dim3((m+63)/64,(n+127)/128,groups),128,0,st>>>((const __nv_bfloat16*)x,(const uint8_t*)w,(const uint8_t*)ws,y,m,n,k,xs,groups*n);
   return (int)cudaGetLastError();
 }
 

@@ -26,11 +26,16 @@ extern "C" {
     fn ds41_fp8_gemv_mx_smem_max() -> usize;
     fn ds41_bf16_gemv_mx(x: *const std::ffi::c_void, w: *const std::ffi::c_void, y: *mut f32, m: i32, n: i32, k: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_moe_mx_ws_bytes(r: i32, i: i32, topk: i32, e: i32) -> usize;
+    fn rs_lt_rows_find(w: *const f32, full: i32, n: i32, k: i32, verbose: i32) -> i32;
+    fn rs_lt_rows_mm(x: *const f32, w: *const f32, y: *mut f32, full: i32, m: i32, n: i32, k: i32) -> i32;
     #[allow(clippy::too_many_arguments)]
     fn ds41_moe_mx_ex(xq: *const std::ffi::c_void, xs: *const std::ffi::c_void, r: i32, idx: *const i64, rw: *const f32, w1: *const std::ffi::c_void,
                       s1: *const std::ffi::c_void, w3: *const std::ffi::c_void, s3: *const std::ffi::c_void, w2: *const std::ffi::c_void,
                       s2: *const std::ffi::c_void, i: i32, add: *const f32, y: *mut f32, ws: *mut std::ffi::c_void, topk: i32, e: i32, skip: i32,
                       st: *mut std::ffi::c_void) -> i32;
+    fn ds41_moe_mx_combine_rows(ws: *mut std::ffi::c_void, r: i32, i: i32, topk: i32, e: i32, add: *const f32, y: *mut f32, r0: i32, nr: i32, st: *mut std::ffi::c_void) -> i32;
+    fn ds41_moe_mx_col_passes(r: i32, topk: i32, e: i32) -> i32;
+    fn ds41_moe_mx_ws_ptrs(ws: *mut std::ffi::c_void, r: i32, i: i32, topk: i32, e: i32, out: *mut *mut f32, pairmap: *mut *mut i32) -> i32;
     fn ds41_moe_mx_combine(ws: *mut std::ffi::c_void, r: i32, i: i32, topk: i32, e: i32, add: *const f32, y: *mut f32, st: *mut std::ffi::c_void) -> i32;
     fn rs_stream_fork(n: i32) -> i32;
     fn rs_stream_set(i: i32) -> i32;
@@ -39,8 +44,11 @@ extern "C" {
                    s1: *const std::ffi::c_void, w3: *const std::ffi::c_void, s3: *const std::ffi::c_void, w2: *const std::ffi::c_void,
                    s2: *const std::ffi::c_void, i: i32, add: *const f32, y: *mut f32, ws: *mut std::ffi::c_void, topk: i32, e: i32,
                    st: *mut std::ffi::c_void) -> i32;
+    fn ds41_fp8_mm_grouped_bf16(x: *const std::ffi::c_void, w: *const std::ffi::c_void, ws: *const std::ffi::c_void, y: *mut std::ffi::c_void, m: i32, n: i32, k: i32, groups: i32, xs: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_fp8_mm(x: *const std::ffi::c_void, w: *const std::ffi::c_void, ws: *const std::ffi::c_void, y: *mut f32, m: i32, n: i32, k: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_hc_slices(t: i32, d: i32) -> i32;
+    fn ds41_hc_mix_as(h: *const std::ffi::c_void, f: *const f32, scale: *const f32, base: *const f32, pre: *mut f32, post: *mut f32, comb: *mut f32,
+                      part: *mut f32, t: i32, rows: i32, d: i32, norm_eps: f32, eps: f32, iters: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_hc_mix(h: *const std::ffi::c_void, f: *const f32, scale: *const f32, base: *const f32, pre: *mut f32, post: *mut f32, comb: *mut f32,
                    part: *mut f32, t: i32, d: i32, norm_eps: f32, eps: f32, iters: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_hc_pre(h: *const std::ffi::c_void, pre: *const f32, out: *mut std::ffi::c_void, t: i32, d: i32, st: *mut std::ffi::c_void) -> i32;
@@ -58,6 +66,7 @@ extern "C" {
     fn ds41_rms_norm(x: *const std::ffi::c_void, w: *const std::ffi::c_void, y: *mut std::ffi::c_void, rows: i32, n: i32, eps: f32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_rms_norm_cl(x: *const std::ffi::c_void, w: *const std::ffi::c_void, y: *mut std::ffi::c_void, rows: i32, n: i32, eps: f32, cl: *const std::ffi::c_void, st: *mut std::ffi::c_void) -> i32;
     fn ds41_rope(x: *const std::ffi::c_void, pos: *const i64, freqs: *const f32, y: *mut std::ffi::c_void, rows: i32, h: i32, d: i32, rd: i32, inverse: i32, st: *mut std::ffi::c_void) -> i32;
+    fn ds41_rope_act_quant(x: *const std::ffi::c_void, pos: *const i64, freqs: *const f32, y: *mut std::ffi::c_void, rows: i32, h: i32, d: i32, rd: i32, inverse: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_moe_ws_bytes(r: i32, i: i32, topk: i32, e: i32) -> usize;
     #[allow(clippy::too_many_arguments)]
     fn ds41_moe(xq: *const std::ffi::c_void, r: i32, idx: *const i64, rw: *const f32, w1: *const std::ffi::c_void, s1: *const std::ffi::c_void,
@@ -128,6 +137,23 @@ pub fn route(logits: &Tensor, bias: &Tensor, k: i64, scale: f64) -> (Tensor, Ten
         t as i32, e as i32, k as i32, scale as f32, rs_current_stream()) }, 0, "ds41_route");
     (idx, w)
 }
+/// Router logits FP32 [m, n] of x [m, k] (BF16 or FP32) and gate_f32 [n, k] with the bits these rows get in the FP32
+/// matmul of a `full`-row call (lt.cpp rs_lt_rows_*: the cublasLt configuration that reproduces at::matmul's for that
+/// shape, found and checked once per shape, run on the m rows only). None: no such configuration (the caller does the
+/// full-shape call). DS41_ROUTER_ROWS=0: always None.
+pub fn router_rows(x: &Tensor, gate_f32: &Tensor, full: i64) -> Option<Tensor> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("DS41_ROUTER_ROWS").map_or(true, |v| v != "0")) { return None; }
+    let (m, k) = (x.size()[0], x.size()[1]);
+    let n = gate_f32.size()[0];
+    assert!(gate_f32.kind() == Kind::Float && gate_f32.is_contiguous() && gate_f32.size()[1] == k, "router_rows: gate");
+    let verbose = std::env::var("DS41_ROUTER_ROWS_LOG").is_ok_and(|v| v == "1") as i32;
+    if unsafe { rs_lt_rows_find(gate_f32.data_ptr() as *const f32, full as i32, n as i32, k as i32, verbose) } != 0 { return None; }
+    let xf = x.to_kind(Kind::Float).contiguous();
+    let y = Tensor::empty([m, n], (Kind::Float, x.device()));
+    let rc = unsafe { rs_lt_rows_mm(xf.data_ptr() as *const f32, gate_f32.data_ptr() as *const f32, y.data_ptr() as *mut f32, full as i32, m as i32, n as i32, k as i32) };
+    (rc == 0).then_some(y)
+}
 /// Shared-expert SwiGLU + act_quant from the stacked gate/up FP32 sums gu [T, 2 I] -> BF16 [T, I] (w2's input).
 /// Engram gate: h [T, hc, D] BF16, kv [T, (hc + 1) D] BF16 (keys of every stream, then the value), qk FP32 [hc, D]
 /// or [D] -> bf16(h + gate * value) [T, hc, D] (model.rs Model::engram), one CTA per (row, stream).
@@ -178,6 +204,18 @@ pub fn bf16_gemv_rows(x: &Tensor, w: &Tensor) -> Tensor {
     y
 }
 
+/// Grouped `fp8_mm` rounded to BF16 (wo_a): x BF16 [m, groups k], W [groups n, k] -> BF16 [m, groups n], group g's
+/// columns x[:, g k .. +k] . W[g n .. +n]^T: the bits of `bf16(fp8_mm(x[:, g].contiguous(), W[g]))` per group, cat
+/// (no input copies, FP32 partials or cat; one launch).
+pub fn fp8_mm_grouped_bf16(x: &Tensor, w: &Tensor, ws: &Tensor, n: i64, groups: i64) -> Tensor {
+    let m = x.size()[0];
+    let x = x.to_kind(Kind::BFloat16).contiguous();
+    let k = x.size()[1] / groups;
+    assert!(x.size()[1] == groups * k && w.size() == [groups * n, k], "fp8_mm_grouped_bf16");
+    let y = Tensor::empty([m, groups * n], (Kind::BFloat16, x.device()));
+    assert_eq!(unsafe { ds41_fp8_mm_grouped_bf16(x.data_ptr(), w.data_ptr(), ws.data_ptr(), y.data_ptr(), m as i32, n as i32, k as i32, groups as i32, (groups * k) as i32, rs_current_stream()) }, 0, "ds41_fp8_mm_grouped_bf16");
+    y
+}
 /// Same contract as `fp8_gemv` for any m (BF16 MMA tiles; used for m > 8).
 pub fn fp8_mm(x: &Tensor, w: &Tensor, ws: &Tensor) -> Tensor {
     let (m, k) = (x.size()[0], x.size()[1]);
@@ -210,6 +248,19 @@ pub fn hc_mix(h: &Tensor, f: &Tensor, scale: &Tensor, base: &Tensor, norm_eps: f
         t as i32, d as i32, norm_eps as f32, eps as f32, iters as i32, rs_current_stream()) };
     assert_eq!(rc, 0, "ds41_hc_mix");
     (pre, post, comb)
+}
+/// `hc_mix` of these rows as a call over `rows` rows computes them (sequence-parallel prefill: a rank's share of a
+/// chunk); None when `rows` does not take the register-blocked path.
+pub fn hc_mix_as(h: &Tensor, rows: i64, f: &Tensor, scale: &Tensor, base: &Tensor, norm_eps: f64, eps: f64, iters: i64) -> Option<(Tensor, Tensor, Tensor)> {
+    let (t, d) = (h.size()[0], h.size()[2]);
+    let h = h.to_kind(Kind::BFloat16).contiguous();
+    let o = (Kind::Float, h.device());
+    let (pre, post, comb) = (Tensor::empty([t, 4], o), Tensor::empty([t, 4], o), Tensor::empty([t, 4, 4], o));
+    let part = Tensor::empty([unsafe { ds41_hc_slices(rows as i32, d as i32) } as i64 * t * 25], o);
+    let rc = unsafe { ds41_hc_mix_as(h.data_ptr(), f.data_ptr() as *const f32, scale.data_ptr() as *const f32, base.data_ptr() as *const f32,
+        pre.data_ptr() as *mut f32, post.data_ptr() as *mut f32, comb.data_ptr() as *mut f32, part.data_ptr() as *mut f32,
+        t as i32, rows as i32, d as i32, norm_eps as f32, eps as f32, iters as i32, rs_current_stream()) };
+    (rc == 0).then_some((pre, post, comb))
 }
 /// sum_j pre[t][j] h[t][j] -> BF16 [T, D]
 pub fn hc_pre(h: &Tensor, pre: &Tensor) -> Tensor {
@@ -358,6 +409,17 @@ pub fn rope(x: &Tensor, pos: &Tensor, freqs: &Tensor, rd: i64, inverse: bool) ->
 }
 
 /// `rope` in place on a contiguous BF16 tensor this caller owns (only the rotary dims are read and written).
+/// act_quant(rope(x)) in one pass (BF16 [n, .., d]): bitwise `act_quant(&rope(x, ..))`.
+pub fn rope_act_quant(x: &Tensor, pos: &Tensor, freqs: &Tensor, rd: i64, inverse: bool) -> Tensor {
+    let sz = x.size();
+    let (n, d) = (sz[0], *sz.last().unwrap());
+    let h = x.numel() as i64 / n / d;
+    let x = x.contiguous();
+    let y = Tensor::empty_like(&x);
+    let pos = pos.to_kind(Kind::Int64).contiguous();
+    assert_eq!(unsafe { ds41_rope_act_quant(x.data_ptr(), pos.data_ptr() as *const i64, freqs.data_ptr() as *const f32, y.data_ptr(), n as i32, h as i32, d as i32, rd as i32, inverse as i32, rs_current_stream()) }, 0, "ds41_rope_act_quant");
+    y
+}
 pub fn rope_inplace(x: &Tensor, pos: &Tensor, freqs: &Tensor, rd: i64, inverse: bool) {
     let sz = x.size();
     let (n, d) = (sz[0], *sz.last().unwrap());
@@ -409,6 +471,40 @@ pub fn fp8_gemv_mx(x: &Tensor, w: &Tensor, ws: &Tensor) -> Tensor { gemv_mx(x, w
 pub fn gemv_mx_init() { assert_eq!(unsafe { ds41_fp8_gemv_mx_init() }, 0, "ds41_fp8_gemv_mx_init"); }
 /// `fp8_gemv_mx` with the sums rounded to BF16 in the kernel (the same bits as converting the FP32 result).
 pub fn fp8_gemv_mx_bf16(x: &Tensor, w: &Tensor, ws: &Tensor) -> Tensor { gemv_mx(x, w, ws, true) }
+/// An mHC mix job for the next MX GEMVs (shim/ds41_hc_job.cuh; the C struct HcJob).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HcJobC { kind: i32, ctas: i32, h: *const std::ffi::c_void, fn_: *const f32, part: *mut f32, t: i32, d: i32, scale: *const f32, base: *const f32,
+                pre: *mut f32, post: *mut f32, comb: *mut f32, norm_eps: f32, eps: f32, iters: i32 }
+extern "C" { fn ds41_fp8_gemv_mx_job(x: *const std::ffi::c_void, aq: *const std::ffi::c_void, as_: *const std::ffi::c_void, w: *const std::ffi::c_void, ws: *const std::ffi::c_void,
+                                    y: *mut std::ffi::c_void, m: i32, n: i32, k: i32, ob16: i32, job: *const HcJobC, st: *mut std::ffi::c_void) -> i32; }
+thread_local! {
+    /// Jobs the next MX GEMVs take, in order (with the tensors they use, kept until the job is launched).
+    static GEMV_JOBS: std::cell::RefCell<std::collections::VecDeque<(HcJobC, Vec<Tensor>)>> = std::cell::RefCell::new(Default::default());
+}
+/// `hc_mix` of a few rows (1..16, the 160-slice path) as side jobs of the next two MX GEMVs on this stream: the partial
+/// sums in the first one's grid, the finalize in the second's (shim/ds41_hc_job.cuh; the same operations as hc_mix's
+/// kernels, so the same bits). The caller makes sure those two GEMVs come next and that nothing reads the results
+/// before the second. None (nothing queued) when the shape does not take that path.
+pub fn hc_mix_jobs(h: &Tensor, f: &Tensor, scale: &Tensor, base: &Tensor, norm_eps: f64, eps: f64, iters: i64) -> Option<(Tensor, Tensor, Tensor)> {
+    let (t, d) = (h.size()[0], h.size()[2]);
+    if !(1..=16).contains(&t) || unsafe { ds41_hc_slices(t as i32, d as i32) } != 160 { return None; }
+    let h = h.to_kind(Kind::BFloat16).contiguous();
+    let o = (Kind::Float, h.device());
+    let (pre, post, comb) = (Tensor::empty([t, 4], o), Tensor::empty([t, 4], o), Tensor::empty([t, 4, 4], o));
+    let part = Tensor::empty([160 * t * 25], o);
+    let j = HcJobC { kind: 1, ctas: 0, h: h.data_ptr(), fn_: f.data_ptr() as *const f32, part: part.data_ptr() as *mut f32, t: t as i32, d: d as i32,
+                     scale: scale.data_ptr() as *const f32, base: base.data_ptr() as *const f32, pre: pre.data_ptr() as *mut f32,
+                     post: post.data_ptr() as *mut f32, comb: comb.data_ptr() as *mut f32, norm_eps: norm_eps as f32, eps: eps as f32, iters: iters as i32 };
+    GEMV_JOBS.with(|q| {
+        let mut q = q.borrow_mut();
+        q.push_back((j, vec![h.shallow_clone(), part.shallow_clone(), f.shallow_clone()]));
+        q.push_back((HcJobC { kind: 2, ..j }, vec![h, part, scale.shallow_clone(), base.shallow_clone(), pre.shallow_clone(), post.shallow_clone(), comb.shallow_clone()]));
+    });
+    Some((pre, post, comb))
+}
+/// No mix job left queued (the GEMVs meant to take them ran).
+pub fn hc_jobs_done() -> bool { GEMV_JOBS.with(|q| q.borrow().is_empty()) }
 fn gemv_mx(x: &Tensor, w: &Tensor, ws: &Tensor, ob16: bool) -> Tensor {
     let x = x.to_kind(Kind::BFloat16).contiguous();
     let (m, k) = (x.size()[0], x.size()[1]);
@@ -418,7 +514,11 @@ fn gemv_mx(x: &Tensor, w: &Tensor, ws: &Tensor, ob16: bool) -> Tensor {
     let fits = (m * k + m * k / 32) as usize <= unsafe { ds41_fp8_gemv_mx_smem_max() };
     let q = (!fits).then(|| act_quant_fp8(&x));
     let (aq, asc) = q.as_ref().map_or((std::ptr::null_mut(), std::ptr::null_mut()), |(a, b)| (a.data_ptr(), b.data_ptr()));
-    assert_eq!(unsafe { ds41_fp8_gemv_mx_q(x.data_ptr(), aq, asc, w.data_ptr(), ws.data_ptr(), y.data_ptr(), m as i32, n as i32, k as i32, ob16 as i32, rs_current_stream()) }, 0, "ds41_fp8_gemv_mx");
+    let job = GEMV_JOBS.with(|q| q.borrow_mut().pop_front());
+    match &job {
+        Some((j, _)) => assert_eq!(unsafe { ds41_fp8_gemv_mx_job(x.data_ptr(), aq, asc, w.data_ptr(), ws.data_ptr(), y.data_ptr(), m as i32, n as i32, k as i32, ob16 as i32, j, rs_current_stream()) }, 0, "ds41_fp8_gemv_mx_job"),
+        None => assert_eq!(unsafe { ds41_fp8_gemv_mx_q(x.data_ptr(), aq, asc, w.data_ptr(), ws.data_ptr(), y.data_ptr(), m as i32, n as i32, k as i32, ob16 as i32, rs_current_stream()) }, 0, "ds41_fp8_gemv_mx"),
+    }
     y
 }
 
@@ -438,6 +538,14 @@ pub fn fp8_gemm_mx_q(xq: &Tensor, xs: &Tensor, w: &Tensor, ws: &Tensor) -> Tenso
     y
 }
 
+/// `fp8_gemm_mx` into `out` (FP32 [M, N], contiguous: e.g. a row range of a larger output).
+pub fn fp8_gemm_mx_into(x: &Tensor, w: &Tensor, ws: &Tensor, out: &Tensor) {
+    let (xq, xs) = act_quant_fp8(x);
+    let (m, k) = (xq.size()[0], xq.size()[1]);
+    let n = w.size()[0];
+    assert!(out.is_contiguous() && out.kind() == Kind::Float && out.size() == [m, n], "fp8_gemm_mx_into");
+    assert_eq!(unsafe { ds41_fp8_gemm_mx(xq.data_ptr(), xs.data_ptr(), w.data_ptr(), ws.data_ptr(), out.data_ptr() as *mut f32, m as i32, n as i32, k as i32, rs_current_stream()) }, 0, "ds41_fp8_gemm_mx");
+}
 /// `fp8_gemm_mx` with the output rounded to BF16 inside (the same bits as converting the FP32 result).
 pub fn fp8_gemm_mx_bf16(x: &Tensor, w: &Tensor, ws: &Tensor) -> Tensor {
     let (xq, xs) = act_quant_fp8(x);
@@ -451,15 +559,20 @@ pub fn fp8_gemm_mx_bf16(x: &Tensor, w: &Tensor, ws: &Tensor) -> Tensor {
 /// Routed experts on the block-scaled tensor-core MMA (shim/ds41_mx.cu): x BF16 [R, 5120] (quantized inside, like the
 /// official act_quant), weights in the mx layout; otherwise the contract of `moe`.
 pub fn moe_mx(x: &Tensor, idx: &Tensor, rw: &Tensor, w: [&Tensor; 6], add: Option<&Tensor>) -> Tensor {
-    let r = x.size()[0];
+    let (xq, xs) = act_quant_fp8(x);
+    moe_mx_q(&xq, &xs, idx, rw, w, add)
+}
+/// `moe_mx` of the act_quant operands of x (E4M3 bytes [R, 5120], UE8M0 bytes [R, 160]: what moe_mx quantizes x into).
+pub fn moe_mx_q(xq: &Tensor, xs: &Tensor, idx: &Tensor, rw: &Tensor, w: [&Tensor; 6], add: Option<&Tensor>) -> Tensor {
+    let r = xq.size()[0];
     let (topk, e) = (idx.size()[1], w[0].size()[0]);
     let i = w[0].size()[1];
-    let (xq, xs) = act_quant_fp8(x);
+    let (xq, xs) = (xq.contiguous(), xs.contiguous());
     let idx = idx.to_kind(Kind::Int64).contiguous();
     let rw = rw.to_kind(Kind::Float).contiguous();
     let add = add.map(|a| a.to_kind(Kind::Float).contiguous());
-    let y = Tensor::empty([r, 5120], (Kind::Float, x.device()));
-    let ws = Tensor::empty([unsafe { ds41_moe_mx_ws_bytes(r as i32, i as i32, topk as i32, e as i32) } as i64], (Kind::Uint8, x.device()));
+    let y = Tensor::empty([r, 5120], (Kind::Float, xq.device()));
+    let ws = Tensor::empty([unsafe { ds41_moe_mx_ws_bytes(r as i32, i as i32, topk as i32, e as i32) } as i64], (Kind::Uint8, xq.device()));
     let rc = unsafe {
         ds41_moe_mx(xq.data_ptr(), xs.data_ptr(), r as i32, idx.data_ptr() as *const i64, rw.data_ptr() as *const f32, w[0].data_ptr(), w[1].data_ptr(),
                     w[2].data_ptr(), w[3].data_ptr(), w[4].data_ptr(), w[5].data_ptr(), i as i32,
@@ -470,6 +583,45 @@ pub fn moe_mx(x: &Tensor, idx: &Tensor, rw: &Tensor, w: [&Tensor; 6], add: Optio
     y
 }
 
+/// `moe_mx_q` with the combine left for later, by row ranges (MoeRows::combine): None when the call's down / combine
+/// run in column passes (then the caller takes moe_mx_q). The rows combined in parts are bitwise the whole call's.
+pub struct MoeRows { ws: Tensor, pub y: Tensor, r: i64, i: i64, topk: i64, e: i64 }   // (y: [0] unless want_y)
+pub fn moe_mx_q_rows(xq: &Tensor, xs: &Tensor, idx: &Tensor, rw: &Tensor, w: [&Tensor; 6], want_y: bool) -> Option<MoeRows> {
+    let r = xq.size()[0];
+    let (topk, e) = (idx.size()[1], w[0].size()[0]);
+    let i = w[0].size()[1];
+    if unsafe { ds41_moe_mx_col_passes(r as i32, topk as i32, e as i32) } != 1 { return None; }
+    let (xq, xs) = (xq.contiguous(), xs.contiguous());
+    let idx = idx.to_kind(Kind::Int64).contiguous();
+    let rw = rw.to_kind(Kind::Float).contiguous();
+    let y = Tensor::empty([if want_y { r } else { 0 }, 5120], (Kind::Float, xq.device()));
+    let ws = Tensor::empty([unsafe { ds41_moe_mx_ws_bytes(r as i32, i as i32, topk as i32, e as i32) } as i64], (Kind::Uint8, xq.device()));
+    // (skip_combine: y is not written)
+    let rc = unsafe {
+        ds41_moe_mx_ex(xq.data_ptr(), xs.data_ptr(), r as i32, idx.data_ptr() as *const i64, rw.data_ptr() as *const f32, w[0].data_ptr(), w[1].data_ptr(),
+                       w[2].data_ptr(), w[3].data_ptr(), w[4].data_ptr(), w[5].data_ptr(), i as i32, std::ptr::null(), y.data_ptr() as *mut f32,
+                       ws.data_ptr(), topk as i32, e as i32, 1, rs_current_stream())
+    };
+    assert_eq!(rc, 0, "ds41_moe_mx_ex (rows)");
+    Some(MoeRows { ws, y, r, i, topk, e })
+}
+impl MoeRows {
+    /// (out [P, 5120] FP32 of the down passes, pairmap [P], topk) inside the workspace
+    pub fn ptrs(&self) -> (*const f32, *const i32, i64) {
+        let (mut o, mut p) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(unsafe { ds41_moe_mx_ws_ptrs(self.ws.data_ptr(), self.r as i32, self.i as i32, self.topk as i32, self.e as i32, &mut o, &mut p) }, 0);
+        (o as *const f32, p as *const i32, self.topk)
+    }
+    /// the workspace (kept by whoever reads it later)
+    pub fn ws(&self) -> Tensor { self.ws.shallow_clone() }
+    /// rows [r0, r0 + nr) of y = the routed sum + add (FP32 [R, 5120], the whole call's add)
+    pub fn combine(&self, add: &Tensor, r0: i64, nr: i64) {
+        assert!(self.y.size()[0] == self.r, "MoeRows::combine without want_y");
+        assert!(add.kind() == Kind::Float && add.is_contiguous() && add.size() == [self.r, 5120], "MoeRows::combine add");
+        assert_eq!(unsafe { ds41_moe_mx_combine_rows(self.ws.data_ptr(), self.r as i32, self.i as i32, self.topk as i32, self.e as i32, add.data_ptr() as *const f32,
+                                                    self.y.data_ptr() as *mut f32, r0 as i32, nr as i32, rs_current_stream()) }, 0, "ds41_moe_mx_combine_rows");
+    }
+}
 /// `moe_mx` with the shared expert `shared(x)` computed on a parallel stream while the router, grouping and routed
 /// experts run (decode / verify: both are small and memory-bound, so each fills the other's kernel ramps and tails),
 /// joined before the combine, which adds it exactly as `moe_mx(.., Some(shared))` does. `route(x)` -> (idx, rw).
@@ -545,6 +697,189 @@ pub fn moe_ref(xq: &Tensor, idx: &Tensor, rw: &Tensor, w: [&Tensor; 6], table: &
 /// act_quant bitwise; GEMVs within FP32 summation-order differences (max relative error reported); and the time per call.
 /// `ds41-gemv-bench`: the decode GEMVs at this engine's per-rank TP3 shapes (random bytes: the speed does not depend on
 /// the values), time and bandwidth per call, so the kernels can be tuned shape by shape.
+/// `ds41-attn-bench`: the prefill sparse attention on the TP3 rank shape of a 4k CED encoder part (24 local heads, 2048
+/// query rows at positions 2048.., window 128 over ring + chunk, 512 compressed indices of the 1024 the positions see,
+/// sorted, -1 past them) and the decoder replay's 128 rows; random BF16 values. Time per call and, for each value of
+/// DS41_ATTN_V in DS41_ATTN_VERSIONS (default "0"), whether the outputs are bitwise equal to the first.
+pub fn attn_bench() {
+    let _g = tch::no_grad_guard();
+    let dev = tch::Device::Cuda(0);
+    extern "C" { fn ds41_attn_version(v: i32) -> i32; }
+    let versions: Vec<i32> = std::env::var("DS41_ATTN_VERSIONS").map_or(vec![0], |v| v.split(',').map(|x| x.parse().unwrap()).collect());
+    let (h, w) = (24i64, 128i64);
+    for (t, start) in [(2048i64, 2048i64), (128, 3968)] {
+        let q = (Tensor::randn([t, h, 512], (Kind::Float, dev)) * 0.5).to_kind(Kind::BFloat16);
+        let ring = Tensor::randn([w, 512], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+        let kv = Tensor::randn([t, 512], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+        let clen = (start + t) / 4;
+        let ckv = Tensor::randn([clen, 512], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+        let pos = Tensor::arange_start(start, start + t, (Kind::Int64, dev));
+        // per row: the compressed entries its position sees (p / 4), 512 of them at random in ascending order, -1 past
+        let mut iv = vec![-1i64; (t * 512) as usize];
+        let mut rng = 0x9e3779b97f4a7c15u64;
+        for r in 0..t {
+            let n = ((start + r) / 4).min(clen);
+            let mut sel: Vec<i64> = if n <= 512 { (0..n).collect() } else {
+                let mut all: Vec<i64> = (0..n).collect();
+                for i in 0..512usize { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; let j = i + (rng % (n as u64 - i as u64)) as usize; all.swap(i, j); }
+                all.truncate(512); all };
+            sel.sort();
+            for (j, &c) in sel.iter().enumerate() { iv[(r * 512) as usize + j] = w + t + c; }
+        }
+        let idx = Tensor::from_slice(&iv).to_device(dev).view([t, 512]);
+        let sink = Tensor::zeros([h], (Kind::Float, dev));
+        let mut outs = Vec::new();
+        let mut line = String::new();
+        for &v in &versions {
+            assert_eq!(unsafe { ds41_attn_version(v) }, 0);
+            let f = || sparse_attn_into(&q, [Some(&ring), Some(&kv), Some(&ckv)], Some((w, start, &pos)), 0, &idx, &sink, 1.0 / (512f64).sqrt(), None).expect("sparse_attn");
+            outs.push(f());
+            for _ in 0..3 { let _ = f(); }
+            tch::Cuda::synchronize(0);
+            let t0 = std::time::Instant::now();
+            for _ in 0..20 { let _ = f(); }
+            tch::Cuda::synchronize(0);
+            line += &format!("  v{v} {:8.1} us", t0.elapsed().as_secs_f64() * 1e6 / 20.0);
+        }
+        let same = outs.windows(2).all(|p| p[0].view_dtype(Kind::Int16).equal(&p[1].view_dtype(Kind::Int16)));
+        eprintln!("[ds41-attn-bench] rows {t} at {start}:{line}  {}", if versions.len() > 1 { if same { "bitwise equal" } else { "DIFFERENT" } } else { "" });
+    }
+    unsafe { ds41_attn_version(0) };
+}
+
+/// `ds41-gemm-bench`: prefill FP8 GEMM (fp8_gemm_mx, BF16 out) on the TP3 rank shapes of a 4k CED prefill: time
+/// per call (weights rotated past L2) of each kernel version in DS41_GEMM_VERSIONS (default 2,3: the previous and the
+/// default) and whether their outputs are bitwise equal.
+pub fn gemm_bench() {
+    let _g = tch::no_grad_guard();
+    let dev = tch::Device::Cuda(0);
+    extern "C" { fn ds41_gemm_version(v: i32) -> i32; }
+    let time = |f: &dyn Fn() -> Tensor| { for _ in 0..5 { let _ = f(); } tch::Cuda::synchronize(0);
+        let t = std::time::Instant::now(); for _ in 0..40 { let _ = f(); } tch::Cuda::synchronize(0); t.elapsed().as_secs_f64() * 1e6 / 40.0 };
+    // (name, m, n, k, calls per 4096-token CED prefill on a rank: DS41_GEMM_SHAPES=1 of an offline 4k round; m = 683 a
+    // part's local rows, 2048 a part's gathered rows, 4096 both parts' rows, 128 the decoder replay)
+    let shapes: [(&str, i64, i64, i64, f64); 13] = [
+        ("wo_b", 2048, 5120, 3072, 40.0), ("wq_b", 2048, 12288, 1280, 40.0), ("shared w13", 4096, 1536, 5120, 20.0),
+        ("shared w2", 4096, 5120, 768, 20.0), ("qakv local", 683, 1792, 5120, 34.0), ("engram full", 683, 25600, 6144, 4.0),
+        ("x qakv", 2048, 1792, 5120, 6.0), ("idx 682", 682, 4096, 1280, 6.0), ("r shared w13", 128, 1536, 5120, 20.0),
+        ("r qakv", 128, 1792, 5120, 20.0), ("r shared w2", 128, 5120, 768, 20.0), ("r wo_b", 128, 5120, 3072, 20.0),
+        ("r wq_b", 128, 12288, 1280, 20.0)];
+    let versions: Vec<i32> = std::env::var("DS41_GEMM_VERSIONS").map_or(vec![2, 3], |v| v.split(',').map(|x| x.parse().unwrap()).collect());
+    let mut tot = vec![0.0f64; versions.len()];
+    for (name, m, n, k, calls) in shapes {
+        let copies = ((96 << 20) / (n * k) + 1) as usize;
+        let ws: Vec<Tensor> = (0..copies).map(|_| Tensor::randint(120, [n, k], (Kind::Uint8, dev))).collect();
+        let s = Tensor::randint_low(110, 130, [(n + 31) / 32, k / 32], (Kind::Uint8, dev));
+        {
+            let x = Tensor::randn([m, k], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+            let it = std::cell::Cell::new(0usize);
+            let w = || { it.set(it.get() + 1); &ws[it.get() % copies] };
+            let mut line = String::new();
+            let mut outs = Vec::new();
+            for (vi, &v) in versions.iter().enumerate() {
+                assert_eq!(unsafe { ds41_gemm_version(v) }, 0, "ds41_gemm_version {v}");
+                outs.push(fp8_gemm_mx_bf16(&x, &ws[0], &s));
+                let aq = act_quant_fp8(&x);
+                let us = time(&|| { let (q, sc) = (&aq.0, &aq.1); let y = Tensor::empty([m, n], (Kind::BFloat16, dev));
+                    let wt = w();
+                    assert_eq!(unsafe { ds41_fp8_gemm_mx_ex(q.data_ptr(), sc.data_ptr(), wt.data_ptr(), s.data_ptr(), y.data_ptr(), m as i32, n as i32, k as i32, 1, rs_current_stream()) }, 0); y });
+                tot[vi] += us * calls;
+                line += &format!("  v{v} {us:7.1} us {:5.1} TF", (2 * m * n * k) as f64 / us / 1e6);
+            }
+            let same = outs.windows(2).all(|p| p[0].view_dtype(Kind::Int16).equal(&p[1].view_dtype(Kind::Int16)));
+            eprintln!("[ds41-gemm-bench] {name:12} m={m:4} [{n:5}x{k:5}] x{calls:2}:{line}  {}", if versions.len() > 1 { if same { "bitwise equal" } else { "DIFFERENT" } } else { "" });
+        }
+    }
+    let t: Vec<String> = versions.iter().zip(&tot).map(|(v, t)| format!("v{v} {:.1} ms", t / 1e3)).collect();
+    eprintln!("[ds41-gemm-bench] per 4k prefill (calls weighted): {}", t.join(", "));
+    unsafe { ds41_gemm_version(0) };
+    // the router's FP32 matmul (cuBLAS): are a row's logits the same whatever the row count (sequence-parallel routing)?
+    {
+        let gate = Tensor::randn([384, 5120], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+        let x = Tensor::randn([4100, 5120], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+        let full = x.to_kind(Kind::Float).matmul(&gate.to_kind(Kind::Float).tr());
+        for (r0, m) in [(0i64, 683i64), (683, 683), (1366, 682), (0, 1366), (1366, 1366), (2732, 1366), (0, 2048), (2048, 2048), (100, 171), (0, 65), (5, 300), (0, 4096)] {
+            let part = x.narrow(0, r0, m).to_kind(Kind::Float).matmul(&gate.to_kind(Kind::Float).tr());
+            let d = (&part - full.narrow(0, r0, m)).abs().max().double_value(&[]);
+            eprintln!("[ds41-gemm-bench] router rows [{r0}, +{m}) vs 4100-row call: max |diff| {d:e}");
+        }
+        for t in [4096i64, 2048, 8192] {
+            let xf = Tensor::randn([t, 5120], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+            let f = xf.to_kind(Kind::Float).matmul(&gate.to_kind(Kind::Float).tr());
+            let w = 3i64; let l = (t + w - 1) / w;
+            let mut worst = 0f64;
+            for r in 0..w { let n = l.min(t - r * l); let p = xf.narrow(0, r * l, n).to_kind(Kind::Float).matmul(&gate.to_kind(Kind::Float).tr()); worst = worst.max((&p - f.narrow(0, r * l, n)).abs().max().double_value(&[])); }
+            for (a, n) in [(0, t / 2), (t / 2, t - t / 2)] { let l2 = (n + w - 1) / w; for r in 0..w { let k = l2.min(n - r * l2); let p = xf.narrow(0, a + r * l2, k).to_kind(Kind::Float).matmul(&gate.to_kind(Kind::Float).tr()); worst = worst.max((&p - f.narrow(0, a + r * l2, k)).abs().max().double_value(&[])); } }
+            eprintln!("[ds41-gemm-bench] router T={t}: SP shares vs whole chunk max |diff| {worst:e}");
+            // the same call shape (T rows) with every row but a rank's share zeroed: are the share's logits the whole
+            // chunk's bits? (then a rank can route its own rows before the FFN gather)
+            let mut worst_z = 0f64;
+            for (a, n) in [(0, t / 2), (t / 2, t - t / 2)] { let l2 = (n + w - 1) / w; for r in 0..w { let k = l2.min(n - r * l2);
+                let z = Tensor::zeros([t, 5120], (Kind::BFloat16, dev)); let _ = z.narrow(0, a + r * l2, k).copy_(&xf.narrow(0, a + r * l2, k));
+                let p = z.to_kind(Kind::Float).matmul(&gate.to_kind(Kind::Float).tr());
+                worst_z = worst_z.max((p.narrow(0, a + r * l2, k) - f.narrow(0, a + r * l2, k)).abs().max().double_value(&[])); } }
+            eprintln!("[ds41-gemm-bench] router T={t}: zero-padded same-shape shares vs whole chunk max |diff| {worst_z:e}");
+        }
+        // wo_a (prefill): one grouped BF16-output fp8_mm against per-group contiguous copies + fp8_mm + bf16 + cat
+        for (m, gl) in [(2048i64, 3i64), (683, 3), (4096, 3), (100, 3), (1366, 2)] {
+            let (n, k) = (1024i64, 4096i64);
+            let w = Tensor::randint(120, [gl * n, k], (Kind::Uint8, dev));
+            let s = Tensor::randint_low(110, 130, [gl * n / 32, k / 32], (Kind::Uint8, dev));
+            let x = act_quant(&Tensor::randn([m, gl * k], (Kind::Float, dev)).to_kind(Kind::BFloat16));
+            let per = || { let o3 = x.view([m, gl, k]);
+                let p: Vec<Tensor> = (0..gl).map(|g| fp8_mm(&o3.select(1, g).contiguous(), &w.narrow(0, g * n, n), &s.narrow(0, g * n / 32, n / 32)).to_kind(Kind::BFloat16)).collect();
+                Tensor::cat(&p, 1) };
+            let a = per();
+            let b = fp8_mm_grouped_bf16(&x, &w, &s, n, gl);
+            let same = a.view_dtype(Kind::Int16).equal(&b.view_dtype(Kind::Int16));
+            let (u0, u1) = (time(&per), time(&|| fp8_mm_grouped_bf16(&x, &w, &s, n, gl)));
+            eprintln!("[ds41-gemm-bench] wo_a m={m} groups {gl}: {}; per group + cat {u0:.0} us, grouped {u1:.0} us", if same { "bitwise equal" } else { "DIFFERENT" });
+        }
+        // the row-subset GEMM with the whole call's bits (lt.cpp rs_lt_rows_*): found configuration, bits and time of a
+        // rank's share against the zero-padded full call
+        let gf = gate.to_kind(Kind::Float).contiguous();
+        for t in [4096i64, 2048, 8192, 4083, 1366] {
+            let t0 = std::time::Instant::now();
+            let rc = unsafe { rs_lt_rows_find(gf.data_ptr() as *const f32, t as i32, 384, 5120, 1) };
+            let find_ms = t0.elapsed().as_secs_f64() * 1e3;
+            if rc != 0 { eprintln!("[ds41-gemm-bench] router rows T={t}: no configuration ({find_ms:.0} ms)"); continue; }
+            let xf = Tensor::randn([t, 5120], (Kind::Float, dev)).to_kind(Kind::BFloat16).to_kind(Kind::Float);
+            let f = xf.matmul(&gf.tr());
+            let l = (t + 2) / 3;
+            let mut same = true;
+            for (o, m) in [(0, l), (l, l), (2 * l, t - 2 * l), (5, 1), (t / 2, t / 2)] {
+                let y = Tensor::empty([m, 384], (Kind::Float, dev));
+                assert_eq!(unsafe { rs_lt_rows_mm((xf.data_ptr() as *const f32).add((o * 5120) as usize), gf.data_ptr() as *const f32, y.data_ptr() as *mut f32, t as i32, m as i32, 384, 5120) }, 0);
+                same &= y.equal(&f.narrow(0, o, m));
+            }
+            let us_full = time(&|| xf.matmul(&gf.tr()));
+            let xs = xf.narrow(0, 0, l).contiguous();
+            let us_rows = time(&|| { let y = Tensor::empty([l, 384], (Kind::Float, dev));
+                assert_eq!(unsafe { rs_lt_rows_mm(xs.data_ptr() as *const f32, gf.data_ptr() as *const f32, y.data_ptr() as *mut f32, t as i32, l as i32, 384, 5120) }, 0); y });
+            eprintln!("[ds41-gemm-bench] router rows T={t}: found in {find_ms:.0} ms; shares {}; full call {us_full:.0} us, a rank's {l} rows {us_rows:.0} us",
+                      if same { "bitwise equal" } else { "DIFFERENT" });
+        }
+    }
+    // routed experts (moe_mx) on the TP3 rank shapes (384 experts, I = 768, top-6 uniform random routing): time per call
+    // against the weight-read floor, and the MMA rate
+    let (e, i, topk) = (384i64, 768i64, 6i64);
+    let w1 = Tensor::randint(256, [e, i, 2560], (Kind::Uint8, dev));
+    let w3 = Tensor::randint(256, [e, i, 2560], (Kind::Uint8, dev));
+    let w2 = Tensor::randint(256, [e, 5120, 384], (Kind::Uint8, dev));
+    let (s1, s3, s2) = (Tensor::randint_low(118, 124, [e, i, 160], (Kind::Uint8, dev)), Tensor::randint_low(118, 124, [e, i, 160], (Kind::Uint8, dev)),
+                        Tensor::randint_low(118, 124, [e, 5120, 24], (Kind::Uint8, dev)));
+    let (w1, w3, w2) = (moe_pack_mx(&w1), moe_pack_mx(&w3), moe_pack_mx(&w2));
+    let bytes = (w1.numel() + w3.numel() + w2.numel() + s1.numel() + s3.numel() + s2.numel()) as f64;
+    for r in [128i64, 2048, 4096, 8192] {
+        let x = (Tensor::randn([r, 5120], (Kind::Float, dev)) * 0.5).to_kind(Kind::BFloat16);
+        let idx = Tensor::rand([r, e], (Kind::Float, dev)).argsort(-1, false).narrow(1, 0, topk).contiguous();
+        let rw = Tensor::rand([r, topk], (Kind::Float, dev));
+        let us = time(&|| moe_mx(&x, &idx, &rw, [&w1, &s1, &w3, &s3, &w2, &s2], None));
+        let fl = 2.0 * (r * topk) as f64 * (3 * i * 5120) as f64;
+        eprintln!("[ds41-gemm-bench] moe_mx R={r:5}: {us:8.1} us, {:.1} TFLOPS, weight floor {:.0} us at 273 GB/s", fl / us / 1e6, bytes / 273e3);
+    }
+}
+
 pub fn gemv_bench() {
     let _g = tch::no_grad_guard();
     let dev = tch::Device::Cuda(0);
@@ -714,6 +1049,26 @@ pub fn test(ckpt: &std::path::Path) {
             let up = |b: &Vec<u8>| Tensor::from_slice(b).to_device(dev);
             check("engram layer 1, 65536 rows", &up(&w).view([65536, 256]), &up(&s).view([65536, 8]));
         }
+    }
+    // hc_mix as GEMV side jobs (hc_mix_jobs) == hc_mix, and the GEMVs' own results unchanged, for 1..=16 rows
+    {
+        let (k, n) = (5120i64, 1792i64);
+        let w = (Tensor::randint(0x7e, [n, k], (Kind::Int64, dev)) + Tensor::randint(2, [n, k], (Kind::Int64, dev)) * 128).to_kind(Kind::Uint8);
+        let ws = (Tensor::randint(6, [n / 32, k / 32], (Kind::Int64, dev)) + 124).to_kind(Kind::Uint8);
+        for t in 1..=16i64 {
+            let h = (Tensor::randn([t, 4, 5120], (Kind::Float, dev)) * 2.0).to_kind(Kind::BFloat16);
+            let f = Tensor::randn([24, 4 * 5120], (Kind::Float, dev)) * 0.01;
+            let (sc, bs) = (Tensor::randn([3], (Kind::Float, dev)), Tensor::randn([24], (Kind::Float, dev)));
+            let x = Tensor::randn([t, k], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+            let r = hc_mix(&h, &f, &sc, &bs, 1e-6, 1e-6, 20);
+            let (y1, y2) = (fp8_gemv_mx(&x, &w, &ws), fp8_gemv_mx_bf16(&x, &w, &ws));
+            let j = hc_mix_jobs(&h, &f, &sc, &bs, 1e-6, 1e-6, 20).expect("hc_mix_jobs path");
+            let (z1, z2) = (fp8_gemv_mx(&x, &w, &ws), fp8_gemv_mx_bf16(&x, &w, &ws));
+            assert!(hc_jobs_done());
+            let same = r.0.equal(&j.0) && r.1.equal(&j.1) && r.2.equal(&j.2) && y1.equal(&z1) && y2.equal(&z2);
+            assert!(same, "hc_mix_jobs differs from hc_mix at {t} rows");
+        }
+        eprintln!("[ds41-kernel-test] hc_mix_jobs (GEMV side jobs) bitwise == hc_mix, GEMV results unchanged, rows 1..=16");
     }
     let report = |name: &str, fast: &Tensor, refv: &Tensor| {
         let rel = ((fast - refv).abs().max().double_value(&[])) / refv.abs().max().double_value(&[]).max(1e-30);

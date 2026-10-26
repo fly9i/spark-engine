@@ -8,10 +8,15 @@
 #include "pdl.cuh"
 #include <cstdlib>
 
+// ds41_pdl_suspend (one for all the translation units, ds41_ops.cu): plain launches while set -- prefill (ds41_pdl_prefill,
+// set by Model::prefill_ced): there the early-launched grids' CTAs, parked in griddepcontrol.wait, hold SM slots the
+// running kernel's tail and the communication stream's kernels need (offline 4k 971 -> 930 ms, 32k 6316 -> 6095 ms
+// without PDL); the decode / verify graphs keep it (captured outside prefill).
+extern "C" int ds41_pdl_suspend;
 static inline bool pdl_on() {
   static int v = -1;
   if (v < 0) { const char* e = std::getenv("DS41_PDL"); v = !(e && e[0] == '0'); }
-  return v;
+  return v && !ds41_pdl_suspend;
 }
 
 template <typename... K, typename... A>

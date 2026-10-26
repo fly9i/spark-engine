@@ -6,7 +6,8 @@
 | --- | --- |
 | `bench/decode_bench.py [prose\|structured] [repeats] [max_tokens]` | Decode speed at 1, 2, 3 and 4 concurrent streams: greedy, thinking off, 32-token warm-up, 400 output tokens; per stream `(completion_tokens - 1) / (t_last - t_first)`, aggregate = all decode tokens / wall window; median of `repeats` runs |
 | `bench/prefill_bench.py TOKENS [SEED]` | Prefill of a synthetic prompt of about `TOKENS` tokens (random words, so different seeds share no prefix); prints the engine's prefill time and tok/s |
-| `bench/ds41_decode_bench.py [--url URL] [--types prose,structured,code] [--conc 1,2,4]` | The DeepSeek-V4.1-Flash numbers ([ds41.md](ds41.md#7-performance)): the protocol of MiaAI-Lab's sparkDash DecodeBench (greedy, thinking off, 32-token warm-up, 256 tokens per stream, prose / structured / code prompts), for comparison with other DGX Spark deployments of that model |
+| `bench/ds41_decode_bench.py [--url URL] [--types prose,structured,code] [--conc 1,2,4]` | The DeepSeek-V4.1-Flash numbers ([ds41.md](ds41.md#7-performance)): greedy, thinking off, 32-token warm-up, 256 tokens per stream, prose / structured / code prompts |
+| `bench/ds41_prefill_bench.py [repeats] [sizes]` | The DeepSeek-V4.1-Flash prefill numbers: 4K–64K prompts of real text, each with a unique prefix, streamed; tok/s = prompt tokens / TTFT, median of `repeats` |
 | `bench/text_check.py LABEL [BASELINE]` | 20 fixed prompts, 256 greedy tokens each, one at a time: compares two builds or settings (identical replies, first divergence) |
 
 `decode_bench.py`, `prefill_bench.py` and `text_check.py` talk to `SPARK_URL` (default `http://127.0.0.1:8888`). Two prompt types are used for decoding:

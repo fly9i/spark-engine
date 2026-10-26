@@ -650,8 +650,9 @@ class App:
             n_out = lo
         elif stream_text.hit_stop_id:
             n_out = len(stream_text.ids) + 1
-        usage = {"prompt_tokens": len(ids), "completion_tokens": n_out, "total_tokens": len(ids) + n_out}
         hit = rec.get("prefix_hit_tokens", 0) or 0
+        usage = {"prompt_tokens": len(ids), "completion_tokens": n_out, "total_tokens": len(ids) + n_out,
+                 "prompt_tokens_details": {"cached_tokens": hit}}
         for name, v in (("vllm:prompt_tokens_total", len(ids)), ("vllm:generation_tokens_total", n_out),
                         ("vllm:prefix_cache_queries_total", len(ids)), ("vllm:prefix_cache_hits_total", hit),
                         ("vllm:prompt_tokens_cached_total", hit),
@@ -910,6 +911,7 @@ def make_handler(app):
                     raise ApiError(400, "prompt is empty", param="prompt")
             if not body.get("stream"):
                 choices, total = [], {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                cached = 0
                 timing = None
                 for i, (pr, ids) in enumerate(encoded):
                     max_new, stops, stop_ids, samp = app.limits(body, len(ids))
@@ -923,6 +925,8 @@ def make_handler(app):
                         choices[-1]["token_ids"] = list(out)
                     for k in total:
                         total[k] += usage[k]
+                    cached += usage["prompt_tokens_details"]["cached_tokens"]
+                total["prompt_tokens_details"] = {"cached_tokens": cached}
                 return self._send(200, {"id": rid, "object": "text_completion", "created": created, "model": model,
                                         "choices": choices, "usage": total, "glm53_timing": timing})
             pr, ids = encoded[0]

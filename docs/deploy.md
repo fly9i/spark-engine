@@ -56,7 +56,8 @@ function on its own /30) and a LAN on which all three reach each other; the layo
 in [ds41.md](ds41.md) §2, which uses the same cluster. Set `SPARK_WORKERS`, `SPARK_MASTER_ADDRS` and `SPARK_TP3_IFNAME`
 in `spark.env`.
 
-TP3 was developed and accepted with the project's own SPX1 checkpoint of GLM-5.3-Flash (not published): spec decode
+TP3 was developed and accepted with the project's own SPX1 checkpoint of GLM-5.3-Flash (revision V1.2, not published;
+V1.1 is [fly9i/GLM-5.3-Flash-SPX1-V1.1](https://huggingface.co/fly9i/GLM-5.3-Flash-SPX1-V1.1)): spec decode
 +21% over TP2 (60.2 vs 49.7 tok/s on the project's mixed benchmark), prefill +4%, KL vs. the FP8 reference unchanged
 (0.01370 vs 0.01364). With the public EXL3 checkpoint TP3 uses the same code paths but has **not been measured**; TP2
 remains the tested configuration for it.

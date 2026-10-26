@@ -21,18 +21,19 @@ One binary runs every model; `start.sh glm|glm3|ds41|qwen` picks one.
 
 ## At a glance
 
-GLM and Qwen: measured on 2026-10-08 (v0.1.1 binary; not re-measured with v0.2), default settings,
-greedy, thinking off. DeepSeek: measured on 2026-10-17 with the 1017 checkpoint as served by v0.2, default settings,
-ablation off. Method and more numbers: [docs/benchmarks.md](docs/benchmarks.md), [docs/ds41.md](docs/ds41.md#7-performance).
+GLM and Qwen: measured on 2026-10-08 (v0.1.1 binary; not re-measured since), default settings, greedy, thinking off.
+DeepSeek: measured on 2026-10-26 with the 1017 checkpoint as served by the current code (greedy, thinking off, the optional
+conditional clamp on). Method and more numbers: [docs/benchmarks.md](docs/benchmarks.md),
+[docs/ds41.md](docs/ds41.md#7-performance).
 
 | | **GLM-5.3-Flash** | **DeepSeek-V4.1-Flash** | **Qwen3.8-Flash-Next** |
 | --- | --- | --- | --- |
 | Hardware | 2× DGX Spark (TP2, RoCE); 3× also supported | 3× DGX Spark (TP3, RoCE mesh) | 1× DGX Spark |
 | Architecture | 45 layers: KDA linear-attn + MLA/DSA sparse-attn, 288-expert MoE | 40 layers (20 encoder + 20 decoder): compressed sparse attention with a hierarchical indexer, 384-expert top-6 MoE, Engram n-gram tables, mHC | 48 layers: gated-DeltaNet + QSA sparse-attn, 512-expert top-10 MoE, per-layer n-gram |
-| **Decode — prose** (1/2/3/4 streams) | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 50–55 / 73.0 / — / 88.2 tok/s | 64.1 / 85.5 / 105.0 / 119.5 tok/s |
-| **Decode — structured** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 94–100 / 131.8 / — / 172.7 tok/s | 149.8 / 192.9 / 232.6 / 226.5 tok/s |
-| **Prefill** | ~1,560 tok/s (10K–55K prompts) | ~2,900 tok/s (28K–33K prompts, cold) | ~1,900 tok/s (13K–77K prompts) |
-| **TTFT** (short prompt) | ~370 ms | 185 ms for a 7K prompt restored from the NVMe prefix cache | ~150 ms |
+| **Decode — prose** (1/2/3/4 streams) | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 55.3 / 74.8 / — / 93.1 tok/s | 64.1 / 85.5 / 105.0 / 119.5 tok/s |
+| **Decode — structured** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 103.6 / 136.7 / — / 186.6 tok/s | 149.8 / 192.9 / 232.6 / 226.5 tok/s |
+| **Prefill** | ~1,560 tok/s (10K–55K prompts) | ~5,400 tok/s (8K–64K prompts, new text; 4K ~4,600) | ~1,900 tok/s (13K–77K prompts) |
+| **TTFT** (short prompt) | ~370 ms | ~200 ms; 185 ms for a 7K prompt restored from the NVMe prefix cache | ~150 ms |
 | **Startup** (load → serving) | ~33 s | ~30 s (checkpoint in page cache) | ~54 s |
 | Speculative decoding | DFlash2 drafter, tree/chain verify | DSpark (the checkpoint's draft stages), drafts per sequence from a cost model | native MTP + prompt-lookup |
 
@@ -199,9 +200,17 @@ This repository contains code only. Models are downloaded separately and keep th
 | Model | Source | License |
 | --- | --- | --- |
 | GLM-5.3-Flash EXL3 4 bpw | [brandonmusic/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw) | see the model card |
+| GLM-5.3-Flash SPX1 V1.1 (this project's own quantization) | [fly9i/GLM-5.3-Flash-SPX1-V1.1](https://huggingface.co/fly9i/GLM-5.3-Flash-SPX1-V1.1) | see the model card |
 | DFlash2 drafter for GLM | [incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2) | **CC BY-NC-ND 4.0 (non-commercial)** |
 | DeepSeek-V4.1-Flash-1017 | [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (`1bae0e10`) | MIT (see the model card) |
 | Qwen3.8-Flash-Next EXL3 | [turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3) (`4.05bpw_h6_ng6`) | Qwen license (see the model card) |
+
+**GLM-5.3-Flash SPX1 V1.1** ([fly9i/GLM-5.3-Flash-SPX1-V1.1](https://huggingface.co/fly9i/GLM-5.3-Flash-SPX1-V1.1), 156 GB) is the project's own quantization of
+GLM-5.3-Flash for this engine: routed experts in EXL3 trellis codes with a per-expert bit width (3–6, 4.0 bpw on
+average), the other linear layers in the 6-bit SPX1 format (INT6 + Hadamard rotation, GPTQ). Eval KL vs. the official
+FP8 model 0.0171 (the uniform 4 bpw EXL3 checkpoint: 0.0231). Point `GLM_MODEL` at it; the engine detects the SPX1
+tensors (`*.spx_q`) and loads them in place of the originals. (The GLM TP3 numbers in [docs/deploy.md](docs/deploy.md)
+were measured with a later, unpublished V1.2 revision of it.) The DFlash2 drafter is downloaded separately as for the EXL3 checkpoint.
 
 Third-party software used at build or run time is listed in [THIRD_PARTY.md](THIRD_PARTY.md).
 

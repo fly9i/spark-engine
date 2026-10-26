@@ -28,6 +28,10 @@ __device__ __forceinline__ void ldsm_x4_t(uint32_t& r0, uint32_t& r1, uint32_t& 
   const unsigned a = (unsigned)__cvta_generic_to_shared(p);
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
 }
+__device__ __forceinline__ void ldsm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+  const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+}
 __device__ __forceinline__ uint32_t ld32(const __nv_bfloat16* p) { return *reinterpret_cast<const uint32_t*>(p); }
 // 16-byte asynchronous global -> shared copy (zero-filled when !valid): a thread's copies are all in flight at once
 // (a plain load -> store loop waits for each load in turn: 16 serial round trips per 64-row tile)
@@ -36,6 +40,8 @@ __device__ __forceinline__ void cp16(void* dst, const void* src, bool valid) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(d), "l"(src), "r"(valid ? 16 : 0));
 }
 __device__ __forceinline__ void cp_wait_all() { asm volatile("cp.async.wait_all;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_wait1() { asm volatile("cp.async.wait_group 1;\n" ::: "memory"); }
 
 // The attention pool as up to three row ranges read in place: [0, na) a, [na, na + nb) b, the rest c. W > 0: the
 // first W indices of every query are its sliding window (keys pos - W + 1 .. pos; a = the ring of the W latest committed
@@ -43,10 +49,15 @@ __device__ __forceinline__ void cp_wait_all() { asm volatile("cp.async.wait_all;
 // K - W indices per query.
 // lo: window keys before position lo are not attended (SWA bounded replay truncates the window to the replayed
 // segment; 0 = no truncation).
-struct Pools { const __nv_bfloat16 *a, *b, *c; int na, nb; int W; long long start; const int64_t* pos; long long lo; };
+struct Pools { const __nv_bfloat16 *a, *b, *c; int na, nb; int W; long long start; const int64_t* pos; long long lo;
+               int pipe = 0; };
 
 // CACHE (MODE 0, at most MAXT tiles): pass 1 keeps the warp's scores of every tile in registers, pass 2 uses them
 // instead of recomputing q . k (the same values: computed once), so pass 2 only loads the tiles for P V.
+// pipe (MODE 0 CACHE; prefill): every tile's rows resolved once up front (both passes), the tile
+// buffer streamed in halves so the next tile loads while this one computes: pass 1 by column halves (the scores' k
+// range [0, 256) then [256, 512)), pass 2 by row halves (P V's kk = 0, 16 then 32, 48). The same MMAs in the same
+// order (the same bits); no room for a second tile buffer (one CTA per SM, 99 KB).
 constexpr int MAXT = 10;
 // MODE 3 (few tokens): the S CTAs of a token in one launch, synchronized twice through a per-token counter and
 // generation (sense-reversing barrier; the launcher only uses it when every CTA can be resident at once): maxima, then
@@ -81,7 +92,8 @@ __global__ __launch_bounds__(WARPS * 32, 1) void sparse_attn_kernel(const __nv_b
   __nv_bfloat16* ps = qs + H * DP;                                        // [32][TP]
   float* red = reinterpret_cast<float*>(ps + 32 * TP);                   // [WARPS][32]
   float* mxs = red + WARPS * 32;                                          // [32]
-  __shared__ int rows[TILE];
+  __shared__ int rows_all[MAXT * TILE];   // pipe: the source rows of every tile; else rows[] of the current one
+  int* const rows = rows_all;
   const int t = MODE == 3 ? blockIdx.y : blockIdx.x, sp_id = MODE == 3 ? blockIdx.x : blockIdx.y;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, qd = lane & 3;
   const Pools pl = MULTI ? mt.pl[t] : pl0;
@@ -136,11 +148,91 @@ __global__ __launch_bounds__(WARPS * 32, 1) void sparse_attn_kernel(const __nv_b
     }
     for (int m = 0; m < MT; ++m) for (int c = 0; c < 4; ++c) s[m][c] *= scale;
   };
+  const bool pipe = MODE == 0 && CACHE && pl.pipe;
+  const int ntp = ntiles - tl0;   // pipe: tiles (<= MAXT)
+  if (pipe) {
+    for (int k = threadIdx.x; k < ntp * TILE; k += blockDim.x) {
+      int src = -1;
+      if (k < pl.W) {
+        const long long kp = pt - (pl.W - 1) + k;
+        src = kp < 0 || kp < pl.lo ? -1 : kp >= pl.start ? (int)(kp - pl.start) + pl.W : (int)(kp % pl.W);
+      } else if (k < K) src = (int)ix[k - pl.W];
+      rows_all[k] = src;
+    }
+    __syncthreads();
+  }
+  // pipe: tile i's columns [256 h, 256 h + 256) of all rows (cols = true) or rows [32 h, 32 h + 32) (cols = false), one
+  // group. 8 threads per row (128 contiguous bytes per instruction and row); a thread resolves its row's address once
+  // (cols: rows tid / 8 and 32 + tid / 8, 4 chunks each; rows: row 32 h + tid / 8, 8 chunks).
+  auto issue = [&](int i, int h, bool cols) {
+    if (i < ntp) {
+#pragma unroll
+      for (int q = 0; q < (cols ? 2 : 1); ++q) {
+        const int r = cols ? q * (TILE / 2) + (threadIdx.x >> 3) : h * (TILE / 2) + (threadIdx.x >> 3);
+        const int src = rows_all[i * TILE + r];
+        const __nv_bfloat16* row = src < 0 ? pl.a : src < pl.na ? pl.a + (long long)src * D : src < pl.na + pl.nb ? pl.b + (long long)(src - pl.na) * D
+                                                                                                           : pl.c + (long long)(src - pl.na - pl.nb) * D;
+        const int c0 = (cols ? h * (D / 2) : 0) + (threadIdx.x & 7) * 8;
+#pragma unroll
+        for (int e = 0; e < (cols ? 4 : 8); ++e) cp16(kvs + r * DP + c0 + e * 64, row + c0 + e * 64, src >= 0);
+      }
+    }
+    cp_commit();   // (empty past the last tile: the waits stay "all but the newest group")
+  };
+  // ldmatrix x4 per 16 x 16 A block (lane's row m 16 + (lane & 15) of q, clamped to the last head: rows >= H only feed
+  // the outputs of heads >= H, never stored), and per two k steps of the warp's 8 key rows for B: the same fragments as
+  // scores' ld32s.
+  auto scores_part = [&](float (&s)[MT][4], int k0b) {
+    const __nv_bfloat16* kr = kvs + (warp * 8 + (lane & 7)) * DP + (lane >> 3) * 8;
+    const __nv_bfloat16* qr[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) qr[m] = qs + min(m * 16 + (lane & 15), H - 1) * DP + (lane >> 4) * 8;
+#pragma unroll 2
+    for (int k0 = k0b; k0 < k0b + D / 2; k0 += 32) {
+      uint32_t b0, b1, b2, b3;
+      ldsm_x4(b0, b1, b2, b3, kr + k0);   // (k0, k0 + 8, k0 + 16, k0 + 24) of rows warp 8 + 0..7
+#pragma unroll
+      for (int m = 0; m < MT; ++m) {
+        uint32_t a0, a1, a2, a3;
+        ldsm_x4(a0, a1, a2, a3, qr[m] + k0);
+        mma(s[m], a0, a1, a2, a3, b0, b1);
+      }
+#pragma unroll
+      for (int m = 0; m < MT; ++m) {
+        uint32_t a0, a1, a2, a3;
+        ldsm_x4(a0, a1, a2, a3, qr[m] + k0 + 16);
+        mma(s[m], a0, a1, a2, a3, b2, b3);
+      }
+    }
+  };
   // ---- pass 1: maxima
   float mx[MT][2];
   for (int m = 0; m < MT; ++m) mx[m][0] = mx[m][1] = -INFINITY;
   float sc[CACHE ? MAXT : 1][MT][4];
-  if (CACHE) {
+  if (pipe) {
+    issue(0, 0, true); issue(0, 1, true);   // (the query rows join the first group)
+#pragma unroll
+    for (int i = 0; i < MAXT; ++i) {
+      if (i >= ntp) break;
+      for (int m = 0; m < MT; ++m) for (int c = 0; c < 4; ++c) sc[i][m][c] = 0.f;
+      cp_wait1(); __syncthreads();
+      scores_part(sc[i], 0);
+      __syncthreads();
+      issue(i + 1, 0, true);
+      cp_wait1(); __syncthreads();
+      scores_part(sc[i], D / 2);
+      for (int m = 0; m < MT; ++m) for (int c = 0; c < 4; ++c) sc[i][m][c] *= scale;
+      const bool v0 = rows_all[i * TILE + warp * 8 + 2 * qd] >= 0, v1 = rows_all[i * TILE + warp * 8 + 2 * qd + 1] >= 0;
+      for (int m = 0; m < MT; ++m) {
+        if (v0) { mx[m][0] = fmaxf(mx[m][0], sc[i][m][0]); mx[m][1] = fmaxf(mx[m][1], sc[i][m][2]); }
+        if (v1) { mx[m][0] = fmaxf(mx[m][0], sc[i][m][1]); mx[m][1] = fmaxf(mx[m][1], sc[i][m][3]); }
+      }
+      __syncthreads();
+      if (i + 1 < ntp) issue(i + 1, 1, true);
+    }
+    cp_wait_all(); __syncthreads();
+    if (ntp > 1) { issue(0, 0, false); issue(0, 1, false); }   // pass 2's first tile (one tile: still in the buffer)
+  } else if (CACHE) {
 #pragma unroll
     for (int i = 0; i < MAXT; ++i) {
       const int tl = tl0 + i;
@@ -198,6 +290,43 @@ __global__ __launch_bounds__(WARPS * 32, 1) void sparse_attn_kernel(const __nv_b
   for (int m = 0; m < MT; ++m) for (int n = 0; n < 8; ++n) for (int c = 0; c < 4; ++c) o[m][n][c] = 0.f;
   float den[MT][2];
   for (int m = 0; m < MT; ++m) den[m][0] = den[m][1] = 0.f;
+  // P V of rows [kb, kb + 32) of the tile in the buffer (p in ps)
+  auto pv_part = [&](int kb) {
+#pragma unroll
+    for (int kk = kb; kk < kb + TILE / 2; kk += 16) {
+      uint32_t a[MT][4];
+      for (int m = 0; m < MT; ++m) ldsm_x4(a[m][0], a[m][1], a[m][2], a[m][3], ps + (m * 16 + (lane & 15)) * TP + kk + (lane >> 4) * 8);
+#pragma unroll
+      for (int n = 0; n < 8; n += 2) {
+        const int n0 = warp * 64 + n * 8;
+        uint32_t b0, b1, b2, b3;
+        ldsm_x4_t(b0, b1, b2, b3, kvs + (kk + (lane & 15)) * DP + n0 + (lane >> 4) * 8);
+        for (int m = 0; m < MT; ++m) { mma(o[m][n], a[m][0], a[m][1], a[m][2], a[m][3], b0, b1); mma(o[m][n + 1], a[m][0], a[m][1], a[m][2], a[m][3], b2, b3); }
+      }
+    }
+  };
+  if (pipe) {
+#pragma unroll
+    for (int i = 0; i < MAXT; ++i) {
+      if (i >= ntp) break;
+      const bool v0 = rows_all[i * TILE + warp * 8 + 2 * qd] >= 0, v1 = rows_all[i * TILE + warp * 8 + 2 * qd + 1] >= 0;
+      for (int m = 0; m < MT; ++m)
+        for (int hh = 0; hh < 2; ++hh) {
+          const float p0 = v0 ? expf(sc[i][m][hh * 2] - mrow[m][hh]) : 0.f, p1 = v1 ? expf(sc[i][m][hh * 2 + 1] - mrow[m][hh]) : 0.f;
+          den[m][hh] += p0 + p1;
+          *reinterpret_cast<__nv_bfloat162*>(ps + (m * 16 + hh * 8 + g) * TP + warp * 8 + 2 * qd) = __floats2bfloat162_rn(p0, p1);
+        }
+      if (ntp > 1) cp_wait1();
+      __syncthreads();
+      pv_part(0);
+      __syncthreads();
+      if (ntp > 1) { issue(i + 1, 0, false); cp_wait1(); }
+      __syncthreads();
+      pv_part(TILE / 2);
+      __syncthreads();
+      if (ntp > 1 && i + 1 < ntp) issue(i + 1, 1, false);
+    }
+  } else
 #pragma unroll
   for (int i = 0; i < (CACHE ? MAXT : ntiles - tl0); ++i) {
     const int tl = tl0 + i;
@@ -214,22 +343,8 @@ __global__ __launch_bounds__(WARPS * 32, 1) void sparse_attn_kernel(const __nv_b
         *reinterpret_cast<__nv_bfloat162*>(ps + (m * 16 + hh * 8 + g) * TP + warp * 8 + 2 * qd) = __floats2bfloat162_rn(p0, p1);
       }
     __syncthreads();
-#pragma unroll
-    for (int kk = 0; kk < TILE; kk += 16) {
-      uint32_t a[MT][4];
-      for (int m = 0; m < MT; ++m) {
-        const __nv_bfloat16* pr = ps + (m * 16 + g) * TP + kk + 2 * qd;
-        a[m][0] = ld32(pr); a[m][1] = ld32(pr + 8 * TP); a[m][2] = ld32(pr + 8); a[m][3] = ld32(pr + 8 * TP + 8);
-      }
-#pragma unroll
-      for (int n = 0; n < 8; n += 2) {
-        // x4.trans: lanes 0-15 rows kk..kk+15 at column n0, lanes 16-31 the same rows at n0 + 8
-        const int n0 = warp * 64 + n * 8;
-        uint32_t b0, b1, b2, b3;
-        ldsm_x4_t(b0, b1, b2, b3, kvs + (kk + (lane & 15)) * DP + n0 + (lane >> 4) * 8);
-        for (int m = 0; m < MT; ++m) { mma(o[m][n], a[m][0], a[m][1], a[m][2], a[m][3], b0, b1); mma(o[m][n + 1], a[m][0], a[m][1], a[m][2], a[m][3], b2, b3); }
-      }
-    }
+    pv_part(0);
+    pv_part(TILE / 2);
     __syncthreads();
   }
   // denominators: lanes of a quad, then warps (in order)
@@ -495,12 +610,18 @@ extern "C" size_t ds41_sparse_attn_smem(int H) { return smem_bytes(H); }
 extern "C" size_t ds41_sparse_attn_ws_bytes(int T, int H) { return T <= 16 ? (size_t)T * 16 * (64 + (size_t)H * D) * 4 : 0; }
 // pools a / b / c with na / nb rows (b, c may be null), W window keys per query from `pos` / `start` (0: none), idx
 // [T, K - W] the other indices.
+// ds41-attn-bench: a kernel variant forced (0: the default)
+static int g_attn_version = 0;
+extern "C" int ds41_attn_version(int v) { g_attn_version = v; return 0; }
 extern "C" int ds41_sparse_attn(const void* q, const void* a, int na, const void* b, int nb, const void* c, int W, long long start,
                                 long long lo, const int64_t* pos, const int64_t* idx, const float* sink, void* out, int T, int H, int K,
                                 float scale, void* ws, cudaStream_t st) {
   if (!b) nb = 0;
   if (!c && !b) na = 0x7fffffff;
   Pools pl{(const __nv_bfloat16*)a, (const __nv_bfloat16*)b, (const __nv_bfloat16*)c, na, nb, W, start, pos, lo};
+  // the pipelined MODE 0 tile loads (DS41_ATTN_PIPE=0 the one-tile-at-a-time loop; the same bits)
+  static const bool pipe_on = !(std::getenv("DS41_ATTN_PIPE") && std::getenv("DS41_ATTN_PIPE")[0] == '0');
+  pl.pipe = pipe_on;
   if (T < 1 || H < 1 || H > 32 || K < 1) return 1;
   const size_t sm = smem_bytes(H);
   const int tiles = (K + TILE - 1) / TILE;

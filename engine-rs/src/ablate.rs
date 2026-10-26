@@ -200,6 +200,9 @@ impl Clamp {
         if !a.count.is_null() { a.count = unsafe { a.count.add(off.max(0) as usize) }; }
         Some(a)
     }
+    /// The count gate's per-row counters (None without the gate): DS41's sequence-parallel encoder gathers each rank's
+    /// rows of them back so every rank holds the whole pass's counts, as when every rank ran every row.
+    pub fn gate_counts(&self) -> Option<&Tensor> { (self.min > 1).then_some(&self.count) }
     /// Test accessors for the ds41-clamp-test fused-epilogue check.
     pub fn site_thresholds(&self, l: usize, s: usize) -> (Tensor, Tensor, Option<Tensor>) {
         (self.tau.get(l as i64).get(s as i64).shallow_clone(), self.tau_lo.get(l as i64).get(s as i64).shallow_clone(),

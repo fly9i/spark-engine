@@ -154,6 +154,76 @@ __global__ __launch_bounds__(128) void hc_part_reg(const __nv_bfloat16* __restri
   }
 }
 
+// hc_part_reg with the same FMA sequence per accumulator (3 mixes per thread, mg 0 also the square sums, the same K
+// slices; fmaf along K in order: bitwise equal), latency hidden: more CTAs and threads (T = 683 gave hc_part_reg 66
+// CTAs of 4 warps on 48 SMs), x kept as its BF16 rows and fn rows FP32 in shared memory, both loaded by cp.async
+// R2S stages ahead (hc_part_reg loads, transposes with 8-way bank conflicts, then waits on every stage). The thread
+// mapping (TPT tokens per thread) is free: each accumulator's FMA chain is the same.
+constexpr int R2K = 64, R2S = 3;
+__device__ __forceinline__ void hc_cp16(void* s, const void* g, bool ok) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"((unsigned)__cvta_generic_to_shared(s)), "l"(g), "r"(ok ? 16 : 0));
+}
+// TPT tokens per thread (thread = TPT tokens x 3 mixes): the CTA is (R2T / TPT) x 8 threads.
+template <int R2T, int TPT>
+__global__ __launch_bounds__(R2T / TPT * 8) void hc_part_reg2(const __nv_bfloat16* __restrict__ h, const float* __restrict__ fn,
+                                                       float* __restrict__ part, int T, int D) {
+  constexpr int NTH = R2T / TPT * 8, XP = R2K + 8, FP = R2K + 4;   // padded rows: x 144 bytes, fn 272 (the 8 mg lanes' rows 3 mg on distinct banks)
+  pdl_entry();
+  __shared__ __align__(16) __nv_bfloat16 xs[R2S][R2T][XP];
+  __shared__ __align__(16) float fs[R2S][MIX][FP];
+  const int K = HC * D, t0 = blockIdx.x * R2T, tid = threadIdx.x, tg = tid >> 3, mg = tid & 7;
+  const int nst = K / R2K, st0 = blockIdx.y * nst / gridDim.y, st1 = (blockIdx.y + 1) * nst / gridDim.y, ns = st1 - st0;
+  auto load = [&](int s, int k0) {
+    for (int i = tid; i < R2T * R2K / 8; i += NTH) {        // x: 8 bf16 per 16-byte copy
+      const int r = i / (R2K / 8), c = (i % (R2K / 8)) * 8, t = t0 + r;
+      hc_cp16(&xs[s][r][c], h + (long long)(t < T ? t : 0) * K + k0 + c, t < T);
+    }
+    for (int i = tid; i < MIX * R2K / 4; i += NTH) {         // fn: 4 floats per copy
+      const int m = i / (R2K / 4), c = (i % (R2K / 4)) * 4;
+      hc_cp16(&fs[s][m][c], fn + (long long)m * K + k0 + c, true);
+    }
+  };
+  float acc[TPT][3], sq[TPT];
+#pragma unroll
+  for (int a = 0; a < TPT; ++a) { sq[a] = 0.f; for (int b = 0; b < 3; ++b) acc[a][b] = 0.f; }
+#pragma unroll
+  for (int s = 0; s < R2S - 1; ++s) { if (s < ns) load(s, (st0 + s) * R2K); asm volatile("cp.async.commit_group;\n"); }
+  for (int j = 0; j < ns; ++j) {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(R2S - 2) : "memory");
+    __syncthreads();
+    if (j + R2S - 1 < ns) load((j + R2S - 1) % R2S, (st0 + j + R2S - 1) * R2K);
+    asm volatile("cp.async.commit_group;\n");
+    const int s = j % R2S;
+#pragma unroll 4
+    for (int c = 0; c < R2K; c += 2) {
+      float2 xv[TPT];
+#pragma unroll
+      for (int a = 0; a < TPT; ++a) xv[a] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xs[s][TPT * tg + a][c]));
+      const float2 f0 = *reinterpret_cast<const float2*>(&fs[s][3 * mg][c]), f1 = *reinterpret_cast<const float2*>(&fs[s][3 * mg + 1][c]),
+                   f2 = *reinterpret_cast<const float2*>(&fs[s][3 * mg + 2][c]);
+#pragma unroll
+      for (int a = 0; a < TPT; ++a) {
+        acc[a][0] = fmaf(xv[a].x, f0.x, acc[a][0]); acc[a][1] = fmaf(xv[a].x, f1.x, acc[a][1]); acc[a][2] = fmaf(xv[a].x, f2.x, acc[a][2]);
+        if (mg == 0) sq[a] = fmaf(xv[a].x, xv[a].x, sq[a]);
+      }
+#pragma unroll
+      for (int a = 0; a < TPT; ++a) {
+        acc[a][0] = fmaf(xv[a].y, f0.y, acc[a][0]); acc[a][1] = fmaf(xv[a].y, f1.y, acc[a][1]); acc[a][2] = fmaf(xv[a].y, f2.y, acc[a][2]);
+        if (mg == 0) sq[a] = fmaf(xv[a].y, xv[a].y, sq[a]);
+      }
+    }
+  }
+  asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+#pragma unroll
+  for (int a = 0; a < TPT; ++a) {
+    const int t = t0 + TPT * tg + a;
+    if (t >= T) continue;
+    float* pr = part + ((long long)blockIdx.y * T + t) * (MIX + 1);
+    pr[3 * mg] = acc[a][0]; pr[3 * mg + 1] = acc[a][1]; pr[3 * mg + 2] = acc[a][2];
+    if (mg == 0) pr[MIX] = sq[a];
+  }
+}
+
 // Finalize: component b < 25 of one token (summed over the S slices) sits in lane b of one warp; that warp computes
 // pre (lanes 0-3), post (lanes 4-7) and the 4x4 Sinkhorn with one element per lane (lane & 15 = 4 j + k, row j;
 // row / column sums by shuffles inside groups of 16): the alternating normalizations run in parallel.
@@ -232,6 +302,18 @@ extern "C" {
 static bool hc_narrow(int T, int D) { return T <= 16 && (HC * D) % (160 * 2 * 64) == 0 && !std::getenv("DS41_HC_WIDE_PART"); }
 // many tokens (register-blocked path): K split so that the 64-token CTAs number about 192
 static bool hc_reg(int T, int D) { return T > 64 && (HC * D) % RK == 0 && !std::getenv("DS41_HC_PART4"); }
+// DS41_HC_REG1=1: hc_part_reg (hc_part_reg2 is bitwise equal)
+static bool hc_reg2() { static const bool on = !(std::getenv("DS41_HC_REG1") && std::getenv("DS41_HC_REG1")[0] == '1'); return on; }
+// hc_part_reg2 shapes by T (bitwise equal whichever; measured, random rows, D 5120): T <= 256 32 tokens x 2 per thread
+// (the replay's 128: 157 -> 44 us), T <= 1536 16 x 1 (a part's 683 local rows: 356 -> 180 us, 1366: 736 -> 341),
+// above 64 x 2 (2048: 501 -> 502, hc_part_reg's level)
+static void hc_part_launch(const void* h, const float* fn, float* part, int T, int D, int S, cudaStream_t st) {
+  const __nv_bfloat16* x = (const __nv_bfloat16*)h;
+  if (!hc_reg2()) pdl_launch(hc_part_reg, dim3(dim3((T + RT - 1) / RT, S)), dim3(128), 0, st, x, fn, part, T, D);
+  else if (T <= 256) pdl_launch((hc_part_reg2<32, 2>), dim3(dim3((T + 31) / 32, S)), dim3(128), 0, st, x, fn, part, T, D);
+  else if (T <= 1536) pdl_launch((hc_part_reg2<16, 1>), dim3(dim3((T + 15) / 16, S)), dim3(128), 0, st, x, fn, part, T, D);
+  else pdl_launch((hc_part_reg2<64, 2>), dim3(dim3((T + 63) / 64, S)), dim3(256), 0, st, x, fn, part, T, D);
+}
 static int hc_reg_slices(int T) { const int blocks = (T + RT - 1) / RT; const int s = (192 + blocks - 1) / blocks; return s < 1 ? 1 : s > 8 ? 8 : s; }
 int ds41_hc_slices(int T, int D) {
   if (hc_narrow(T, D)) return 160;
@@ -239,6 +321,17 @@ int ds41_hc_slices(int T, int D) {
   const int K = HC * D; int S = T <= 16 ? 40 : T <= 64 ? 8 : 1; while (S > 1 && K % (S * 2 * THREADS)) --S; return S;
 }
 // part: workspace of ds41_hc_slices(T, D) * T * 25 floats
+// ds41_hc_mix of T rows exactly as a call over `rows` rows would compute them (the kernel and K slices that `rows` select;
+// sequence-parallel prefill: each rank's share of a chunk keeps the full chunk's sums). Only the register-blocked path
+// (rows > 64): its per-token result depends on S alone. part: S(rows) * T * 25 floats.
+int ds41_hc_mix_as(const void* h, const float* fn, const float* scale, const float* base, float* pre, float* post, float* comb,
+                   float* part, int T, int rows, int D, float norm_eps, float eps, int iters, cudaStream_t st) {
+  if (T < 1 || D % 2 || !hc_reg(rows, D)) return 1;
+  const int S = hc_reg_slices(rows);
+  hc_part_launch(h, fn, part, T, D, S, st);
+  pdl_launch((hc_fin_kernel<false>), dim3((T + 3) / 4), dim3(128), 0, st, part, S, scale, base, pre, post, comb, T, D, norm_eps, eps, iters);
+  return (int)cudaGetLastError();
+}
 int ds41_hc_mix(const void* h, const float* fn, const float* scale, const float* base, float* pre, float* post, float* comb,
                 float* part, int T, int D, float norm_eps, float eps, int iters, cudaStream_t st) {
   if (T < 1 || D % 2) return 1;
@@ -246,7 +339,7 @@ int ds41_hc_mix(const void* h, const float* fn, const float* scale, const float*
   if (hc_narrow(T, D)) pdl_launch((hc_part_kernel<1, 64>), dim3(dim3(T, S)), dim3(64), 0, st, (const __nv_bfloat16*)h, fn, part, T, D);
   else if (T <= 16) pdl_launch((hc_part_kernel<1>), dim3(dim3(T, S)), dim3(THREADS), 0, st, (const __nv_bfloat16*)h, fn, part, T, D);
   else if (hc_reg(T, D))   // many tokens: register-blocked, K split in S slices
-    pdl_launch(hc_part_reg, dim3(dim3((T + RT - 1) / RT, S)), dim3(128), 0, st, (const __nv_bfloat16*)h, fn, part, T, D);
+    hc_part_launch(h, fn, part, T, D, S, st);
   else if (T <= 256) pdl_launch((hc_part_kernel<4>), dim3(dim3((T + 3) / 4, S)), dim3(THREADS), 0, st, (const __nv_bfloat16*)h, fn, part, T, D);
   else if (std::getenv("DS41_HC_TILED")) hc_part_tiled<<<(T + TT - 1) / TT, 256, 0, st>>>((const __nv_bfloat16*)h, fn, part, T, D);
   else pdl_launch((hc_part_kernel<4>), dim3(dim3((T + 3) / 4, S)), dim3(THREADS), 0, st, (const __nv_bfloat16*)h, fn, part, T, D);

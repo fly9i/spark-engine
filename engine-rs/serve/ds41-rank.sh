@@ -10,6 +10,9 @@ source "$SPARK_HOME/scripts/env.sh"
 export GLM53_TP_RANK=$rank GLM53_TP_WORLD=3 GLM53_MASTER_ADDR=$master GLM53_MASTER_PORT=${DS41_MASTER_PORT:-29961}
 # transport: NCCL only bootstraps over sockets; every collective goes over the engine's N-way RDMA (subnet-paired links)
 export NCCL_SOCKET_IFNAME=${SPARK_TP3_IFNAME:?set SPARK_TP3_IFNAME in spark.env} NCCL_IB_DISABLE=1 GLM53_RDMA_ARN_INIT=1 GLM53_RDMA_AR=1
+# prefill: RDMA row reduce-scatter / all-gather depth 12 in flight, the communication stream at the highest priority,
+# MoE down-projection output buffer up to 1024 MiB (8192-row chunks in one pass, the combine fused into the scatter)
+export GLM53_RDMA_ARN_ROWS_PIPE=${GLM53_RDMA_ARN_ROWS_PIPE:-12} GLM53_COMM_STREAM_PRIO=${GLM53_COMM_STREAM_PRIO:-1} DS41_MOE_OUT_MB=${DS41_MOE_OUT_MB:-1024}
 # serving: 4 sequences, DSpark speculative decoding (the draft stages take ~2.7 GiB per rank), NVMe prefix cache, image input
 # (rank 0 loads the vision encoder, ~1 GiB). Small per-capture cuBLAS workspaces shared by the graphs.
 export DS41_SERVE_STORES=${DS41_SERVE_STORES:-4} DS41_MTP=${DS41_MTP:-1} DS41_SPEC=${DS41_SPEC:-1} DS41_PCACHE=${DS41_PCACHE:-1} \

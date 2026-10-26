@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Decode throughput with the protocol of MiaAI-Lab/sparkDash DecodeBench (the numbers in MiaAI-Lab/DeepSeek-v4.1-Flash-
-DGX-Sparks): greedy, top_p 1, thinking off, 32-token warmup, 256 completion tokens per stream, streamed;
+"""Decode throughput: greedy, top_p 1, thinking off, 32-token warmup, 256 completion tokens per stream, streamed;
 per-stream decode tok/s = (completion_tokens - 1) / (last - first content token); aggregate = all streams' tokens over
-the window from the first stream's first token to the last stream's last token. Prompts: sparkDash's prose (hash map
+the window from the first stream's first token to the last stream's last token. Prompts: prose (hash map
 explanation), structured (count 1..200), code.
 
 usage: decode_bench.py [--url http://127.0.0.1:8888] [--types prose,structured,code] [--conc 1,2,4] [--max-tokens 256]

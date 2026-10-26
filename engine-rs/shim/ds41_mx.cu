@@ -15,7 +15,10 @@
 // - in a 32-block, the lane's 8 K positions split into the even ones (low nibbles: B fragment register 0, A bytes
 //   0, 2, 4, 6) and the odd ones (high nibbles: register 1, A bytes 1, 3, 5, 7): A and B use the same K mapping;
 // - x and the intermediate h as E4M3 bytes + UE8M0 bytes per 32 (ds41_act_quant_fp8; up's epilogue writes h so).
+#include <map>
+#include <tuple>
 #include "ds41_pdl.cuh"
+#include "ds41_hc_job.cuh"
 #include <cuda_runtime.h>
 #include <cstdlib>
 #include <cuda_bf16.h>
@@ -259,16 +262,17 @@ __global__ __launch_bounds__(128) void down_mx(const uint8_t* __restrict__ hq, c
     }
 }
 
+// (columns [c0, c0 + hn) of y; out holds those columns of every pair, hn per row)
 __global__ void combine_kernel(const float* __restrict__ out, const int* __restrict__ pairmap, const float* __restrict__ add,
-                               float* __restrict__ y, int R, int topk) {
+                               float* __restrict__ y, int R, int topk, int c0, int hn) {
   pdl_entry();
   const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= (long long)R * (H / 4)) return;
-  const int r = (int)(i / (H / 4)), c = (int)(i % (H / 4)) * 4;
+  if (i >= (long long)R * (hn / 4)) return;
+  const int r = (int)(i / (hn / 4)), c = c0 + (int)(i % (hn / 4)) * 4;
   float4 acc = add ? *reinterpret_cast<const float4*>(add + (long long)r * H + c) : make_float4(0.f, 0.f, 0.f, 0.f);
   float4 s = make_float4(0.f, 0.f, 0.f, 0.f);
   for (int k = 0; k < topk; ++k) {
-    const float4 v = *reinterpret_cast<const float4*>(out + (long long)pairmap[r * topk + k] * H + c);
+    const float4 v = *reinterpret_cast<const float4*>(out + (long long)pairmap[r * topk + k] * hn + (c - c0));
     s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w;
   }
   acc.x += s.x; acc.y += s.y; acc.z += s.z; acc.w += s.w;
@@ -397,6 +401,228 @@ __global__ __launch_bounds__(256) void fp8_gemm_mx(const uint8_t* __restrict__ a
     }
 }
 
+// fp8_gemm_mx with the same MMA sequence per output (32-blocks in K order, the same fragments and scales: bitwise
+// equal) and: the scales one K step ahead in registers (two adjacent UE8M0 bytes per row / column block in one 16-bit
+// load; fp8_gemm_mx reads them from global memory per 32-block inside the MMA loop, B's once per n tile though all of a
+// warp's 32 columns share one), one barrier per K step (load the next step after the barrier that ends the previous
+// step's reads), a warp tile of 64 x 8 NT (WMW x WNW warps).
+template <bool B16, int WMW, int WNW, int NT>
+__global__ __launch_bounds__(32 * WMW * WNW) void fp8_gemm_mx2(const uint8_t* __restrict__ aq, const uint8_t* __restrict__ as_,
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, void* __restrict__ yv, int M, int N, int K) {
+  constexpr int BM = 64 * WMW, BN = 8 * NT * WNW, NTH = 32 * WMW * WNW, NB = NT / 4;   // NB: 32-col scale blocks per warp
+  __shared__ __align__(16) uint8_t sa[2][BM * GP], sb[2][BN * GP];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, q = lane & 3;
+  const int wm = warp / WNW, wn = warp % WNW;
+  const int m0 = blockIdx.x * BM, n0 = blockIdx.y * BN;
+  const int nk = K / GK, kb = K / 32;
+  auto load = [&](int stage, int k0) {
+    for (int i = tid; i < BM * GK / 16; i += NTH) {
+      const int r = i >> 2, c = (i & 3) * 16, gm = m0 + r;
+      cp16(&sa[stage][r * GP + c], aq + (long long)(gm < M ? gm : 0) * K + k0 + c, gm < M);
+    }
+    for (int i = tid; i < BN * GK / 16; i += NTH) {
+      const int r = i >> 2, c = (i & 3) * 16, gn = n0 + r;
+      cp16(&sb[stage][r * GP + c], w + (long long)(gn < N ? gn : 0) * K + k0 + c, gn < N);
+    }
+    asm volatile("cp.async.commit_group;\n");
+  };
+  float acc[4][NT][4];
+#pragma unroll
+  for (int a = 0; a < 4; ++a)
+#pragma unroll
+    for (int b = 0; b < NT; ++b)
+#pragma unroll
+      for (int c = 0; c < 4; ++c) acc[a][b][c] = 0.f;
+  const uint16_t* pa[4];
+#pragma unroll
+  for (int mt = 0; mt < 4; ++mt) pa[mt] = reinterpret_cast<const uint16_t*>(as_ + (long long)min(m0 + wm * 64 + mt * 16 + g + 8 * (lane & 1), M - 1) * kb);
+  const uint16_t* pb[NB];
+#pragma unroll
+  for (int j = 0; j < NB; ++j) pb[j] = reinterpret_cast<const uint16_t*>(ws + (long long)(min(n0 + wn * 8 * NT + j * 32 + g, N - 1) >> 5) * kb);
+  uint16_t ca[4], cb[NB];
+#pragma unroll
+  for (int mt = 0; mt < 4; ++mt) ca[mt] = __ldg(pa[mt]);
+#pragma unroll
+  for (int j = 0; j < NB; ++j) cb[j] = __ldg(pb[j]);
+  load(0, 0);
+  for (int ks = 0; ks < nk; ++ks) {
+    const int st = ks & 1;
+    asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+    if (ks + 1 < nk) load(st ^ 1, (ks + 1) * GK);
+    uint16_t na[4], nb[NB];
+    const int kn = ks + 1 < nk ? ks + 1 : ks;
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) na[mt] = __ldg(pa[mt] + kn);
+#pragma unroll
+    for (int j = 0; j < NB; ++j) nb[j] = __ldg(pb[j] + kn);
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+      uint32_t a[4][4];
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt) {
+        const uint8_t* p0 = &sa[st][(wm * 64 + mt * 16 + g) * GP + b * 32 + 8 * q];
+        const uint2 r0 = *reinterpret_cast<const uint2*>(p0), r1 = *reinterpret_cast<const uint2*>(p0 + 8 * GP);
+        a_split(r0, a[mt][0], a[mt][2]);
+        a_split(r1, a[mt][1], a[mt][3]);
+      }
+      uint32_t sfa[4];
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt) sfa[mt] = (ca[mt] >> (8 * b)) & 0xFF;
+#pragma unroll
+      for (int nt = 0; nt < NT; ++nt) {
+        const uint2 rb = *reinterpret_cast<const uint2*>(&sb[st][(wn * 8 * NT + nt * 8 + g) * GP + b * 32 + 8 * q]);
+        uint32_t b0, b1;
+        a_split(rb, b0, b1);
+        const uint32_t sfb = (cb[nt / 4] >> (8 * b)) & 0xFF;
+#pragma unroll
+        for (int mt = 0; mt < 4; ++mt) mma_e4(acc[mt][nt], a[mt][0], a[mt][1], a[mt][2], a[mt][3], b0, b1, sfa[mt], sfb);
+      }
+    }
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) ca[mt] = na[mt];
+#pragma unroll
+    for (int j = 0; j < NB; ++j) cb[j] = nb[j];
+  }
+#pragma unroll
+  for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+    for (int hh = 0; hh < 2; ++hh) {
+      const int r = m0 + wm * 64 + mt * 16 + hh * 8 + g;
+      if (r >= M) continue;
+#pragma unroll
+      for (int nt = 0; nt < NT; ++nt) {
+        const int c = n0 + wn * 8 * NT + nt * 8 + 2 * q;
+        if (c < N) {
+          if (B16) *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(yv) + (long long)r * N + c) = __floats2bfloat162_rn(acc[mt][nt][hh * 2], acc[mt][nt][hh * 2 + 1]);
+          else *reinterpret_cast<float2*>(reinterpret_cast<float*>(yv) + (long long)r * N + c) = make_float2(acc[mt][nt][hh * 2], acc[mt][nt][hh * 2 + 1]);
+        }
+      }
+    }
+}
+// fp8_gemm_mx2 (the same MMA sequence per output: bitwise equal) with the operand rows PB bytes apart in shared memory
+// and NS stages (dynamic shared memory). fp8_gemm_mx2's 80-byte rows (GP): the 64-bit fragment loads of a half warp
+// (rows g = 0..3, 8 bytes at 8 q) fall on 4-byte banks 20 g + 2 q + {0, 1}, so rows 0 and 3 share banks 0-3 (two-way
+// conflicts); 96-byte rows (banks 24 g + ..) are conflict-free.
+// PB == 0: 64-byte rows (no padding) with the 16-byte chunks of rows with bit 1 set swapped in pairs (chunk ^ 2): a half
+// warp's rows g = 0..3 then cover banks 0-7, 16-23, 8-15, 24-31 (conflict-free), a third less shared memory than 96.
+template <bool B16, int WMW, int WNW, int NT, int NS, int PB>
+__global__ __launch_bounds__(32 * WMW * WNW) void fp8_gemm_mx3(const uint8_t* __restrict__ aq, const uint8_t* __restrict__ as_,
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, void* __restrict__ yv, int M, int N, int K) {
+  constexpr int BM = 64 * WMW, BN = 8 * NT * WNW, NTH = 32 * WMW * WNW, NB = NT / 4, RB = PB ? PB : GK;
+  // byte offset of (row r, byte c of the K step) in a stage
+  auto at = [](int r, int c) { return PB ? r * PB + c : r * GK + ((((c >> 4) ^ (((r >> 1) & 1) << 1))) << 4) + (c & 15); };
+  extern __shared__ __align__(16) uint8_t g3_smem[];
+  uint8_t* const sa0 = g3_smem;                     // [NS][BM * RB]
+  uint8_t* const sb0 = g3_smem + NS * BM * RB;      // [NS][BN * RB]
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, q = lane & 3;
+  const int wm = warp / WNW, wn = warp % WNW;
+  const int m0 = blockIdx.x * BM, n0 = blockIdx.y * BN;
+  const int nk = K / GK, kb = K / 32;
+  auto load = [&](int stage, int k0) {
+    uint8_t* sa = sa0 + stage * BM * RB;
+    uint8_t* sb = sb0 + stage * BN * RB;
+    for (int i = tid; i < BM * GK / 16; i += NTH) {
+      const int r = i >> 2, c = (i & 3) * 16, gm = m0 + r;
+      cp16(&sa[at(r, c)], aq + (long long)(gm < M ? gm : 0) * K + k0 + c, gm < M);
+    }
+    for (int i = tid; i < BN * GK / 16; i += NTH) {
+      const int r = i >> 2, c = (i & 3) * 16, gn = n0 + r;
+      cp16(&sb[at(r, c)], w + (long long)(gn < N ? gn : 0) * K + k0 + c, gn < N);
+    }
+  };
+  float acc[4][NT][4];
+#pragma unroll
+  for (int a = 0; a < 4; ++a)
+#pragma unroll
+    for (int b = 0; b < NT; ++b)
+#pragma unroll
+      for (int c = 0; c < 4; ++c) acc[a][b][c] = 0.f;
+  const uint16_t* pa[4];
+#pragma unroll
+  for (int mt = 0; mt < 4; ++mt) pa[mt] = reinterpret_cast<const uint16_t*>(as_ + (long long)min(m0 + wm * 64 + mt * 16 + g + 8 * (lane & 1), M - 1) * kb);
+  const uint16_t* pb[NB];
+#pragma unroll
+  for (int j = 0; j < NB; ++j) pb[j] = reinterpret_cast<const uint16_t*>(ws + (long long)(min(n0 + wn * 8 * NT + j * 32 + g, N - 1) >> 5) * kb);
+  uint16_t ca[4], cb[NB];
+#pragma unroll
+  for (int mt = 0; mt < 4; ++mt) ca[mt] = __ldg(pa[mt]);
+#pragma unroll
+  for (int j = 0; j < NB; ++j) cb[j] = __ldg(pb[j]);
+#pragma unroll
+  for (int s = 0; s < NS - 1; ++s) { if (s < nk) load(s, s * GK); asm volatile("cp.async.commit_group;\n"); }
+  for (int ks = 0; ks < nk; ++ks) {
+    const int st = ks % NS;
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(NS - 2) : "memory");
+    __syncthreads();
+    if (ks + NS - 1 < nk) load((ks + NS - 1) % NS, (ks + NS - 1) * GK);
+    asm volatile("cp.async.commit_group;\n");
+    const uint8_t* sa = sa0 + st * BM * RB;
+    const uint8_t* sb = sb0 + st * BN * RB;
+    uint16_t na[4], nb[NB];
+    const int kn = ks + 1 < nk ? ks + 1 : ks;
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) na[mt] = __ldg(pa[mt] + kn);
+#pragma unroll
+    for (int j = 0; j < NB; ++j) nb[j] = __ldg(pb[j] + kn);
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+      uint32_t a[4][4];
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt) {
+        const int ra = wm * 64 + mt * 16 + g;   // (ra + 8: the same swizzle)
+        const uint2 r0 = *reinterpret_cast<const uint2*>(&sa[at(ra, b * 32 + 8 * q)]), r1 = *reinterpret_cast<const uint2*>(&sa[at(ra + 8, b * 32 + 8 * q)]);
+        a_split(r0, a[mt][0], a[mt][2]);
+        a_split(r1, a[mt][1], a[mt][3]);
+      }
+      uint32_t sfa[4];
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt) sfa[mt] = (ca[mt] >> (8 * b)) & 0xFF;
+#pragma unroll
+      for (int nt = 0; nt < NT; ++nt) {
+        const uint2 rb = *reinterpret_cast<const uint2*>(&sb[at(wn * 8 * NT + nt * 8 + g, b * 32 + 8 * q)]);
+        uint32_t b0, b1;
+        a_split(rb, b0, b1);
+        const uint32_t sfb = (cb[nt / 4] >> (8 * b)) & 0xFF;
+#pragma unroll
+        for (int mt = 0; mt < 4; ++mt) mma_e4(acc[mt][nt], a[mt][0], a[mt][1], a[mt][2], a[mt][3], b0, b1, sfa[mt], sfb);
+      }
+    }
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) ca[mt] = na[mt];
+#pragma unroll
+    for (int j = 0; j < NB; ++j) cb[j] = nb[j];
+  }
+  asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+#pragma unroll
+  for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+    for (int hh = 0; hh < 2; ++hh) {
+      const int r = m0 + wm * 64 + mt * 16 + hh * 8 + g;
+      if (r >= M) continue;
+#pragma unroll
+      for (int nt = 0; nt < NT; ++nt) {
+        const int c = n0 + wn * 8 * NT + nt * 8 + 2 * q;
+        if (c < N) {
+          if (B16) *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(yv) + (long long)r * N + c) = __floats2bfloat162_rn(acc[mt][nt][hh * 2], acc[mt][nt][hh * 2 + 1]);
+          else *reinterpret_cast<float2*>(reinterpret_cast<float*>(yv) + (long long)r * N + c) = make_float2(acc[mt][nt][hh * 2], acc[mt][nt][hh * 2 + 1]);
+        }
+      }
+    }
+}
+template <int WMW, int WNW, int NT, int NS, int PB>
+int launch_g3(const void* aq, const void* as_, const void* w, const void* ws, void* y, int M, int N, int K, int bf16out, cudaStream_t st) {
+  constexpr int BM = 64 * WMW, BN = 8 * NT * WNW, SM = NS * (BM + BN) * (PB ? PB : GK);
+  static const bool attr = cudaFuncSetAttribute(fp8_gemm_mx3<true, WMW, WNW, NT, NS, PB>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM) == cudaSuccess &&
+                           cudaFuncSetAttribute(fp8_gemm_mx3<false, WMW, WNW, NT, NS, PB>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM) == cudaSuccess;
+  if (!attr) return 3;
+  const dim3 gr((M + BM - 1) / BM, (N + BN - 1) / BN);
+  if (bf16out) fp8_gemm_mx3<true, WMW, WNW, NT, NS, PB><<<gr, 32 * WMW * WNW, SM, st>>>((const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, M, N, K);
+  else fp8_gemm_mx3<false, WMW, WNW, NT, NS, PB><<<gr, 32 * WMW * WNW, SM, st>>>((const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, M, N, K);
+  return (int)cudaGetLastError();
+}
+
+int g_gemm_version = 0;   // 0: default; ds41_gemm_version (benches) forces one
 
 // ---- Prefill gate/up as a grouped GEMM: items of up to 64 rows (one expert), block = 64 rows x 128 intermediate
 // columns (16 w1 + 16 w3 tiles of 8), 8 warps (2 row halves x 4 groups of 32 columns: the up_mx<2, 1> warp tile). K in
@@ -405,7 +631,10 @@ __global__ __launch_bounds__(256) void fp8_gemm_mx(const uint8_t* __restrict__ a
 // the global layout (lane l's 16 bytes of a tile/step block), A rows are gathered by prow. Same MMA sequence per
 // output as up_mx<2, 1> (bitwise equal), same epilogue.
 constexpr int UG_NS = 3, UG_AP = 144;
-struct UgStage { uint8_t a[64][UG_AP]; uint32_t as[64]; uint4 b[32][32]; uint32_t bs[32][8]; };
+// RT rows per block (64, or 128: an expert's rows up to 128 share one read of its weights), RT / 32 row groups x 8 / (RT
+// / 32) column groups of warps (the 64-row block: 2 x 4 warps of 32 rows x 32 columns, up_mx<2, 1>'s tile); NS stages.
+template <int RT> struct UgStageT { uint8_t a[RT][UG_AP]; uint32_t as[RT]; uint4 b[32][32]; uint32_t bs[32][8]; };
+using UgStage = UgStageT<64>;
 __device__ __forceinline__ void cpa16(void* dst, const void* src, bool valid) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"((unsigned)__cvta_generic_to_shared(dst)), "l"(src), "r"(valid ? 16 : 0));
 }
@@ -415,27 +644,29 @@ __device__ __forceinline__ void cpa4(void* dst, const void* src, bool valid) {
 __device__ __forceinline__ void cpa_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
 template <int N> __device__ __forceinline__ void cpa_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory"); }
 
+template <int RT, int NS>
 __global__ __launch_bounds__(256, 1) void up_gemm(const uint8_t* __restrict__ xq, const uint8_t* __restrict__ xs, const uint8_t* __restrict__ w1,
     const uint8_t* __restrict__ s1, const uint8_t* __restrict__ w3, const uint8_t* __restrict__ s3, int I,
     const float* __restrict__ rw, const int* __restrict__ G, const Item* __restrict__ items, const int* __restrict__ prow,
     uint8_t* __restrict__ hq, uint8_t* __restrict__ hs, int topk) {
+  constexpr int WMR = RT / 32, WNC = 8 / WMR, TPW = 16 / WNC, AJ = RT * 8 / 256;   // TPW: n8 tiles per warp and matrix
   pdl_entry();
   if ((int)blockIdx.y >= *G) return;
   extern __shared__ __align__(16) unsigned char ug_smem[];
-  UgStage* st = reinterpret_cast<UgStage*>(ug_smem);
+  UgStageT<RT>* st = reinterpret_cast<UgStageT<RT>*>(ug_smem);
   const Item it = items[blockIdx.y];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, q = lane & 3;
-  const int wm = warp >> 2, wn = warp & 3;
+  const int wm = warp / WNC, wn = warp % WNC;
   const int jb = blockIdx.x * 128;
   constexpr int ALL = H / 128;
-  // this thread's load jobs: A rows (2 x 16 B), A scales (threads < 64), B blocks (4 x 16 B), B scales (threads < 64)
-  int a_row[2]; const uint8_t* a_src[2]; bool a_ok[2];
-  for (int j = 0; j < 2; ++j) {
+  // this thread's load jobs: A rows (AJ x 16 B), A scales (threads < RT), B blocks (4 x 16 B), B scales (threads < 64)
+  int a_row[AJ]; const uint8_t* a_src[AJ]; bool a_ok[AJ];
+  for (int j = 0; j < AJ; ++j) {
     const int i = tid + 256 * j, r = i >> 3;
     a_row[j] = r; a_ok[j] = r < it.n;
     a_src[j] = xq + (long long)(a_ok[j] ? prow[it.off + r] / topk : 0) * H + (i & 7) * 16;
   }
-  const uint8_t* as_src = xs + (long long)(tid < 64 && tid < it.n ? prow[it.off + tid] / topk : 0) * (H / 32);
+  const uint8_t* as_src = xs + (long long)(tid < RT && tid < it.n ? prow[it.off + tid] / topk : 0) * (H / 32);
   const uint8_t* b_src[4];
   for (int j = 0; j < 4; ++j) {
     const int i = tid + 256 * j, t = i >> 5, l = i & 31;
@@ -448,26 +679,26 @@ __global__ __launch_bounds__(256, 1) void up_gemm(const uint8_t* __restrict__ xq
     const long long tile = ((long long)it.e * I + jb + 8 * (t & 15)) / 8;
     bs_src = (t < 16 ? s1 : s3) + tile * ALL * 32 + (tid & 1) * 16;
   }
-  auto load = [&](int s, UgStage& b) {
-    for (int j = 0; j < 2; ++j) cpa16(&b.a[a_row[j]][((tid + 256 * j) & 7) * 16], a_src[j] + s * 128, a_ok[j]);
-    if (tid < 64) cpa4(&b.as[tid], as_src + s * 4, tid < it.n);
+  auto load = [&](int s, UgStageT<RT>& b) {
+    for (int j = 0; j < AJ; ++j) cpa16(&b.a[a_row[j]][((tid + 256 * j) & 7) * 16], a_src[j] + s * 128, a_ok[j]);
+    if (tid < RT) cpa4(&b.as[tid], as_src + s * 4, tid < it.n);
     for (int j = 0; j < 4; ++j) { const int i = tid + 256 * j; cpa16(&b.b[i >> 5][i & 31], b_src[j] + s * 512, true); }
     if (tid < 64) cpa16(reinterpret_cast<uint8_t*>(&b.bs[tid >> 1][0]) + (tid & 1) * 16, bs_src + s * 32, true);
   };
-  float acc[2][8][4];
-  for (int m = 0; m < 2; ++m) for (int t = 0; t < 8; ++t) for (int c = 0; c < 4; ++c) acc[m][t][c] = 0.f;
+  float acc[2][2 * TPW][4];
+  for (int m = 0; m < 2; ++m) for (int t = 0; t < 2 * TPW; ++t) for (int c = 0; c < 4; ++c) acc[m][t][c] = 0.f;
 #pragma unroll
-  for (int s = 0; s < UG_NS - 1; ++s) { load(s, st[s]); cpa_commit(); }
+  for (int s = 0; s < NS - 1; ++s) { load(s, st[s]); cpa_commit(); }
   for (int s = 0; s < ALL; ++s) {
-    cpa_wait<UG_NS - 2>();
+    cpa_wait<NS - 2>();
     __syncthreads();
-    if (s + UG_NS - 1 < ALL) load(s + UG_NS - 1, st[(s + UG_NS - 1) % UG_NS]);
+    if (s + NS - 1 < ALL) load(s + NS - 1, st[(s + NS - 1) % NS]);
     cpa_commit();
-    const UgStage& b = st[s % UG_NS];
-    uint4 bw[8]; uint32_t bsc[8];
+    const UgStageT<RT>& b = st[s % NS];
+    uint4 bw[2 * TPW]; uint32_t bsc[2 * TPW];
 #pragma unroll
-    for (int t = 0; t < 8; ++t) {
-      const int tb = (t < 4 ? 0 : 16) + wn * 4 + (t & 3);
+    for (int t = 0; t < 2 * TPW; ++t) {
+      const int tb = (t < TPW ? 0 : 16) + wn * TPW + (t % TPW);
       bw[t] = b.b[tb][lane]; bsc[t] = b.bs[tb][g];
     }
     uint32_t sfa4[2];
@@ -482,7 +713,7 @@ __global__ __launch_bounds__(256, 1) void up_gemm(const uint8_t* __restrict__ xq
         a_split(*reinterpret_cast<const uint2*>(&b.a[r0 + 8][kb * 32 + 8 * q]), a[m][1], a[m][3]);
       }
 #pragma unroll
-      for (int t = 0; t < 8; ++t) {
+      for (int t = 0; t < 2 * TPW; ++t) {
         const uint32_t w = kb == 0 ? bw[t].x : kb == 1 ? bw[t].y : kb == 2 ? bw[t].z : bw[t].w;
         uint32_t b0, b1;
         b_split(w, b0, b1);
@@ -492,30 +723,122 @@ __global__ __launch_bounds__(256, 1) void up_gemm(const uint8_t* __restrict__ xq
     }
   }
   cpa_wait<0>();
-  // epilogue (up_mx): SwiGLU of gate / up rounded to BF16, routing weight, act_quant per 32 columns
-  const int j0 = jb + wn * 32;
+  // epilogue (up_mx): SwiGLU of gate / up rounded to BF16, routing weight, act_quant per 32 columns (TPW / 4 groups)
+#pragma unroll
+  for (int gq = 0; gq < TPW / 4; ++gq) {
+    const int j0 = jb + wn * 8 * TPW + gq * 32;
+    for (int m = 0; m < 2; ++m)
+      for (int hh = 0; hh < 2; ++hh) {
+        const int r = wm * 32 + m * 16 + hh * 8 + g;
+        const float wgt = r < it.n ? rw[prow[it.off + r]] : 0.f;
+        float v[8], amax = 0.f;
+        for (int t = 0; t < 4; ++t)
+          for (int c = 0; c < 2; ++c) {
+            const float gt = fminf(bf16r(acc[m][gq * 4 + t][hh * 2 + c]), 10.f);
+            const float up = fminf(fmaxf(bf16r(acc[m][TPW + gq * 4 + t][hh * 2 + c]), -10.f), 10.f);
+            const float y = bf16r(gt / (1.f + expf(-gt)) * up * wgt);
+            v[t * 2 + c] = y;
+            amax = fmaxf(amax, fabsf(y));
+          }
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        const uint32_t e = aq_scale(amax);
+        if (r < it.n) {
+          uint8_t* hr = hq + (long long)(it.off + r) * I + j0 + 2 * q;
+          for (int t = 0; t < 4; ++t)
+            *reinterpret_cast<uint16_t*>(hr + 8 * t) = (uint16_t)aq_byte(v[2 * t], e) | ((uint16_t)aq_byte(v[2 * t + 1], e) << 8);
+          if (q == 0) hs[(long long)(it.off + r) * (I / 32) + j0 / 32] = (uint8_t)e;
+        }
+      }
+  }
+}
+
+// ---- Prefill down as a grouped GEMM (the up_gemm scheme): block = one item's 64 rows x 128 output columns (16 w2 tiles
+// of 8), 8 warps (2 row halves x 4 groups of 32 columns), I in steps of 128 through shared memory, UG_NS stages in flight.
+// down_mx<4> reads the item's A rows from global memory in every warp and the weights into registers without prefetch;
+// here each block loads both once per step. Same MMA sequence per output as down_mx (bitwise equal).
+template <int RT> struct DgStageT { uint8_t a[RT][UG_AP]; uint32_t as[RT]; uint4 b[16][32]; uint32_t bs[16][8]; };
+template <int RT, int NS>
+__global__ __launch_bounds__(256, 1) void down_gemm(const uint8_t* __restrict__ hq, const uint8_t* __restrict__ hs, const uint8_t* __restrict__ w2,
+    const uint8_t* __restrict__ s2, int I, const int* __restrict__ G, const Item* __restrict__ items, float* __restrict__ out, int c0, int ldo) {
+  constexpr int WMR = RT / 32, WNC = 8 / WMR, TPW = 16 / WNC, AJ = RT * 8 / 256;
+  pdl_entry();
+  if ((int)blockIdx.y >= *G) return;
+  extern __shared__ __align__(16) unsigned char dg_smem[];
+  DgStageT<RT>* st = reinterpret_cast<DgStageT<RT>*>(dg_smem);
+  const Item it = items[blockIdx.y];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, q = lane & 3;
+  const int wm = warp / WNC, wn = warp % WNC;
+  const int nb = c0 + blockIdx.x * 128;   // output columns [c0, ..) into out rows of ldo (a column pass, see moe_mx)
+  const int steps = I / 128;
+  // load jobs: A rows (AJ x 16 B), A scales (threads < RT), B blocks (2 x 16 B), B scales (threads < 32)
+  int a_row[AJ]; const uint8_t* a_src[AJ]; bool a_ok[AJ];
+  for (int j = 0; j < AJ; ++j) {
+    const int i = tid + 256 * j, r = i >> 3;
+    a_row[j] = r; a_ok[j] = r < it.n;
+    a_src[j] = hq + (long long)(it.off + (a_ok[j] ? r : 0)) * I + (i & 7) * 16;
+  }
+  const uint8_t* as_src = hs + (long long)(it.off + (tid < RT && tid < it.n ? tid : 0)) * (I / 32);
+  const uint8_t* b_src[2];
+  for (int j = 0; j < 2; ++j) {
+    const int i = tid + 256 * j, t = i >> 5, l = i & 31;
+    const long long tile = ((long long)it.e * H + nb + 8 * t) / 8;
+    b_src[j] = w2 + tile * steps * 512 + l * 16;
+  }
+  const uint8_t* bs_src = nullptr;
+  if (tid < 32) {
+    const int t = tid >> 1;
+    const long long tile = ((long long)it.e * H + nb + 8 * t) / 8;
+    bs_src = s2 + tile * steps * 32 + (tid & 1) * 16;
+  }
+  auto load = [&](int s, DgStageT<RT>& b) {
+    for (int j = 0; j < AJ; ++j) cpa16(&b.a[a_row[j]][((tid + 256 * j) & 7) * 16], a_src[j] + s * 128, a_ok[j]);
+    if (tid < RT) cpa4(&b.as[tid], as_src + s * 4, tid < it.n);
+    for (int j = 0; j < 2; ++j) { const int i = tid + 256 * j; cpa16(&b.b[i >> 5][i & 31], b_src[j] + s * 512, true); }
+    if (tid < 32) cpa16(reinterpret_cast<uint8_t*>(&b.bs[tid >> 1][0]) + (tid & 1) * 16, bs_src + s * 32, true);
+  };
+  float acc[2][TPW][4];
+  for (int m = 0; m < 2; ++m) for (int t = 0; t < TPW; ++t) for (int c = 0; c < 4; ++c) acc[m][t][c] = 0.f;
+#pragma unroll
+  for (int s = 0; s < NS - 1; ++s) { if (s < steps) load(s, st[s]); cpa_commit(); }
+  for (int s = 0; s < steps; ++s) {
+    cpa_wait<NS - 2>();
+    __syncthreads();
+    if (s + NS - 1 < steps) load(s + NS - 1, st[(s + NS - 1) % NS]);
+    cpa_commit();
+    const DgStageT<RT>& b = st[s % NS];
+    uint4 bw[TPW]; uint32_t bsc[TPW];
+#pragma unroll
+    for (int t = 0; t < TPW; ++t) { bw[t] = b.b[wn * TPW + t][lane]; bsc[t] = b.bs[wn * TPW + t][g]; }
+    uint32_t sfa4[2];
+    for (int m = 0; m < 2; ++m) sfa4[m] = b.as[wm * 32 + m * 16 + (lane >> 2) + 8 * (lane & 1)];
+#pragma unroll
+    for (int kb = 0; kb < 4; ++kb) {
+      uint32_t a[2][4];
+#pragma unroll
+      for (int m = 0; m < 2; ++m) {
+        const int r0 = wm * 32 + m * 16 + g;
+        a_split(*reinterpret_cast<const uint2*>(&b.a[r0][kb * 32 + 8 * q]), a[m][0], a[m][2]);
+        a_split(*reinterpret_cast<const uint2*>(&b.a[r0 + 8][kb * 32 + 8 * q]), a[m][1], a[m][3]);
+      }
+#pragma unroll
+      for (int t = 0; t < TPW; ++t) {
+        const uint32_t w = kb == 0 ? bw[t].x : kb == 1 ? bw[t].y : kb == 2 ? bw[t].z : bw[t].w;
+        uint32_t b0, b1;
+        b_split(w, b0, b1);
+        const uint32_t sfb = (bsc[t] >> (8 * kb)) & 0xFF;
+        for (int m = 0; m < 2; ++m) mma_mx(acc[m][t], a[m][0], a[m][1], a[m][2], a[m][3], b0, b1, (sfa4[m] >> (8 * kb)) & 0xFF, sfb);
+      }
+    }
+  }
+  cpa_wait<0>();
+  const int n0 = nb + wn * 8 * TPW;
   for (int m = 0; m < 2; ++m)
     for (int hh = 0; hh < 2; ++hh) {
       const int r = wm * 32 + m * 16 + hh * 8 + g;
-      const float wgt = r < it.n ? rw[prow[it.off + r]] : 0.f;
-      float v[8], amax = 0.f;
-      for (int t = 0; t < 4; ++t)
-        for (int c = 0; c < 2; ++c) {
-          const float gt = fminf(bf16r(acc[m][t][hh * 2 + c]), 10.f);
-          const float up = fminf(fmaxf(bf16r(acc[m][t + 4][hh * 2 + c]), -10.f), 10.f);
-          const float y = bf16r(gt / (1.f + expf(-gt)) * up * wgt);
-          v[t * 2 + c] = y;
-          amax = fmaxf(amax, fabsf(y));
-        }
-      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
-      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
-      const uint32_t e = aq_scale(amax);
-      if (r < it.n) {
-        uint8_t* hr = hq + (long long)(it.off + r) * I + j0 + 2 * q;
-        for (int t = 0; t < 4; ++t)
-          *reinterpret_cast<uint16_t*>(hr + 8 * t) = (uint16_t)aq_byte(v[2 * t], e) | ((uint16_t)aq_byte(v[2 * t + 1], e) << 8);
-        if (q == 0) hs[(long long)(it.off + r) * (I / 32) + j0 / 32] = (uint8_t)e;
-      }
+      if (r >= it.n) continue;
+      float* o = out + (long long)(it.off + r) * ldo + (n0 - c0) + 2 * q;
+      for (int t = 0; t < TPW; ++t) *reinterpret_cast<float2*>(o + 8 * t) = make_float2(acc[m][t][hh * 2], acc[m][t][hh * 2 + 1]);
     }
 }
 
@@ -535,14 +858,17 @@ template <int U, int S>
 // aq null: x BF16 [m, k] is act-quantized by the CTA into shared memory first (one warp per 32-block, the same scale
 // and bytes as act_quant_fp8_kernel; dynamic shared memory m k + m k / 32 bytes), so no separate quantization kernel;
 // else aq / as_ are the quantized input in global memory. ob16: y is BF16 (rounded sums).
+// job: an mHC mix job run by the grid's first job.ctas CTAs (ds41_hc_job.cuh; kind 0: none)
 __global__ __launch_bounds__(256) void fp8_gemv_mx(const __nv_bfloat16* __restrict__ x, const uint8_t* aq, const uint8_t* as_,
-    const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, void* __restrict__ yv, int m, int n, int k, int ob16) {
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, void* __restrict__ yv, int m, int n, int k, int ob16, HcJob job) {
   float* y = reinterpret_cast<float*>(yv);
   extern __shared__ __align__(16) uint8_t gq_smem[];
   pdl_trigger();
+  if (hcj::run(job)) return;
+  const int bx = blockIdx.x - (job.kind ? job.ctas : 0);
   const int lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
   const int wid = threadIdx.x >> 5, slice = wid % S;
-  const int n0 = (blockIdx.x * (8 / S) + wid / S) * 8;
+  const int n0 = (bx * (8 / S) + wid / S) * 8;
   const int kb = k / 32;
   const int ns = kb / 2, s_lo = slice * ns / S, s_hi = (slice + 1) * ns / S;
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
@@ -796,7 +1122,9 @@ __global__ __launch_bounds__(256) void fp8_gemv_bx(const __nv_bfloat16* __restri
 
 // prefill (R > 64): 64-row items for the grouped GEMM (up_gemm; DS41_MOE_GEMM=0 the earlier 32-row up_mx items)
 inline bool moe_gemm(int R) { static const bool on = !(std::getenv("DS41_MOE_GEMM") && std::getenv("DS41_MOE_GEMM")[0] == '0'); return on && R > 64; }
-inline int gr_of(int R, int topk, int E) { (void)topk; (void)E; return R <= 8 ? 16 : moe_gemm(R) ? 64 : 32; }   // (64-row up_mx items: register-bound, 2.4x slower)
+// DS41_MOE_ROWS (prefill items, 64 default, or 128: an expert's rows up to 128 share one read of its weights; measured no faster)
+inline int gemm_rows() { static const int r = std::getenv("DS41_MOE_ROWS") && std::atoi(std::getenv("DS41_MOE_ROWS")) == 128 ? 128 : 64; return r; }
+inline int gr_of(int R, int topk, int E) { (void)topk; (void)E; return R <= 8 ? 16 : moe_gemm(R) ? gemm_rows() : 32; }   // (64-row up_mx items: register-bound, 2.4x slower)
 inline int gmax_of(int R, int topk, int E) { const int P = R * topk; return (P < E ? P : E) + P / gr_of(R, topk, E) + 1; }
 inline size_t al(size_t b) { return (b + 255) & ~(size_t)255; }
 } // namespace
@@ -805,11 +1133,35 @@ extern "C" {
 // y [M, N] FP32 = A . W^T: A E4M3 [M, K] + UE8M0 [M, K/32], W E4M3 [N, K] + E8M0 [ceil(N/32), K/32]; K % 64 == 0, N % 8 == 0
 int ds41_fp8_gemm_mx_ex(const void* aq, const void* as_, const void* w, const void* ws, void* y, int M, int N, int K, int bf16out, cudaStream_t st) {
   if (M < 1 || K % GK || N % 8) return 1;
+  // DS41_GEMM_SHAPES=1: count the calls per (M, N, K), printed every 100 calls (to tune on the real shapes)
+  static const bool shapes = std::getenv("DS41_GEMM_SHAPES") && std::getenv("DS41_GEMM_SHAPES")[0] == '1';
+  if (shapes) {
+    static std::map<std::tuple<int, int, int>, int> cnt; static int calls = 0;
+    ++cnt[std::make_tuple(M, N, K)];
+    if (++calls % 100 == 0) { for (auto& kv : cnt) fprintf(stderr, "[ds41-gemm-shape] M %d N %d K %d: %d\n", std::get<0>(kv.first), std::get<1>(kv.first), std::get<2>(kv.first), kv.second); fprintf(stderr, "[ds41-gemm-shape] --\n"); }
+  }
+  static const int env_v = std::getenv("DS41_GEMM_V") ? std::atoi(std::getenv("DS41_GEMM_V")) : 3;
+  const int v = g_gemm_version ? g_gemm_version : env_v;
+// (measured on the TP3 prefill shapes at 2048 / 4096 rows: 2 stages with two blocks per SM beat 3-4 stages and a 64 x 64
+// warp tile; DS41_GEMM_V=1 the original kernel)
+  // default (3): fp8_gemm_mx3 with swizzled 64-byte rows and 3 stages (two blocks per SM); a 64-row block tile up to 256
+  // rows (the decoder replay's 128: twice the blocks). Measured on the shapes of a 4k CED prefill (ds41-gemm-bench, calls
+  // weighted): fp8_gemm_mx2 100.2 ms, this 86.7 ms; padded 96-byte rows with 2 stages 94.1, 3-4 stages with padding or
+  // 4 stages (one block per SM) and 64 x 64 warp tiles slower. Bitwise equal to v2 on every shape. DS41_GEMM_V=2: v2.
+  if (v == 3) return M <= 256 ? launch_g3<1, 4, 4, 3, 0>(aq, as_, w, ws, y, M, N, K, bf16out, st)
+                              : launch_g3<2, 4, 4, 3, 0>(aq, as_, w, ws, y, M, N, K, bf16out, st);
+  if (v != 1) {
+    const dim3 gr((M + GM - 1) / GM, (N + GN - 1) / GN);
+    if (bf16out) fp8_gemm_mx2<true, 2, 4, 4><<<gr, 256, 0, st>>>((const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, M, N, K);
+    else fp8_gemm_mx2<false, 2, 4, 4><<<gr, 256, 0, st>>>((const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, M, N, K);
+    return (int)cudaGetLastError();
+  }
   if (bf16out) { fp8_gemm_mx<true><<<dim3((M + GM - 1) / GM, (N + GN - 1) / GN), 256, 0, st>>>((const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, M, N, K); return (int)cudaGetLastError(); }
   fp8_gemm_mx<false><<<dim3((M + GM - 1) / GM, (N + GN - 1) / GN), 256, 0, st>>>((const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w,
                                                                        (const uint8_t*)ws, y, M, N, K);
   return (int)cudaGetLastError();
 }
+int ds41_gemm_version(int v) { g_gemm_version = v; return 0; }
 int ds41_fp8_gemm_mx(const void* aq, const void* as_, const void* w, const void* ws, float* y, int M, int N, int K, cudaStream_t st) {
   return ds41_fp8_gemm_mx_ex(aq, as_, w, ws, y, M, N, K, 0, st);
 }
@@ -822,8 +1174,16 @@ int ds41_fp8_gemv_mx_init() {
   done = 1;
   return 0;
 }
+int ds41_fp8_gemv_mx_job(const void* x, const void* aq, const void* as_, const void* w, const void* ws, void* y, int m, int n, int k, int ob16, const HcJob* jp, cudaStream_t st);
 int ds41_fp8_gemv_mx_q(const void* x, const void* aq, const void* as_, const void* w, const void* ws, void* y, int m, int n, int k, int ob16, cudaStream_t st) {
+  HcJob none{}; return ds41_fp8_gemv_mx_job(x, aq, as_, w, ws, y, m, n, k, ob16, &none, st);
+}
+// ds41_fp8_gemv_mx_q with an mHC mix job (ds41_hc_job.cuh; job->kind 0: none) in the grid's first CTAs
+int ds41_fp8_gemv_mx_job(const void* x, const void* aq, const void* as_, const void* w, const void* ws, void* y, int m, int n, int k, int ob16, const HcJob* jp, cudaStream_t st) {
   if (m < 1 || m > 16 || k % 64 || n % 8) return 1;
+  HcJob job = *jp;
+  job.ctas = hcj::ctas(job.kind, job.T);
+  if (job.kind && (job.T < 1 || job.T > 16 || (4 * job.D) % (hcj::SLICES * 2 * hcj::PTH))) return 1;
   // split K 8 ways while every warp keeps >= 2 spans (cold weights, m = 1: wq_b 69.6 -> 67.2 us, wo_b 70.5 -> 67.7,
   // wq_a [1280 x 5120] 38.6 -> 32.3; DS41_GEMV_SPLIT forces S)
   static const int force = std::getenv("DS41_GEMV_SPLIT") ? std::atoi(std::getenv("DS41_GEMV_SPLIT")) : 0;
@@ -832,7 +1192,7 @@ int ds41_fp8_gemv_mx_q(const void* x, const void* aq, const void* as_, const voi
   else while (S > 1 && k / 64 / S < 2) S /= 2;
   const int sm = aq ? 0 : m * k + m * k / 32;
   if (sm > 48 * 1024 && ds41_fp8_gemv_mx_init()) return 4;
-#define GEMV_MX(SS) pdl_launch((fp8_gemv_mx<4, SS>), dim3((n / 8 + 8 / SS - 1) / (8 / SS)), dim3(256), (size_t)sm, st, (const __nv_bfloat16*)x, (const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, m, n, k, ob16)
+#define GEMV_MX(SS) pdl_launch((fp8_gemv_mx<4, SS>), dim3((n / 8 + 8 / SS - 1) / (8 / SS) + job.ctas), dim3(256), (size_t)sm, st, (const __nv_bfloat16*)x, (const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, m, n, k, ob16, job)
   switch (S) { case 1: GEMV_MX(1); break; case 2: GEMV_MX(2); break; case 4: GEMV_MX(4); break; default: GEMV_MX(8); }
 #undef GEMV_MX
   return (int)cudaGetLastError();
@@ -868,9 +1228,23 @@ int ds41_act_quant_fp8(const void* x, void* q, void* s, long long numel, cudaStr
   pdl_launch(act_quant_fp8_kernel, dim3((unsigned)((blocks + 7) / 8)), dim3(256), 0, st, (const __nv_bfloat16*)x, (uint8_t*)q, (uint8_t*)s, blocks);
   return (int)cudaGetLastError();
 }
+// prefill items (grouped GEMMs): the down output of every pair, FP32 [P, H], is at most 512 MiB -- more pairs (two
+// chunks in one call, Model::moe_groups) run down + combine in column passes over one buffer of H / passes columns
+// (each output's MMA sequence and each sum the same; w2's rows split between the passes, read once): the eager peak
+// (and the memory left to the page cache) of a 4096-row call
+inline int col_passes(int R, int topk, int E) {
+  const size_t P = (size_t)R * topk;
+  if (!(gr_of(R, topk, E) == 64 || gr_of(R, topk, E) == 128)) return 1;
+  // DS41_MOE_OUT_MB (512): the cap (MiB) of that buffer; 1024 keeps a two-chunk (8192-row) call in one pass, so its
+  // combine can run inside the reduce-scatter (Model moe_rs)
+  static const size_t cap = (size_t)(std::getenv("DS41_MOE_OUT_MB") ? std::atoi(std::getenv("DS41_MOE_OUT_MB")) : 512) << 20;
+  int n = 1;
+  while (4 * P * H / n > cap && n < 4) n *= 2;
+  return n;
+}
 size_t ds41_moe_mx_ws_bytes(int R, int I, int topk, int E) {
   const size_t P = (size_t)R * topk;
-  return al(16) + al(sizeof(Item) * gmax_of(R, topk, E)) + 2 * al(4 * P) + al(P * I) + al(P * I / 32) + al(4 * P * H);
+  return al(16) + al(sizeof(Item) * gmax_of(R, topk, E)) + 2 * al(4 * P) + al(P * I) + al(P * I / 32) + al(4 * P * H / col_passes(R, topk, E));
 }
 // xq [R, H] E4M3 bytes + xs [R, H/32] UE8M0 (act_quant of x), idx / rw [R, topk], weights in the mx tile layout,
 // add [R, H] FP32 or null; y [R, H] FP32.
@@ -881,6 +1255,8 @@ int ds41_moe_mx_ex(const void* xq, const void* xs, int R, const int64_t* idx, co
                    cudaStream_t st) {
   if (R < 1 || I % 128 != 0 || E > EMAX || topk < 1) return 1;
   const int P = R * topk, GR = gr_of(R, topk, E), Gm = gmax_of(R, topk, E);
+  const int np = col_passes(R, topk, E), hn = H / np;   // (column passes combine as they go)
+  if (skip_combine && np > 1) return 1;
   char* p = (char*)ws;
   int* G = (int*)p; p += al(16);
   Item* items = (Item*)p; p += al(sizeof(Item) * Gm);
@@ -901,12 +1277,22 @@ int ds41_moe_mx_ex(const void* xq, const void* xs, int R, const int64_t* idx, co
   } else if (GR == 16) {
     pdl_launch((up_mx<1, 4>), dim3(dim3(I / 32, Gm)), dim3(128), 0, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk);
     pdl_launch((down_mx<1>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out);
-  } else if (GR == 64) {
-    static bool attr = false;
-    const int sm = UG_NS * (int)sizeof(UgStage);
-    if (!attr) { if (cudaFuncSetAttribute(up_gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, sm)) return 3; attr = true; }
-    pdl_launch(up_gemm, dim3(dim3(I / 128, Gm)), dim3(256), sm, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk);
-    pdl_launch((down_mx<4>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out);
+  } else if (GR == 64 || GR == 128) {
+    // DS41_DOWN_GEMM=0: down_mx<4> (the same MMA sequence per output, bitwise equal; 64-row items only)
+    static const bool dg = !(std::getenv("DS41_DOWN_GEMM") && std::getenv("DS41_DOWN_GEMM")[0] == '0');
+#define MOE_GEMM(RT, UNS, DNS) do { \
+      const int usm = UNS * (int)sizeof(UgStageT<RT>), dsm = DNS * (int)sizeof(DgStageT<RT>); \
+      static const bool attr = cudaFuncSetAttribute(up_gemm<RT, UNS>, cudaFuncAttributeMaxDynamicSharedMemorySize, usm) == cudaSuccess && \
+                               cudaFuncSetAttribute(down_gemm<RT, DNS>, cudaFuncAttributeMaxDynamicSharedMemorySize, dsm) == cudaSuccess; \
+      if (!attr) return 3; \
+      pdl_launch((up_gemm<RT, UNS>), dim3(dim3(I / 128, Gm)), dim3(256), usm, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk); \
+      if (np > 1 || dg || RT != 64) { \
+        for (int pc = 0; pc < np; ++pc) { \
+          pdl_launch((down_gemm<RT, DNS>), dim3(dim3(hn / 128, Gm)), dim3(256), dsm, st, hq, hs, W2, S2, I, G, items, out, pc * hn, hn); \
+          if (np > 1) pdl_launch(combine_kernel, dim3((unsigned)(((long long)R * (hn / 4) + 255) / 256)), dim3(256), 0, st, (const float*)out, (const int*)pairmap, add, y, R, topk, pc * hn, hn); } } \
+      else pdl_launch((down_mx<4>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out); } while (0)
+    if (GR == 128) MOE_GEMM(128, 2, 3); else MOE_GEMM(64, 3, 3);
+#undef MOE_GEMM
   } else if (GR == 32) {
     pdl_launch((up_mx<2, 1>), dim3(dim3(I / 128, Gm)), dim3(128), 0, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk);
     pdl_launch((down_mx<2>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out);
@@ -914,9 +1300,9 @@ int ds41_moe_mx_ex(const void* xq, const void* xs, int R, const int64_t* idx, co
     pdl_launch((up_mx<4, 1>), dim3(dim3(I / 128, Gm)), dim3(128), 0, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk);
     pdl_launch((down_mx<4>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out);
   }
-  if (skip_combine) return (int)cudaGetLastError();
+  if (skip_combine || np > 1) return (int)cudaGetLastError();
   const long long n4 = (long long)R * (H / 4);
-  pdl_launch(combine_kernel, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, out, pairmap, add, y, R, topk);
+  pdl_launch(combine_kernel, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, out, pairmap, add, y, R, topk, 0, H);
   return (int)cudaGetLastError();
 }
 int ds41_moe_mx(const void* xq, const void* xs, int R, const int64_t* idx, const float* rw, const void* w1, const void* s1, const void* w3,
@@ -924,6 +1310,39 @@ int ds41_moe_mx(const void* xq, const void* xs, int R, const int64_t* idx, const
   return ds41_moe_mx_ex(xq, xs, R, idx, rw, w1, s1, w3, s3, w2, s2, I, add, y, ws, topk, E, 0, st);
 }
 // the combine of a ds41_moe_mx_ex(skip_combine) call with the same R, I, topk, E and workspace
+// rows [r0, r0 + nr) of ds41_moe_mx_combine (add / y: the whole [R, H]; each row's sum is its own, so the rows in
+// parts are bitwise the whole call: a part's reduce-scatter can start while the next part combines)
+int ds41_moe_mx_combine_rows(void* ws, int R, int I, int topk, int E, const float* add, float* y, int r0, int nr, cudaStream_t st) {
+  if (r0 < 0 || nr < 1 || r0 + nr > R) return 1;
+  const int P = R * topk, Gm = gmax_of(R, topk, E);
+  char* p = (char*)ws;
+  p += al(16);
+  p += al(sizeof(Item) * Gm);
+  int* pairmap = (int*)p; p += al(4 * (size_t)P);
+  p += al(4 * (size_t)P);
+  p += al((size_t)P * I);
+  p += al((size_t)P * I / 32);
+  float* out = (float*)p;
+  const long long n4 = (long long)nr * (H / 4);
+  pdl_launch(combine_kernel, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, (const float*)out, (const int*)pairmap + (long long)r0 * topk,
+             add ? add + (long long)r0 * H : nullptr, y + (long long)r0 * H, nr, topk, 0, H);
+  return (int)cudaGetLastError();
+}
+// the down outputs out [P, H] FP32 and pairmap [P] in a call's workspace (a combine done elsewhere: the reduce-scatter)
+int ds41_moe_mx_ws_ptrs(void* ws, int R, int I, int topk, int E, float** out, int** pairmap) {
+  const int P = R * topk, Gm = gmax_of(R, topk, E);
+  char* p = (char*)ws;
+  p += al(16);
+  p += al(sizeof(Item) * Gm);
+  *pairmap = (int*)p; p += al(4 * (size_t)P);
+  p += al(4 * (size_t)P);
+  p += al((size_t)P * I);
+  p += al((size_t)P * I / 32);
+  *out = (float*)p;
+  return 0;
+}
+// column passes of a call (> 1: down and combine interleave inside ds41_moe_mx_ex; no skip_combine)
+int ds41_moe_mx_col_passes(int R, int topk, int E) { return col_passes(R, topk, E); }
 int ds41_moe_mx_combine(void* ws, int R, int I, int topk, int E, const float* add, float* y, cudaStream_t st) {
   const int P = R * topk, Gm = gmax_of(R, topk, E);
   char* p = (char*)ws;
@@ -935,7 +1354,7 @@ int ds41_moe_mx_combine(void* ws, int R, int I, int topk, int E, const float* ad
   p += al((size_t)P * I / 32);
   float* out = (float*)p;
   const long long n4 = (long long)R * (H / 4);
-  pdl_launch(combine_kernel, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, (const float*)out, (const int*)pairmap, add, y, R, topk);
+  pdl_launch(combine_kernel, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, (const float*)out, (const int*)pairmap, add, y, R, topk, 0, H);
   return (int)cudaGetLastError();
 }
 }
