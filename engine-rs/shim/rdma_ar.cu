@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 #include "host_pin.cuh"
 #include <cuda_fp16.h>
+#include "rdma_gid.h"
 #include <infiniband/verbs.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -145,8 +146,9 @@ void proxy_loop(){
   }
 }
 
+int g_gid[NLINK]={-1,-1};   // each link's GID index (rdma_ipv4_v2_gid; GLM53_RDMA_AR_GID overrides)
 bool qp_to_rts(int l){
-  const char* gid_s=std::getenv("GLM53_RDMA_AR_GID");int gid_index=gid_s?std::atoi(gid_s):3;
+  const int gid_index=g_gid[l];
   ibv_qp* g_qp_l=g_qp[l];
   ibv_qp_attr a{};a.qp_state=IBV_QPS_INIT;a.pkey_index=0;a.port_num=1;a.qp_access_flags=IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_LOCAL_WRITE;
   if(ibv_modify_qp(g_qp_l,&a,IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS))return false;
@@ -169,7 +171,6 @@ extern "C" int glm53_rdma_ar_init(int rank){
   const char* wants[NLINK]={d0?d0:"rocep1s0f0",d1?d1:"roceP2p1s0f0"};const char* want=wants[0];
   g_nlink=std::getenv("GLM53_RDMA_AR_DUAL")&&!strcmp(std::getenv("GLM53_RDMA_AR_DUAL"),"1")?2:1;
   {const char* k=std::getenv("GLM53_RDMA_AR_SPLIT_KB");g_split=g_nlink==2?(unsigned long long)(k?std::atoi(k):32)*1024:0;}
-  const char* gid_s=std::getenv("GLM53_RDMA_AR_GID");int gid_index=gid_s?std::atoi(gid_s):3;
   int n=0;ibv_device** list=ibv_get_device_list(&n);
   Peer mine{};mine.nlink=(uint32_t)g_nlink;mine.addr=(uint64_t)(uintptr_t)g_host;
   for(int l=0;l<g_nlink;++l){
@@ -180,7 +181,9 @@ extern "C" int glm53_rdma_ar_init(int rank){
     g_mr[l]=ibv_reg_mr(g_pd[l],g_host,sizeof(Host),IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE);if(!g_mr[l]){perror("rdma_ar reg_mr");return 7;}
     ibv_qp_init_attr qa{};qa.send_cq=g_cq[l];qa.recv_cq=g_cq[l];qa.qp_type=IBV_QPT_RC;qa.cap.max_send_wr=64;qa.cap.max_recv_wr=1;qa.cap.max_send_sge=1;qa.cap.max_recv_sge=1;qa.cap.max_inline_data=64;
     g_qp[l]=ibv_create_qp(g_pd[l],&qa);if(!g_qp[l])return 8;
-    ibv_gid gid;if(ibv_query_gid(g_ctx[l],1,gid_index,&gid))return 9;
+    g_gid[l]=rdma_ipv4_v2_gid(g_ctx[l],wants[l],0,"GLM53_RDMA_AR_GID");
+    if(g_gid[l]<0){fprintf(stderr,"[rdma_ar] %s: no IPv4 RoCE v2 GID on port 1\n",wants[l]);return 9;}
+    ibv_gid gid;if(ibv_query_gid(g_ctx[l],1,g_gid[l],&gid))return 9;
     mine.qpn[l]=g_qp[l]->qp_num;mine.psn[l]=0;mine.rkey[l]=g_mr[l]->rkey;memcpy(mine.gid[l],gid.raw,16);
   }
   ibv_free_device_list(list);
@@ -204,7 +207,8 @@ extern "C" int glm53_rdma_ar_init(int rank){
       fprintf(stderr,"[rdma_ar] rank%d allreduce stamps -> %s\n",rank,path.c_str());
     }else{g_stats=nullptr;g_stats_dev=nullptr;}
   }
-  fprintf(stderr,"[rdma_ar] rank%d ready: dev=%s%s%s gid_index=%d slots=%d x %zu KiB split>=%llu B\n",rank,want,g_nlink==2?" + ":"",g_nlink==2?wants[1]:"",gid_index,NSLOT,SLOT_BYTES/1024,g_split);
+  char gids[32];if(g_nlink==2)snprintf(gids,sizeof gids,"%d/%d",g_gid[0],g_gid[1]);else snprintf(gids,sizeof gids,"%d",g_gid[0]);
+  fprintf(stderr,"[rdma_ar] rank%d ready: dev=%s%s%s gid_index=%s slots=%d x %zu KiB split>=%llu B\n",rank,want,g_nlink==2?" + ":"",g_nlink==2?wants[1]:"",gids,NSLOT,SLOT_BYTES/1024,g_split);
   return 0;
 }
 extern "C" size_t glm53_rdma_ar_max_bytes(){return SLOT_BYTES;}

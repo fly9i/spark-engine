@@ -304,7 +304,7 @@ pub mod io {
     }
     fn threads() -> usize {
         static N: OnceLock<usize> = OnceLock::new();
-        *N.get_or_init(|| std::env::var("DS41_ENGRAM_IO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(64usize).max(1))
+        *N.get_or_init(|| std::env::var("DS41_ENGRAM_IO_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(256usize).max(1))
     }
 
     /// One engram layer's weight [rows, head_dim] FP8 and scale [rows, head_dim / 32] tables in their file.
@@ -337,12 +337,34 @@ pub mod io {
         static P: OnceLock<Mutex<HashMap<(usize, usize), Vec<(Vec<i64>, Gathered)>>>> = OnceLock::new();
         P.get_or_init(Default::default)
     }
-    /// Starts reading `rows` of the layer in the background (explicit modes, prefill-sized gathers only).
+    /// A background gather's completion, for the one queued after it (`prefetch_rows`).
+    #[derive(Default)]
+    struct Done { m: Mutex<bool>, c: std::sync::Condvar }
+    impl Done {
+        fn wait(&self) { let mut d = self.m.lock().unwrap(); while !*d { d = self.c.wait(d).unwrap(); } }
+    }
+    /// Sets `Done` when dropped (also when the gather panics: the next one is not left waiting).
+    struct Signal(Arc<Done>);
+    impl Drop for Signal { fn drop(&mut self) { *self.0.m.lock().unwrap() = true; self.0.c.notify_all(); } }
+
+    /// Starts reading `rows` of the layer in the background (explicit modes, prefill-sized gathers only). The
+    /// background gathers run one at a time in the order asked (each waits for the one before): a prompt's first chunk
+    /// asks for layer 1's rows, then layer 14's, then the next chunk's, and layer 1 is needed first (after layer 0,
+    /// ~50 ms at 4096 tokens). The device's random reads scale with the queue depth up to ~256 (`threads`: ~1.15M 4 KiB
+    /// reads/s on every node, 64 gave ~0.4M); two gathers at once split it, so layer 1's rows came at the time both
+    /// were done (~80 ms each at 256 threads, a 60-90 ms stall in layer 1 of every 4k request), alone at ~56 ms.
     pub fn prefetch_rows(ck: &Checkpoint, layer: usize, rows: Vec<i64>, head_dim: i64) {
         if !explicit() || rows.len() < min_rows() { return; }
         let Some(t) = table(ck, layer) else { return };
+        static LANE: Mutex<Option<Arc<Done>>> = Mutex::new(None);
+        let me = Arc::new(Done::default());
+        let prev = LANE.lock().unwrap().replace(me.clone());
         let r = rows.clone();
-        let h = std::thread::spawn(move || t.gather(&r, head_dim));
+        let h = std::thread::spawn(move || {
+            let _s = Signal(me);
+            if let Some(p) = prev { p.wait(); }
+            t.gather(&r, head_dim)
+        });
         let mut p = pending().lock().unwrap();
         let v = p.entry(key(ck, layer)).or_default();
         v.push((rows, h));

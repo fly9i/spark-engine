@@ -551,6 +551,13 @@ extern "C" int rs_stream_sync() { return cudaStreamSynchronize(at::cuda::getCurr
 extern "C" void rs_empty_cache() {c10::cuda::CUDACachingAllocator::emptyCache();}
 // Caps the caching allocator of device 0 at `fraction` of the device memory (allocations beyond fail with a CUDA OOM
 // error instead of taking the unified memory the OS needs); total device memory in *total.
+// the caching allocator's cumulative counters on device 0: allocation retries (a failed cudaMalloc that freed the cache
+// and tried again) and cudaFree calls
+extern "C" int rs_cuda_alloc_stats(int64_t* retries, int64_t* frees) {
+    const auto st = c10::cuda::CUDACachingAllocator::getDeviceStats(0);
+    *retries = st.num_alloc_retries; *frees = st.num_device_free;
+    return 0;
+}
 extern "C" int rs_cuda_set_memory_fraction(double fraction, int64_t* total) {
     size_t free = 0, tot = 0;
     auto rc = cudaMemGetInfo(&free, &tot);
@@ -807,7 +814,13 @@ static cudaEvent_t g_comm_ev[64];
 static int g_comm_next = 0;
 static int comm_init() {
     if (g_comm) return 0;
-    if (cudaStreamCreateWithFlags(&g_comm, cudaStreamNonBlocking) != cudaSuccess) return 1;
+    // GLM53_COMM_STREAM_PRIO=1: the comm stream at the highest priority (its send / finish kernels' CTAs are scheduled
+    // ahead of the compute stream's waiting ones; scheduling only, the same results)
+    const char* pr = std::getenv("GLM53_COMM_STREAM_PRIO");
+    if (pr && pr[0] == '1') {
+        int lo = 0, hi = 0; cudaDeviceGetStreamPriorityRange(&lo, &hi);
+        if (cudaStreamCreateWithPriority(&g_comm, cudaStreamNonBlocking, hi) != cudaSuccess) return 1;
+    } else if (cudaStreamCreateWithFlags(&g_comm, cudaStreamNonBlocking) != cudaSuccess) return 1;
     for (auto& e : g_comm_ev) if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) return 1;
     return 0;
 }
@@ -852,6 +865,39 @@ extern "C" int rs_allreduce_bf16t(void* p, int64_t numel) {
 extern "C" int rs_allreduce_bf16t_async(void* p, int64_t numel) {
     if (!rdma_arn_on() || !g_comm_mode) return -1;
     return on_comm([&](cudaStream_t s) { return glm53_rdma_arn_big_bf16_cuda(static_cast<float*>(p), numel, s); }, false);
+}
+// DS41 sequence-parallel prefill over the N-way RDMA: the BF16 allreduce's sum as a row-block reduce-scatter (`in` FP32
+// world blocks of blk_f elements, the first n_valid real; `out` this rank's block BF16) and a row-block all-gather of
+// `bytes` per rank. In comm mode on the comm stream (the device sequence: one stream in issue order); `async` returns
+// a handle for rs_ar_wait (>= 0) instead of joining. Returns < 0 / nonzero when unavailable.
+extern "C" int glm53_rdma_arn_rows_bf16r_cuda(const float*,void*,long long,long long,cudaStream_t);
+extern "C" int glm53_rdma_arn_rows_bf16r_b16_cuda(const void*,void*,long long,long long,cudaStream_t);
+// b16: `in` BF16 (rs_sp_reduce_scatter_b16), else FP32
+static int sp_rs(const void* in, void* out, int64_t blk_f, int64_t n_valid, int async, bool b16) {
+    if (!rdma_arn_on()) return -1;
+    auto f = [&](cudaStream_t s) { return b16 ? glm53_rdma_arn_rows_bf16r_b16_cuda(in, out, blk_f, n_valid, s)
+                                              : glm53_rdma_arn_rows_bf16r_cuda(static_cast<const float*>(in), out, blk_f, n_valid, s); };
+    if (g_comm_mode) { const int r = on_comm(f, !async); return async ? r : (r == 0 ? 0 : -2); }
+    if (async) return -1;
+    return f(at::cuda::getCurrentCUDAStream()) == 0 ? 0 : -2;
+}
+extern "C" int rs_sp_reduce_scatter(const void* in, void* out, int64_t blk_f, int64_t n_valid, int async) { return sp_rs(in, out, blk_f, n_valid, async, false); }
+extern "C" int rs_sp_reduce_scatter_b16(const void* in, void* out, int64_t blk_f, int64_t n_valid, int async) { return sp_rs(in, out, blk_f, n_valid, async, true); }
+extern "C" int glm53_rdma_arn_rows_bf16r_comb_cuda(const float*,const int*,const float*,int,int,void*,long long,long long,cudaStream_t);
+// rs_sp_reduce_scatter of a routed-expert combine computed in the send (rdma_arn.cu Comb)
+extern "C" int rs_sp_reduce_scatter_comb(const float* pout, const int* pairmap, const float* add, int topk, int hcols, void* out, int64_t blk_f, int64_t n_valid, int async) {
+    if (!rdma_arn_on()) return -1;
+    auto f = [&](cudaStream_t s) { return glm53_rdma_arn_rows_bf16r_comb_cuda(pout, pairmap, add, topk, hcols, out, blk_f, n_valid, s); };
+    if (g_comm_mode) { const int r = on_comm(f, !async); return async ? r : (r == 0 ? 0 : -2); }
+    if (async) return -1;
+    return f(at::cuda::getCurrentCUDAStream()) == 0 ? 0 : -2;
+}
+extern "C" int rs_sp_all_gather(const void* in, void* out, int64_t bytes, int async) {
+    if (!rdma_arn_on() || bytes % 16) return -1;
+    auto f = [&](cudaStream_t s) { return glm53_rdma_arn_rows_cuda(in, out, bytes, 1, s); };
+    if (g_comm_mode) { const int r = on_comm(f, !async); return async ? r : (r == 0 ? 0 : -2); }
+    if (async) return -1;
+    return f(at::cuda::getCurrentCUDAStream()) == 0 ? 0 : -2;
 }
 // 原地 allreduce(SUM);wait() 只挂流依赖,不阻塞 host。
 extern "C" int rs_allreduce(void* p, int64_t numel, int dtype) {

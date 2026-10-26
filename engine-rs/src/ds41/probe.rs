@@ -158,7 +158,16 @@ pub fn bench(ckpt: &Path, hash: &str, prompt_len: usize, decode_n: usize, chunk:
     let dev = Device::Cuda(0);
     let m = Model::load(ckpt, tp.rank, tp.world, usize::MAX, (hash != "-").then(|| Path::new(hash)), dev);
     let mut rng = 0x9E3779B97F4A7C15u64;
-    let ids: Vec<i64> = (0..prompt_len).map(|_| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng % 120000) as i64 + 1000 }).collect();
+    // DS41_BENCH_IDS=<file>: the prompt's token ids from a file (whitespace-separated, repeated to prompt_len; real text
+    // routes unevenly, unlike the random ids)
+    let ids: Vec<i64> = match std::env::var("DS41_BENCH_IDS") {
+        Ok(f) => {
+            let v: Vec<i64> = std::fs::read_to_string(&f).expect("DS41_BENCH_IDS").split_whitespace().map(|x| x.parse().expect("token id")).collect();
+            assert!(!v.is_empty(), "DS41_BENCH_IDS: no ids");
+            v.iter().cycle().take(prompt_len).copied().collect()
+        }
+        Err(_) => (0..prompt_len).map(|_| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng % 120000) as i64 + 1000 }).collect(),
+    };
     let cap = ((prompt_len + decode_n) as i64 + 255) / 256 * 256;
     let report = |what: &str, total_ms: f64| {
         if tp.rank != 0 { let _ = take_prof(); return; }
@@ -186,10 +195,21 @@ pub fn bench(ckpt: &Path, hash: &str, prompt_len: usize, decode_n: usize, chunk:
         report("prefill", pre_ms);
         let mut tok = lg.argmax(-1, false).int64_value(&[0]);
         let mut steps = Vec::new();
+        let mut toks = vec![tok];
         for _ in 0..decode_n {
             let t = std::time::Instant::now();
             tok = m.step_logits(&mut seq, &[tok]).argmax(-1, false).int64_value(&[0]);
             steps.push(t.elapsed().as_secs_f64() * 1e3);
+            toks.push(tok);
+        }
+        // DS41_BENCH_DUMP=<file> (rank 0, round 1): the prompt's last logits (FP32 bytes) and the greedy tokens after it,
+        // to compare prefill paths bit for bit
+        if let (0, 0, Ok(f)) = (round, tp.rank, std::env::var("DS41_BENCH_DUMP")) {
+            let v: Vec<f32> = Vec::<f32>::try_from(lg.to_kind(Kind::Float).to_device(Device::Cpu).view(-1)).unwrap();
+            let mut b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            b.extend(toks.iter().flat_map(|x| x.to_le_bytes()));
+            std::fs::write(&f, b).expect("DS41_BENCH_DUMP");
+            eprintln!("[ds41-bench] dumped to {f}: tokens {toks:?}");
         }
         report("decode", steps.iter().sum());
         steps.sort_by(|a, b| a.partial_cmp(b).unwrap());

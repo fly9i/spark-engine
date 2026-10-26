@@ -17,6 +17,7 @@
 #include <pthread.h>
 #include <cuda_runtime.h>
 #include "host_pin.cuh"
+#include "rdma_gid.h"
 #include <infiniband/verbs.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -166,7 +167,7 @@ extern "C" int glm53_rdma_big_init(int rank){
   if(cudaMalloc(&g_state,sizeof(DevState))!=cudaSuccess)return 3;cudaMemset(g_state,0,sizeof(DevState));
   const char* d0=std::getenv("GLM53_RDMA_BIG_DEV0");const char* d1=std::getenv("GLM53_RDMA_BIG_DEV1");
   const char* want[NPORT]={d0?d0:"rocep1s0f0",d1?d1:"roceP2p1s0f0"};
-  const char* gid_s=std::getenv("GLM53_RDMA_AR_GID");int gid_index=gid_s?std::atoi(gid_s):3;
+  int gid_index[NPORT];   // each port's GID index (rdma_ipv4_v2_gid; GLM53_RDMA_AR_GID overrides)
   int n=0;ibv_device** list=ibv_get_device_list(&n);
   Peer mine{};mine.ctl=(uint64_t)(uintptr_t)g_ctl;mine.buf=(uint64_t)(uintptr_t)g_buf;
   for(int p=0;p<NPORT;++p){
@@ -180,18 +181,20 @@ extern "C" int glm53_rdma_big_init(int rank){
     ibv_qp_init_attr qa{};qa.send_cq=g_cq[p];qa.recv_cq=g_cq[p];qa.qp_type=IBV_QPT_RC;qa.cap.max_send_wr=128;qa.cap.max_recv_wr=1;
     qa.cap.max_send_sge=1;qa.cap.max_recv_sge=1;qa.cap.max_inline_data=64;
     g_qp[p]=ibv_create_qp(g_pd[p],&qa);if(!g_qp[p])return 8;
-    ibv_gid gid;if(ibv_query_gid(g_ctx[p],1,gid_index,&gid))return 9;
+    gid_index[p]=rdma_ipv4_v2_gid(g_ctx[p],want[p],0,"GLM53_RDMA_AR_GID");
+    if(gid_index[p]<0){fprintf(stderr,"[rdma_big] %s: no IPv4 RoCE v2 GID on port 1\n",want[p]);return 9;}
+    ibv_gid gid;if(ibv_query_gid(g_ctx[p],1,gid_index[p],&gid))return 9;
     mine.qpn[p]=g_qp[p]->qp_num;mine.psn[p]=0;mine.rkey_ctl[p]=g_mr_ctl[p]->rkey;mine.rkey_buf[p]=g_mr_buf[p]->rkey;memcpy(mine.gid[p],gid.raw,16);
   }
   ibv_free_device_list(list);
   if(!sock_exchange(mine,g_peer)){fprintf(stderr,"[rdma_big] exchange failed\n");return 10;}
-  for(int p=0;p<NPORT;++p)if(!qp_rts(p,gid_index)){fprintf(stderr,"[rdma_big] QP %d transition failed\n",p);return 11;}
+  for(int p=0;p<NPORT;++p)if(!qp_rts(p,gid_index[p])){fprintf(stderr,"[rdma_big] QP %d transition failed\n",p);return 11;}
   std::thread t(proxy_loop);
   {const char* c=std::getenv("GLM53_RDMA_BIG_CPU");const int cpu=c?std::atoi(c):18;
    pthread_setname_np(t.native_handle(),"glm53-rdma-big");
    if(cpu>=0){cpu_set_t set;CPU_ZERO(&set);CPU_SET(cpu,&set);if(pthread_setaffinity_np(t.native_handle(),sizeof(set),&set))fprintf(stderr,"[rdma_big] affinity cpu%d failed\n",cpu);}}
   t.detach();
-  fprintf(stderr,"[rdma_big] rank%d ready: %s + %s, gid %d, %d x %zu KiB per op/direction, pinned %zu MiB\n",rank,want[0],want[1],gid_index,MAX_CHUNKS,CHUNK/1024,(sizeof(Bufs)+sizeof(Ctl))>>20);
+  fprintf(stderr,"[rdma_big] rank%d ready: %s + %s, gid %d / %d, %d x %zu KiB per op/direction, pinned %zu MiB\n",rank,want[0],want[1],gid_index[0],gid_index[1],MAX_CHUNKS,CHUNK/1024,(sizeof(Bufs)+sizeof(Ctl))>>20);
   return 0;
 }
 extern "C" unsigned long long glm53_rdma_big_max_bytes(){return AREA;}

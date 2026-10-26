@@ -110,6 +110,94 @@ __global__ void rms_norm_vec_kernel(const __nv_bfloat16* __restrict__ x, const _
   }
 }
 
+// rms_norm_vec_kernel with a clamp of at most KM directions for two rows per CTA (DS41_RMS_CL2, default on): each
+// direction element read once for both rows (the clamp's d reads, not x, dominated: 2 x K x n FP32 per row). Per row
+// exactly rms_norm_vec_kernel's arithmetic: the same thread -> element mapping, sums of squares, reductions, partial
+// dots in (u, j) order, block reduction + count gate (row by row), updates and roundings.
+template <int KM>
+__global__ void rms_norm_cl2_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y,
+                                    int rows, int n, float eps, SparkClamp cl) {
+  pdl_entry();
+  const int nv = n / 8;
+  const int r0 = blockIdx.x * 2;
+  const bool has1 = r0 + 1 < rows;
+  const uint4* xr0 = reinterpret_cast<const uint4*>(x + (long long)r0 * n);
+  const uint4* xr1 = reinterpret_cast<const uint4*>(x + (long long)(has1 ? r0 + 1 : r0) * n);
+  uint4 v0[2], v1[2];
+  float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int i = threadIdx.x + u * blockDim.x;
+    v0[u] = i < nv ? xr0[i] : make_uint4(0, 0, 0, 0);
+    v1[u] = i < nv ? xr1[i] : make_uint4(0, 0, 0, 0);
+    const __nv_bfloat16* e0 = reinterpret_cast<const __nv_bfloat16*>(&v0[u]);
+    const __nv_bfloat16* e1 = reinterpret_cast<const __nv_bfloat16*>(&v1[u]);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { const float f0 = __bfloat162float(e0[j]); s0 += f0 * f0; const float f1 = __bfloat162float(e1[j]); s1 += f1 * f1; }
+  }
+  __shared__ float red[2][32];
+  __shared__ float cred[SPARK_CLAMP_MAX_K * 32];
+  __shared__ float ce[SPARK_CLAMP_MAX_K];
+  for (int o = 16; o; o >>= 1) { s0 += __shfl_xor_sync(0xffffffffu, s0, o); s1 += __shfl_xor_sync(0xffffffffu, s1, o); }
+  if ((threadIdx.x & 31) == 0) { red[0][threadIdx.x >> 5] = s0; red[1][threadIdx.x >> 5] = s1; }
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    float t0 = threadIdx.x < (blockDim.x >> 5) ? red[0][threadIdx.x] : 0.f, t1 = threadIdx.x < (blockDim.x >> 5) ? red[1][threadIdx.x] : 0.f;
+    for (int o = 16; o; o >>= 1) { t0 += __shfl_xor_sync(0xffffffffu, t0, o); t1 += __shfl_xor_sync(0xffffffffu, t1, o); }
+    __syncwarp();
+    if (threadIdx.x == 0) { red[0][0] = rsqrtf(t0 / n + eps); red[1][0] = rsqrtf(t1 / n + eps); }
+  }
+  __syncthreads();
+  const float rr0 = red[0][0], rr1 = red[1][0];
+  float acc0[KM], acc1[KM];
+  float zf0[2][8], zf1[2][8];
+#pragma unroll
+  for (int j = 0; j < KM; ++j) acc0[j] = acc1[j] = 0.f;
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int i = threadIdx.x + u * blockDim.x;
+    const bool live = i < nv;
+    const uint4 wv = live ? reinterpret_cast<const uint4*>(w)[i] : make_uint4(0, 0, 0, 0);
+    const __nv_bfloat16* e0 = reinterpret_cast<const __nv_bfloat16*>(&v0[u]);
+    const __nv_bfloat16* e1 = reinterpret_cast<const __nv_bfloat16*>(&v1[u]);
+    const __nv_bfloat16* we = reinterpret_cast<const __nv_bfloat16*>(&wv);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const float z0 = live ? __fmul_rn(__bfloat162float(we[j]), __fmul_rn(__bfloat162float(e0[j]), rr0)) : 0.f;
+      const float z1 = live ? __fmul_rn(__bfloat162float(we[j]), __fmul_rn(__bfloat162float(e1[j]), rr1)) : 0.f;
+      zf0[u][j] = z0; zf1[u][j] = z1;
+#pragma unroll
+      for (int q = 0; q < KM; ++q) if (q < cl.k) { const float dv = __ldg(cl.d + (long long)q * n + i * 8 + j); acc0[q] += z0 * dv; acc1[q] += z1 * dv; }
+    }
+  }
+  float ce0[KM], ce1[KM];
+  spark_clamp_reduce(cl, acc0, cred, ce, r0);
+#pragma unroll
+  for (int q = 0; q < KM; ++q) ce0[q] = q < cl.k ? ce[q] : 0.f;
+  if (has1) {
+    spark_clamp_reduce(cl, acc1, cred, ce, r0 + 1);
+#pragma unroll
+    for (int q = 0; q < KM; ++q) ce1[q] = q < cl.k ? ce[q] : 0.f;
+  }
+  uint4* yr0 = reinterpret_cast<uint4*>(y + (long long)r0 * n);
+  uint4* yr1 = reinterpret_cast<uint4*>(y + (long long)(r0 + 1) * n);
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int i = threadIdx.x + u * blockDim.x;
+    if (i >= nv) break;
+    uint4 o0, o1; __nv_bfloat16* oe0 = reinterpret_cast<__nv_bfloat16*>(&o0); __nv_bfloat16* oe1 = reinterpret_cast<__nv_bfloat16*>(&o1);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      float z0 = zf0[u][j], z1 = zf1[u][j];
+#pragma unroll
+      for (int q = 0; q < KM; ++q) if (q < cl.k) { const float dv = __ldg(cl.d + (long long)q * n + i * 8 + j); z0 -= ce0[q] * dv; z1 -= ce1[q] * dv; }
+      oe0[j] = __float2bfloat16(z0); oe1[j] = __float2bfloat16(z1);
+    }
+    yr0[i] = o0;
+    if (has1) yr1[i] = o1;
+  }
+}
+
 // grid (rows, H): one CTA per (row, head), one thread per rotary pair; the plain dims are copied
 __global__ void rope_kernel(const __nv_bfloat16* x, const int64_t* __restrict__ pos, const float* __restrict__ freqs,
                             __nv_bfloat16* y, int H, int d, int rd, int inverse) {
@@ -130,6 +218,39 @@ __global__ void rope_kernel(const __nv_bfloat16* x, const int64_t* __restrict__ 
     y[o] = __float2bfloat16(__fsub_rn(__fmul_rn(re, cs), __fmul_rn(im, sn)));
     y[o + 1] = __float2bfloat16(__fadd_rn(__fmul_rn(re, sn), __fmul_rn(im, cs)));
   }
+}
+// rope_kernel then act_quant32 (shim/ds41.cu: per 32 elements, UE8M0 scale, E4M3 rounding, dequantized BF16) in one
+// pass (attention output before wo_a: the inverse rotation and the quantization each read and wrote all of o): one warp
+// per 32-block, the rotary pairs computed exactly as rope_kernel (both elements of a pair lie in one block).
+__global__ void rope_act_quant_kernel(const __nv_bfloat16* __restrict__ x, const int64_t* __restrict__ pos, const float* __restrict__ freqs,
+                                      __nv_bfloat16* __restrict__ out, long long blocks, int H, int d, int rd, int inverse) {
+  pdl_entry();
+  const long long b = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  if (b >= blocks) return;
+  const long long e = b * 32 + lane;
+  const int c = (int)(e % d), plain = d - rd;
+  float v;
+  if (c < plain) v = __bfloat162float(x[e]);
+  else {
+    const int j = (c - plain) / 2, odd = (c - plain) & 1;
+    const long long o = e - odd;
+    const float p = (float)pos[e / ((long long)H * d)];
+    const float ang = __fmul_rn(p, freqs[j]);
+    const float cs = cosf(ang), sn = inverse ? -sinf(ang) : sinf(ang);
+    const float re = __bfloat162float(x[o]), im = __bfloat162float(x[o + 1]);
+    v = __bfloat162float(odd ? __float2bfloat16(__fadd_rn(__fmul_rn(re, sn), __fmul_rn(im, cs))) : __float2bfloat16(__fsub_rn(__fmul_rn(re, cs), __fmul_rn(im, sn))));
+  }
+  float a = fabsf(v);
+  for (int k = 16; k; k >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, k));
+  a = fmaxf(a, 1e-4f);
+  const float t = a * (1.0f / 448.0f);
+  const unsigned bits = __float_as_uint(t);
+  const int ex = (int)((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0);
+  const float sc = __uint_as_float((unsigned)(ex + 127) << 23);
+  const float q = fminf(fmaxf(v / sc, -448.f), 448.f);
+  const __nv_fp8_e4m3 f8(q);
+  out[e] = __float2bfloat16(float(f8) * sc);
 }
 // MoE routing (model.py Gate, sqrtsoftplus): s = sqrt(softplus(logit)) (softplus threshold 20 like torch), experts =
 // top-k of s + bias (descending; lower index first on ties), weights = s[experts] / (sum + 1e-20) (k > 1) * scale.
@@ -330,6 +451,11 @@ int ds41_rms_norm_cl(const void* x, const void* w, void* y, int rows, int n, flo
   if (!cl || !cl->d || n % 8 || n > 8 * 2 * 512 || std::getenv("DS41_RMS_GENERIC")) return -1;
   const int nv = n / 8, threads = ((nv + 1) / 2 + 31) / 32 * 32;
   const SparkClamp c = *cl;
+  static const bool two = !(std::getenv("DS41_RMS_CL2") && std::getenv("DS41_RMS_CL2")[0] == '0');
+  if (two && c.k <= 4 && rows >= 2) {
+    pdl_launch(rms_norm_cl2_kernel<4>, dim3((rows + 1) / 2), dim3(threads), 0, st, (const __nv_bfloat16*)x, (const __nv_bfloat16*)w, (__nv_bfloat16*)y, rows, n, eps, c);
+    return (int)cudaGetLastError();
+  }
   pdl_launch(rms_norm_vec_kernel, dim3(rows), dim3(threads), 0, st, (const __nv_bfloat16*)x, (const __nv_bfloat16*)w, (__nv_bfloat16*)y, n, eps, c);
   return (int)cudaGetLastError();
 }
@@ -339,4 +465,16 @@ int ds41_rope(const void* x, const int64_t* pos, const float* freqs, void* y, in
   pdl_launch(rope_kernel, dim3(dim3(rows, H)), dim3(128), 0, st, (const __nv_bfloat16*)x, pos, freqs, (__nv_bfloat16*)y, H, d, rd, inverse);
   return (int)cudaGetLastError();
 }
+// act_quant32(rope(x)) [rows, H, d] -> y (rope_act_quant_kernel; bitwise the two kernels in turn)
+int ds41_rope_act_quant(const void* x, const int64_t* pos, const float* freqs, void* y, int rows, int H, int d, int rd, int inverse, cudaStream_t st) {
+  if (rows < 1) return 0;
+  if (rd % 2 || rd > d || (d - rd) % 8 || d % 32) return 1;
+  const long long blocks = (long long)rows * H * d / 32;
+  pdl_launch(rope_act_quant_kernel, dim3((unsigned)((blocks + 7) / 8)), dim3(256), 0, st, (const __nv_bfloat16*)x, pos, freqs, (__nv_bfloat16*)y, blocks, H, d, rd, inverse);
+  return (int)cudaGetLastError();
 }
+}
+
+// PDL suspended during prefill (ds41_pdl.cuh): returns the previous value
+extern "C" int ds41_pdl_suspend = 0;
+extern "C" int ds41_pdl_prefill(int on) { const int was = ds41_pdl_suspend; ds41_pdl_suspend = on; return was; }

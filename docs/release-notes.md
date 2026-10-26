@@ -1,28 +1,37 @@
-spark-engine v0.2.1 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
+spark-engine v0.3.0 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
 
-Changes since v0.2.0 (DeepSeek-V4.1-Flash; GLM-5.3-Flash and Qwen3.8-Flash-Next code paths are unchanged):
+Changes since v0.2.1 (DeepSeek-V4.1-Flash; GLM-5.3-Flash and Qwen3.8-Flash-Next code paths are unchanged apart from the
+shared RDMA transport). Every change keeps the outputs bitwise identical. Measured on three DGX Sparks, served, with the
+1017 checkpoint (docs/ds41.md §7):
 
-- **The DeepSeek front end follows the official API** (deepseek-ai/deepseek-recipe). Control tokens now come only
-  from the prompt template: special-token text inside a request (`</think>`, `<｜DSML｜…>`, `<｜User｜>` in content,
-  reasoning, tool arguments, results or schemas) is encoded as ordinary text, and the output parser recognizes
-  `</think>` / `｜DSML｜` by token id. Before, an agent reading a file with such text could open turns or tool blocks,
-  and a model quoting DSML markup produced a real tool call. Prompts without such text encode to the same tokens as
-  before. Request handling as the official API: thinking mode samples at temperature 1.0
-  (`DS41_THINKING_TEMPERATURE`), `max_tokens` defaults to 8K / 64K thinking / 128K at `max` effort, effort levels map
-  `minimal`/`low` 50, `medium`/`high`/`xhigh` 75, `max`/`ultra` 100 (was `medium` 62, `xhigh` 100), top-level
-  `thinking: {type}`, tool definitions normalized to `{name, description, parameters}`, `tool_choice` `none` /
-  `required` / a named function, `response_format` `json_object` / `json_schema`, `"prefix": true` continuation.
-  docs/ds41.md §6.
-- **DSpark draft sampling runs as one CUDA graph** (`DS41_DRAFT_GRAPH`, default on): Markov bias, Gumbel top-1,
-  cross-rank choice and confidence for all five drafts, one read-back instead of two host round trips per draft.
-  Bitwise the same drafts (`DS41_DRAFT_GRAPH_CHECK=1` compares every round). Draft time 4.31 → 3.96 ms per round;
-  single-stream decode +0.2 to +4.6% across prose / structured / code, within run-to-run noise; 2–4 streams unchanged.
-- **Engram prefill without FP32 / BF16 intermediates** (`DS41_ENGRAM_Q`, default on): a requantize kernel builds the
-  projection's FP8 operands straight from the table bytes, bitwise the same (~450 MB → 52 MB of memory traffic per
-  4K-token chunk and Engram layer; about −5 ms per 8K prefill).
-- **Smaller prefix-cache checkpoints:** checkpoints inside a long prefill leave out the 20 decoder window rings
-  (2.5 MiB each, 12–21% of the file), which a restore never reads (checked by filling them with NaN). Checkpoints
-  written by an older binary are not reused (the cache is keyed by the binary).
+- **Prefill about 1.9× faster:** ~5,400 tok/s for 8K–64K prompts (32K in ~6.1 s), ~4,600 tok/s at 4K, the same for new
+  and repeated text (v0.2.1: ~2,900 tok/s cold at 28–33K).
+  - Sequence-parallel encoder: each rank keeps a third of the rows through the norms, mHC and Engram; attention and
+    MoE inputs are all-gathered (as FP8 operands), outputs reduce-scattered over RDMA, with the scatters interleaved
+    with the next part's attention and deferred into the next layer.
+  - FP8 GEMM v3 (swizzled shared memory, 3-stage pipeline, 64-row tiles for small M).
+  - Router logits only for the rank's own rows: a cuBLASLt configuration that reproduces the full matmul's bits.
+  - wo_a as one grouped launch.
+  - MoE combine fused into the reduce-scatter send.
+  - Two 4096-token sub-chunks share one MoE call (`DS41_PREFILL_CHUNK` 8192).
+  - PDL suspended during prefill: early-launched grids parked on their wait held SMs.
+  - The communication stream at the highest priority; RDMA row transfers 12 deep (`GLM53_RDMA_ARN_ROWS_PIPE`).
+  - Engram rows of every chunk, including the next one, read in the background with O_DIRECT. The next chunk's rows
+    are now asked for with its real length (the prefix cache shortens the last chunk by one token). Before, new text
+    paid a synchronous NVMe read in layer 1 of that chunk.
+- **Decode about 4% faster per step:** the mHC mixes of each sublayer run as extra CTAs of the two GEMVs that follow
+  them, off the critical path (`DS41_HC_JOBS`). Single stream 55.3 / 103.6 / 93.2 tok/s (prose / structured / code),
+  4 streams 93.1 / 186.6 / 133.1.
+- **`DS41_MIX_DECODE_SHARE`** (default 0): a share of the time for decoding streams while another prompt prefills,
+  traded against that prompt's prefill.
+- **RDMA:** the RoCE v2 GID index is looked up per device (it is not the same on every node).
+- **API:** `usage.prompt_tokens_details.cached_tokens` reports prefix-cache hits.
+- **Docs:** README links the project's own GLM-5.3-Flash quantization
+  [fly9i/GLM-5.3-Flash-SPX1-V1.1](https://huggingface.co/fly9i/GLM-5.3-Flash-SPX1-V1.1). New
+  `bench/ds41_prefill_bench.py`.
+
+Node setting: the host settings of docs/deploy.md (no proactive compaction, no watermark boosting) are needed on all
+three nodes. Memory reclaim on one node stalls every rank: a node without them gave random +0.4–1.5 s prefill spikes.
 
 What it runs:
 

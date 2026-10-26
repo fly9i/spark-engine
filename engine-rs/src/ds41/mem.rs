@@ -122,6 +122,13 @@ pub fn release() {
     unsafe { rs_empty_cache() }
 }
 
+/// The caching allocator's (allocation retries, cudaFree calls) so far.
+pub fn alloc_stats() -> (i64, i64) {
+    extern "C" { fn rs_cuda_alloc_stats(r: *mut i64, f: *mut i64) -> i32; }
+    let (mut r, mut f) = (0i64, 0i64);
+    unsafe { rs_cuda_alloc_stats(&mut r, &mut f) };
+    (r, f)
+}
 pub fn report(rank: usize) {
     let (a, r) = crate::tp::graph::memory();
     eprintln!("[ds41-mem] rank{rank}: allocated {:.1} GiB, reserved {:.1} GiB, MemAvailable {:.1} GiB, {}", gib(a), gib(r), gib(mem_available()), host());

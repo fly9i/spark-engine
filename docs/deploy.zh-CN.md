@@ -49,7 +49,7 @@ GLM-5.3-Flash 也可以用同一个二进制、同一个检查点和同一个 pr
 局域网；布局以及引擎如何配对链路见 [ds41.zh-CN.md](ds41.zh-CN.md) §2，它使用同一个集群。在 `spark.env` 中设置
 `SPARK_WORKERS`、`SPARK_MASTER_ADDRS` 和 `SPARK_TP3_IFNAME`。
 
-TP3 是用本项目自己的 GLM-5.3-Flash SPX1 检查点（未公开）开发和验收的：投机解码比 TP2 快 21%（在本项目的混合基准上
+TP3 是用本项目自己的 GLM-5.3-Flash SPX1 检查点开发和验收的（V1.2 版本，未公开；V1.1 见 [fly9i/GLM-5.3-Flash-SPX1-V1.1](https://huggingface.co/fly9i/GLM-5.3-Flash-SPX1-V1.1)）：投机解码比 TP2 快 21%（在本项目的混合基准上
 60.2 对 49.7 tok/s），prefill 快 4%，对 FP8 参考的 KL 不变（0.01370 对 0.01364）。使用公开的 EXL3 检查点时，TP3 走相同的
 代码路径，但**尚未实测**；对该检查点，TP2 仍是经过测试的配置。
 
