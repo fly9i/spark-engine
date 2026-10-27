@@ -31,6 +31,7 @@ pub struct Mtp {
 }
 
 impl Mtp {
+    pub(super) fn markov_head(&self) -> &Tensor { &self.markov_head }
     pub fn load(ck: &Checkpoint, c: &Cfg, sp: &Split, fp4: &Tensor, dev: Device) -> Mtp {
         let layers = (0..c.n_mtp).map(|i| {
             let mut l = Model::load_block(ck, c, sp, &format!("mtp.{i}"), c.n_layers + i, c.mtp_experts, c.mtp_active, fp4);

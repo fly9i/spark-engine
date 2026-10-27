@@ -94,13 +94,58 @@ pub fn fp8_gemv(x: &Tensor, w: &Tensor, ws: &Tensor) -> Tensor {
 }
 
 /// y [m, n] FP32 = x [m, k] . W^T for BF16 W [n, k] and m <= 8 (FP32 products and sums, as the official FP32 head).
+/// A weight registered with `c12_register` is read from its C12 coding (shim/c12.cu c12_gemv_f32: 12 of 16 bits, the
+/// same FMA sequence and reduction as ds41_bf16_gemv on the exact BF16 values: bitwise equal, L0).
 pub fn bf16_gemv(x: &Tensor, w: &Tensor) -> Tensor {
     let (m, k) = (x.size()[0], x.size()[1]);
     let n = w.size()[0];
     let x = x.to_kind(Kind::BFloat16).contiguous();
     let y = Tensor::empty([m, n], (Kind::Float, x.device()));
+    if let Some(c) = c12_lookup(w) {
+        extern "C" { fn glm53_c12_gemv_f32_cuda(x: *const std::ffi::c_void, m8: *const std::ffi::c_void, e4: *const std::ffi::c_void, eb: *const std::ffi::c_void,
+            ptr: *const i32, col: *const i32, val: *const std::ffi::c_void, y: *mut f32, m: i32, n: i32, k: i32, pdl: i32, st: *mut std::ffi::c_void) -> i32;
+            fn ds41_pdl_enabled() -> i32; }
+        assert_eq!(unsafe { glm53_c12_gemv_f32_cuda(x.data_ptr(), c[0].data_ptr(), c[1].data_ptr(), c[2].data_ptr(), c[3].data_ptr().cast(), c[4].data_ptr().cast(),
+            c[5].data_ptr(), y.data_ptr() as *mut f32, m as i32, n as i32, k as i32, ds41_pdl_enabled(), rs_current_stream()) }, 0, "c12_gemv_f32");
+        return y;
+    }
     assert_eq!(unsafe { ds41_bf16_gemv(x.data_ptr(), w.data_ptr(), y.data_ptr() as *mut f32, m as i32, n as i32, k as i32, rs_current_stream()) }, 0, "ds41_bf16_gemv");
     y
+}
+
+/// DS41_C12 (default on; 0 off): the decode-sized BF16 GEMVs (head, routers, compressor / indexer projections, the
+/// draft's Markov head) read a C12 coding of the weight; the BF16 source stays for the prefill-sized FP32 matmuls.
+pub fn c12_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_C12").map_or(true, |v| v != "0")) }
+type C12Parts = [Tensor; 6];
+/// Codings keyed by (data pointer, rows, cols) of the BF16 source; process lifetime (the sources live as long).
+fn c12_map() -> &'static std::sync::Mutex<std::collections::HashMap<(usize, i64, i64), C12Parts>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(usize, i64, i64), C12Parts>>> = std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+fn c12_lookup(w: &Tensor) -> Option<C12Parts> {
+    if !c12_on() || w.dim() != 2 { return None; }
+    let key = (w.data_ptr() as usize, w.size()[0], w.size()[1]);
+    c12_map().lock().unwrap().get(&key).map(|p| [p[0].shallow_clone(), p[1].shallow_clone(), p[2].shallow_clone(), p[3].shallow_clone(), p[4].shallow_clone(), p[5].shallow_clone()])
+}
+/// Encode a BF16 [n, k] weight for `bf16_gemv` (n % 16 == 0, k % 256 == 0, contiguous; others are skipped) and prove
+/// at load that every decoded weight equals its BF16 bits. Returns the coded bytes (0 when skipped).
+pub fn c12_register(w: &Tensor) -> i64 {
+    if !c12_on() || w.kind() != Kind::BFloat16 || w.dim() != 2 || !w.is_contiguous() || !w.device().is_cuda() { return 0; }
+    let (n, k) = (w.size()[0], w.size()[1]);
+    if n % 16 != 0 || k % 256 != 0 { return 0; }
+    let key = (w.data_ptr() as usize, n, k);
+    if c12_map().lock().unwrap().contains_key(&key) { return 0; }
+    let p = crate::c12::encode_parts(w);
+    extern "C" { fn glm53_c12_verify_exact_cuda(src: *const std::ffi::c_void, m8: *const std::ffi::c_void, e4: *const std::ffi::c_void, eb: *const std::ffi::c_void,
+        ptr: *const i32, col: *const i32, val: *const std::ffi::c_void, n: i32, k: i32, bad: *mut u64, st: *mut std::ffi::c_void) -> i32; }
+    let bad = Tensor::zeros([1], (Kind::Int64, w.device()));
+    assert_eq!(unsafe { glm53_c12_verify_exact_cuda(w.data_ptr(), p[0].data_ptr(), p[1].data_ptr(), p[2].data_ptr(), p[3].data_ptr().cast(), p[4].data_ptr().cast(),
+        p[5].data_ptr(), n as i32, k as i32, bad.data_ptr().cast(), rs_current_stream()) }, 0, "c12_verify_exact");
+    let b = bad.int64_value(&[0]);
+    assert_eq!(b, 0, "DS41 C12: {b} decoded weights of [{n}, {k}] differ from the BF16 source");
+    let bytes: i64 = p.iter().map(|t| t.numel() as i64 * t.kind().elt_size_in_bytes() as i64).sum();
+    c12_map().lock().unwrap().insert(key, p);
+    bytes
 }
 
 /// DS41_GEMV_BX=0: wo_a on the CUDA-core FP8 GEMV (cost linear in the rows) instead of the BF16-MMA one.
@@ -505,13 +550,27 @@ pub fn hc_mix_jobs(h: &Tensor, f: &Tensor, scale: &Tensor, base: &Tensor, norm_e
 }
 /// No mix job left queued (the GEMVs meant to take them ran).
 pub fn hc_jobs_done() -> bool { GEMV_JOBS.with(|q| q.borrow().is_empty()) }
+static GEMV_PREQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+pub fn gemv_preq_rows() -> i64 {
+    let v = GEMV_PREQ.load(std::sync::atomic::Ordering::Relaxed);
+    if v >= 0 { return v; }
+    let e = std::env::var("DS41_GEMV_PREQ_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    GEMV_PREQ.store(e, std::sync::atomic::Ordering::Relaxed);
+    e
+}
+/// DS41_GEMV_PREQ_K1 (default on; 0 off): single rows with k >= 4096 also take the one-kernel quantization (qakv share,
+/// shared w13: -2 us each; the k = 1280 GEMVs are faster quantizing in the CTA).
+fn gemv_preq_k1() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_GEMV_PREQ_K1").map_or(true, |v| v != "0")) }
+pub fn set_gemv_preq_rows(v: i64) { GEMV_PREQ.store(v, std::sync::atomic::Ordering::Relaxed); }
 fn gemv_mx(x: &Tensor, w: &Tensor, ws: &Tensor, ob16: bool) -> Tensor {
     let x = x.to_kind(Kind::BFloat16).contiguous();
     let (m, k) = (x.size()[0], x.size()[1]);
     let n = w.size()[0];
     let y = Tensor::empty([m, n], (if ob16 { Kind::BFloat16 } else { Kind::Float }, x.device()));
-    // the input is act-quantized by every CTA in shared memory when it fits, else by a kernel first
-    let fits = (m * k + m * k / 32) as usize <= unsafe { ds41_fp8_gemv_mx_smem_max() };
+    // the input is act-quantized by every CTA in shared memory when it fits, else by a kernel first; from
+    // DS41_GEMV_PREQ_ROWS rows (default 2; 99 off) always by one act_quant_fp8 kernel: the same bytes, so the same result,
+    // and each CTA no longer quantizes all m x k inputs itself (wo_b at 8 rows 102 -> 69 us)
+    let fits = (m * k + m * k / 32) as usize <= unsafe { ds41_fp8_gemv_mx_smem_max() } && m < gemv_preq_rows() && !(m == 1 && k >= 4096 && gemv_preq_k1());
     let q = (!fits).then(|| act_quant_fp8(&x));
     let (aq, asc) = q.as_ref().map_or((std::ptr::null_mut(), std::ptr::null_mut()), |(a, b)| (a.data_ptr(), b.data_ptr()));
     let job = GEMV_JOBS.with(|q| q.borrow_mut().pop_front());
@@ -1014,6 +1073,36 @@ pub fn gemv_bench() {
     let _ = (&x1, &xq, &idx, &rw, w);
 }
 
+/// ds41-kernel-test: every decode MX GEMV shape of a TP3 rank, cold, per row count with the in-CTA quantization and with
+/// one act_quant_fp8 kernel first (DS41_GEMV_PREQ_ROWS), and whether the two agree bitwise.
+fn mx_table(dev: tch::Device) {
+    let time = |f: &dyn Fn() -> Tensor| { for _ in 0..3 { let _ = f(); } tch::Cuda::synchronize(0);
+        let t = std::time::Instant::now(); for _ in 0..20 { let _ = f(); } tch::Cuda::synchronize(0); t.elapsed().as_secs_f64() * 1e6 / 20.0 };
+    // every decode MX GEMV shape of a TP3 rank, cold (copies rotating over >= 96 MB), GB/s of weight + scale bytes
+    for (name, n, k) in [("qakv", 1792i64, 5120i64), ("qakv/3", 608, 5120), ("wq_b 24h", 12288, 1280), ("wq_b 16h", 8192, 1280), ("wo_b", 5120, 3072),
+                         ("wo_b 2g", 5120, 2048), ("sh w13", 1536, 5120), ("sh w2", 5120, 768), ("idx wq_b", 4096, 1280)] {
+        let q = (Tensor::randn([n, k], (Kind::Float, dev)) * 0.05).to_kind(Kind::Float8e4m3fn).view_dtype(Kind::Uint8);
+        let s = Tensor::randint_low(118, 126, [n / 32, k / 32], (Kind::Uint8, dev));
+        let bytes = n * k + n * k / 1024;
+        let copies = ((96 << 20) / bytes + 1) as usize;
+        let set: Vec<(Tensor, Tensor)> = (0..copies).map(|_| (q.copy(), s.copy())).collect();
+        let mut line = format!("[ds41-kernel-test] MX GEMV {name} [{n}x{k}] ({copies} copies):");
+        for m in [1i64, 2, 4, 8, 16] {
+            let x = Tensor::randn([m, k], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+            let i = std::cell::Cell::new(0usize);
+            set_gemv_preq_rows(99);
+            let us = time(&|| { let j = i.get(); i.set(j + 1); fp8_gemv_mx_bf16(&x, &set[j % copies].0, &set[j % copies].1) });
+            let a = fp8_gemv_mx(&x, &set[0].0, &set[0].1);
+            set_gemv_preq_rows(1);
+            let up = time(&|| { let j = i.get(); i.set(j + 1); fp8_gemv_mx_bf16(&x, &set[j % copies].0, &set[j % copies].1) });
+            let same = fp8_gemv_mx(&x, &set[0].0, &set[0].1).equal(&a);
+            line += &format!(" m={m} {us:.1} / pre-q {up:.1} us{};", if same { "" } else { " DIFFERENT" });
+        }
+        set_gemv_preq_rows(-1);
+        eprintln!("{line}");
+    }
+}
+
 pub fn test(ckpt: &std::path::Path) {
     use super::load::{dequant_fp8, dequant_mxfp4, fp4_table, Checkpoint};
     let _g = tch::no_grad_guard();
@@ -1021,6 +1110,17 @@ pub fn test(ckpt: &std::path::Path) {
     let ck = Checkpoint::open(ckpt, dev);
     gemv_mx_init();
     tch::manual_seed(7);
+    // the clamped sublayer norm variants against the original row kernel (DS41_KT_ONLY=clp: only this)
+    {
+        extern "C" { fn ds41_rms_clp_selftest(rows: i32, n: i32, k: i32, minc: i32, out: *mut i64) -> i32; }
+        for (rows, k, minc) in [(1, 3, 1), (2, 3, 1), (3, 3, 2), (4, 3, 2), (8, 3, 1), (16, 4, 2), (5, 2, 1)] {
+            let mut o = [0i64; 5];
+            assert_eq!(unsafe { ds41_rms_clp_selftest(rows, 5120, k, minc, o.as_mut_ptr()) }, 0);
+            eprintln!("[ds41-kernel-test] clamp norm rows={rows} k={k} min={minc}: mismatches clp1 {} clp2 {} cl2 {} counts {} (triggers {})", o[0], o[1], o[2], o[3], o[4]);
+        }
+        if std::env::var("DS41_KT_ONLY").as_deref() == Ok("clp") { return; }
+        if std::env::var("DS41_KT_ONLY").as_deref() == Ok("mx") { mx_table(dev); return; }
+    }
     // act_quant
     let x = Tensor::randn([8, 5120], (Kind::Float, dev)) * 3.0;
     let a = act_quant(&x.to_kind(Kind::BFloat16));
@@ -1240,6 +1340,64 @@ pub fn test(ckpt: &std::path::Path) {
         let us = time(&|| bf16_gemv(&x, &w));
         let us0 = time(&|| x.to_kind(Kind::Float).matmul(&w.to_kind(Kind::Float).tr()));
         eprintln!("[ds41-kernel-test] bf16_gemv head [43136x5120] m=1: {us:.1} us ({:.0} GB/s; v0 {us0:.1} us)", (43136 * 5120 * 2) as f64 / us / 1e3);
+        // the joint q / kv projection (qakv [1792, 5120] FP8) whole vs a third of its rows (608: 19 of 56 row blocks),
+        // 6 copies rotating (cold); the rows of the third equal the whole's rows
+        {
+            let q = (Tensor::randn([1792, 5120], (Kind::Float, dev)) * 0.05).to_kind(Kind::Float8e4m3fn).view_dtype(Kind::Uint8);
+            let s = Tensor::randint_low(118, 126, [56, 160], (Kind::Uint8, dev));
+            let full: Vec<(Tensor, Tensor)> = (0..6).map(|_| (q.copy(), s.copy())).collect();
+            let third: Vec<(Tensor, Tensor)> = (0..6).map(|_| (q.narrow(0, 608, 608).copy(), s.narrow(0, 19, 19).copy())).collect();
+            for m in [1i64, 2, 4, 8] {
+                let x = Tensor::randn([m, 5120], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+                let same = fp8_gemv_mx_bf16(&x, &third[0].0, &third[0].1).equal(&fp8_gemv_mx_bf16(&x, &full[0].0, &full[0].1).narrow(1, 608, 608));
+                let i = std::cell::Cell::new(0usize);
+                let uf = time(&|| { let k = i.get(); i.set(k + 1); fp8_gemv_mx_bf16(&x, &full[k % 6].0, &full[k % 6].1) });
+                let ut = time(&|| { let k = i.get(); i.set(k + 1); fp8_gemv_mx_bf16(&x, &third[k % 6].0, &third[k % 6].1) });
+                eprintln!("[ds41-kernel-test] qakv m={m}: 1792 rows {uf:.1} us, 608 rows {ut:.1} us (rows bitwise: {same})");
+            }
+        }
+        mx_table(dev);
+        // DS41_C12: the coded GEMV must equal the BF16 one bit for bit (head, a router, the Markov head shape), every m;
+        // timing on a rotating set of 4 head copies (1.8 GB > L2) for both
+        if c12_on() {
+            let mtp_head = ck.get("mtp.2.markov_head.head.weight", Kind::BFloat16).narrow(0, 0, 43136).contiguous();
+            let gate = ck.get("layers.20.ffn.gate.weight", Kind::BFloat16);
+            for (name, w) in [("head", &w), ("gate", &gate), ("markov", &mtp_head)] {
+                let wc = w.copy();   // a fresh pointer: registered; the original stays on the BF16 kernel
+                let bytes = c12_register(&wc);
+                let mut same = bytes > 0;
+                for m in 1..=8i64 {
+                    let x = Tensor::randn([m, w.size()[1]], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+                    let (want, got) = (bf16_gemv(&x, w), bf16_gemv(&x, &wc));
+                    if !got.equal(&want) { same = false; eprintln!("[ds41-kernel-test] C12 {name} m={m}: DIFFERENT"); }
+                }
+                eprintln!("[ds41-kernel-test] C12 {name} [{}x{}] ({:.1} MB coded / {:.1} MB): 1..8 rows {}", w.size()[0], w.size()[1],
+                    bytes as f64 / 1e6, (w.numel() * 2) as f64 / 1e6, if same { "IDENTICAL" } else { "DIFFERENT" });
+            }
+            {
+                let gs: Vec<Tensor> = (0..32).map(|_| gate.copy()).collect();
+                let gc: Vec<Tensor> = (0..32).map(|_| gate.copy()).collect();
+                for t in &gc { c12_register(t); }
+                for m in [1i64, 4] {
+                    let x = Tensor::randn([m, 5120], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+                    let i = std::cell::Cell::new(0usize);
+                    let ub = time(&|| { let k = i.get(); i.set(k + 1); bf16_gemv(&x, &gs[k % 32]) });
+                    let uc = time(&|| { let k = i.get(); i.set(k + 1); bf16_gemv(&x, &gc[k % 32]) });
+                    eprintln!("[ds41-kernel-test] gate [384x5120] m={m} rotating: BF16 {ub:.1} us, C12 {uc:.1} us");
+                }
+            }
+            let ws: Vec<Tensor> = (0..4).map(|_| w.copy()).collect();
+            let wc: Vec<Tensor> = (0..4).map(|_| w.copy()).collect();
+            for t in &wc { c12_register(t); }
+            for m in [1i64, 2, 4, 8] {
+                let x = Tensor::randn([m, 5120], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+                let i = std::cell::Cell::new(0usize);
+                let ub = time(&|| { let k = i.get(); i.set(k + 1); bf16_gemv(&x, &ws[k % 4]) });
+                let uc = time(&|| { let k = i.get(); i.set(k + 1); bf16_gemv(&x, &wc[k % 4]) });
+                eprintln!("[ds41-kernel-test] head m={m} rotating: BF16 {ub:.1} us ({:.0} GB/s), C12 {uc:.1} us ({:.0} GB/s of BF16-equivalent)",
+                    (43136 * 5120 * 2) as f64 / ub / 1e3, (43136 * 5120 * 2) as f64 / uc / 1e3);
+            }
+        }
     }
     // sparse attention against ops.rs: 24 and 16 heads, pool of 3000 rows, 640 indices with invalid ones
     for (t, h, k) in [(1i64, 24i64, 640i64), (2, 24, 640), (5, 16, 128), (8, 16, 640), (300, 24, 640), (2048, 24, 640)] {

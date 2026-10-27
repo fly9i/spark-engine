@@ -400,6 +400,30 @@ pub fn ar_bench() {
         let us = t.elapsed().as_secs_f64() * 1e6 / 1000.0;
         if tp.rank == 0 { eprintln!("[ds41-ar-bench] graph: {n} floats ({:.1} KB): {us:.1} us per all-reduce", n as f64 * 4.0 / 1024.0); }
     }
+    // decode-size row all-gather (rdma_arn rows, ag): each rank's [T, 608] BF16 block (a third of the joint q / kv
+    // projection's columns), 100 back-to-back inside one graph
+    for (i, t) in [1i64, 2, 4, 8].into_iter().enumerate() {
+        use crate::tp::graph::{begin_pool, end, Owned};
+        extern "C" { fn rs_sp_all_gather(i: *const std::ffi::c_void, o: *mut std::ffi::c_void, bytes: i64, async_: i32) -> i32; }
+        let x = (Tensor::arange(t * 608, (Kind::Float, dev)) + 1000.0 * tp.rank as f64).to_kind(Kind::BFloat16);
+        let out = Tensor::zeros([tp.world as i64 * t * 608], (Kind::BFloat16, dev));
+        let ag = || assert_eq!(unsafe { rs_sp_all_gather(x.data_ptr(), out.data_ptr(), t * 608 * 2, 0) }, 0, "rs_sp_all_gather");
+        ag();
+        tch::Cuda::synchronize(0);
+        let want = Tensor::cat(&(0..tp.world).map(|r| (Tensor::arange(t * 608, (Kind::Float, dev)) + 1000.0 * r as f64).to_kind(Kind::BFloat16)).collect::<Vec<_>>(), 0);
+        let same = out.equal(&want);
+        begin_pool(0xa21 + i as i64).expect("capture begin");
+        for _ in 0..100 { ag(); }
+        end().expect("capture end");
+        let g = Owned::take();
+        g.replay();
+        tch::Cuda::synchronize(0);
+        let t0 = std::time::Instant::now();
+        for _ in 0..10 { g.replay(); }
+        tch::Cuda::synchronize(0);
+        let us = t0.elapsed().as_secs_f64() * 1e6 / 1000.0;
+        if tp.rank == 0 { eprintln!("[ds41-ar-bench] graph: all-gather [{t} x 608] BF16 per rank: {us:.1} us, correct: {same}"); }
+    }
     for rows in [1i64, 64, 512, 2048, 4096] {
         let n = rows * 5120;
         let mk = |r: usize| Tensor::arange(n, (Kind::Float, dev)).sin() * (r as f64 + 1.0) + 0.1 * r as f64;

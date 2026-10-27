@@ -223,6 +223,11 @@ fn ar_prefill(y: &Tensor) {
     }
     prof("allreduce", || crate::tp::allreduce(y));
 }
+/// DS41_ENGRAM_JIT (default on; 0 off): decode graphs upload an engram layer's rows right before its first segment.
+fn engram_jit_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_ENGRAM_JIT").map_or(true, |v| v != "0")) }
+/// DS41_QAKV_SPLIT (default on; 0 off): decode-sized joint q / kv projections split by rows over the ranks plus an
+/// all-gather (Attn::qakv_mine) instead of every rank projecting all rows.
+fn qakv_split_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_QAKV_SPLIT").map_or(true, |v| v != "0")) }
 /// The block-scaled MMA GEMV (any 1..16 rows, cost independent of the row count) instead of the CUDA-core one: for 2..16
 /// rows always (the CUDA-core GEMV's cost grows with the rows), for 1 row with DS41_GEMV_MX1 (default on).
 fn mx_gemv_ok(m: i64, k: i64, n: i64) -> bool {
@@ -357,7 +362,11 @@ pub struct Compressor { wkv: Tensor, wgate: Option<Tensor>, norm: Tensor, w2: Op
 pub struct Indexer { wq_b: Fp8W, weights_proj: Tensor, wk: Option<Tensor>, k_norm: Option<Tensor> }
 pub struct Attn {
     /// wq_a and wkv stacked (they share the input; one GEMV), and views of the two
-    pub(super) qakv: Fp8W, pub(super) wq_a: Fp8W, pub(super) q_norm: Tensor, pub(super) wq_b: Fp8W, pub(super) wkv: Fp8W, pub(super) kv_norm: Tensor, pub(super) sink: Tensor,
+    pub(super) qakv: Fp8W,
+    /// DS41_QAKV_SPLIT: this rank's equal share of qakv's 32-row blocks (rows padded with zeros to world x share), for
+    /// decode-sized calls: each rank projects its share and the shares are all-gathered (`attn_qakv`)
+    qakv_mine: Option<Fp8W>,
+    pub(super) wq_a: Fp8W, pub(super) q_norm: Tensor, pub(super) wq_b: Fp8W, pub(super) wkv: Fp8W, pub(super) kv_norm: Tensor, pub(super) sink: Tensor,
     wo_a: Fp8W,    // [local groups * o_lora, heads_per_group * head_dim] FP8 (dequantized: the official BF16 weight)
     wo_b: Fp8W,    // [dim, local groups * o_lora]
     comp: Option<Compressor>, idx: Option<Indexer>, pub(super) rope: Rope,
@@ -554,6 +563,20 @@ impl Model {
         }
         if dev.is_cuda() { super::kern::gemv_mx_init(); }
         let head8 = (mtp.is_some() && std::env::var("DS41_DRAFT_HEAD_FP8").map_or(true, |v| v != "0")).then(|| quant_fp8_blocks(&head));
+        if dev.is_cuda() && super::kern::c12_on() {
+            // DS41_C12: C12 codings of the BF16 weights the decode-sized bf16_gemv reads (the sources stay for prefill)
+            let mut ws: Vec<&Tensor> = vec![&head];
+            for l in layers.iter().chain(mtp.iter().flat_map(|m| m.layers.iter())) {
+                ws.push(&l.moe.gate);
+                if let Some(cm) = &l.attn.comp { ws.push(cm.w2.as_ref().unwrap_or(&cm.wkv)); }
+                if let Some(ix) = &l.attn.idx { ws.push(&ix.weights_proj); }
+            }
+            if let Some(m) = &mtp { ws.push(m.markov_head()); }
+            let t1 = std::time::Instant::now();
+            let bytes: i64 = ws.iter().map(|w| super::kern::c12_register(w)).sum();
+            let (a, _) = crate::tp::graph::memory();
+            eprintln!("[ds41] rank{rank} C12 codings: {:.0} MB in {:.1}s (allocated {:.1} GiB)", bytes as f64 / 1e6, t1.elapsed().as_secs_f64(), a as f64 / (1u64 << 30) as f64);
+        }
         Model { c, sp, ck, tables, dev, embed, head, norm, layers, hash, fp4, graph: std::cell::RefCell::new(HashMap::new()), graph_clock: std::cell::Cell::new(0), mtp, head8,
                 last_hidden: std::cell::RefCell::new(None), draft_debug: std::cell::RefCell::new(None),
                 mtp_graphs: std::cell::RefCell::new(HashMap::new()) }
@@ -632,12 +655,28 @@ impl Model {
         });
         let wo_a_rows = Self::fp8_rows(ck, &format!("{a}.wo_a"), sp.g0 * c.o_lora, gl * c.o_lora);
         let (wq_a0, wkv0) = (Self::fp8(ck, &format!("{a}.wq_a")), Self::fp8(ck, &format!("{a}.wkv")));
-        let qakv = Fp8W { w: Tensor::cat(&[&wq_a0.w, &wkv0.w], 0), s: Tensor::cat(&[&wq_a0.s, &wkv0.s], 0) };
+        let (nq, k) = (wq_a0.n() + wkv0.n(), wq_a0.w.size()[1]);
+        // DS41_QAKV_SPLIT: rows padded to world x blk (blk = the largest Part of the 32-row blocks) so that every rank's
+        // share is a contiguous block of the same size; the whole qakv is a view of the first nq rows (prefill)
+        let blk = if qakv_split_on() && sp.world > 1 { (nq / 32 + sp.world as i64 - 1) / sp.world as i64 * 32 } else { nq };
+        let pad = blk * sp.world as i64 - nq;
+        let (qw, qs) = if pad > 0 && blk < nq {
+            (Tensor::cat(&[&wq_a0.w, &wkv0.w, &Tensor::zeros([pad, k], (Kind::Uint8, ck.dev))], 0),
+             Tensor::cat(&[&wq_a0.s, &wkv0.s, &Tensor::zeros([pad / 32, k / 32], (Kind::Uint8, ck.dev))], 0))
+        } else { (Tensor::cat(&[&wq_a0.w, &wkv0.w], 0), Tensor::cat(&[&wq_a0.s, &wkv0.s], 0)) };
         drop((wq_a0, wkv0));
+        let qpad = Fp8W { w: qw, s: qs };
+        let qakv_mine = (blk < nq).then(|| {
+            let part = crate::tp::Part::of(nq / 32, sp.rank, sp.world, 0);
+            assert_eq!(part.start * 32, sp.rank as i64 * blk, "qakv share layout");
+            qpad.rows(sp.rank as i64 * blk, blk)
+        });
+        let qakv = qpad.rows(0, nq);
         let attn = Attn {
             wq_a: qakv.rows(0, c.q_lora),
             wkv: qakv.rows(c.q_lora, c.head_dim),
             qakv,
+            qakv_mine,
             q_norm: ck.get(&format!("{a}.q_norm.weight"), Kind::BFloat16),
             wq_b: Self::fp8_rows(ck, &format!("{a}.wq_b"), h0 * hd, (h1 - h0) * hd),
             kv_norm: ck.get(&format!("{a}.kv_norm.weight"), Kind::BFloat16),
@@ -1083,11 +1122,19 @@ impl Model {
             g.used = self.graph_clock.get();
             let _ = g.pos.copy_(&pos_now);
             let _ = g.h0.copy_(&e.unsqueeze(1).expand([total, c.hc, c.dim], false));
-            for (li, l) in engram_layers.iter().enumerate() {
-                if let Some(r) = g.rows.get_mut(l) { let _ = r.copy_(&prof("engram", || rows_now(li, *l))); }
-            }
+            // DS41_ENGRAM_JIT (default on; 0: all rows before layer 0): an engram layer's rows are fetched (host) and
+            // uploaded right before its S1, so the fetch overlaps the GPU running the layers before it (same rows,
+            // same stream order before their only reader)
+            let jit = engram_jit_on();
+            let mut upload = |l: usize, g: &mut DecodeGraph| {
+                if let Some(li) = engram_layers.iter().position(|x| *x == l) {
+                    if let Some(r) = g.rows.get_mut(&l) { let _ = r.copy_(&prof("engram", || rows_now(li, l))); }
+                }
+            };
+            if !jit { for &l in &engram_layers { upload(l, g); } }
             let mut sh: Vec<Shared> = (0..seqs.len()).map(|_| Shared::default()).collect();
             for (i, layer) in self.layers.iter().enumerate() {
+                if jit { upload(layer.id, g); }
                 prof("graph.s1", || g.s1[i].replay());
                 let _ = run_mid(layer, &g.mid[i], &g.pos, Some(&g.obuf[i]), &mut sh, seqs);
                 prof("graph.s3", || g.s3[i].replay());
@@ -1958,7 +2005,25 @@ impl Model {
 
     /// Query (low-rank, normed, rotated) and the window key/value of the chunk (rotated, FP8-quantized).
     pub(super) fn attn_in(&self, layer: &Layer, x: &Tensor, pos: &Tensor) -> (Tensor, Tensor, Tensor) {
-        self.attn_in_qakv(layer, &layer.attn.qakv.mm(x), pos)                           // [T, q_lora + head_dim]
+        self.attn_in_qakv(layer, &self.attn_qakv(layer, x), pos)
+    }
+    /// qakv = x . [wq_a; wkv]^T [T, q_lora + head_dim] BF16. Decode-sized x with DS41_QAKV_SPLIT: this rank's share of
+    /// the rows (the MX GEMV's K split depends on K only, so each output is bitwise the whole GEMV's), the shares
+    /// all-gathered (a copy) into [T, world x share] and cut to the real columns: a third of the bytes per rank (TP3).
+    pub(super) fn attn_qakv(&self, layer: &Layer, x: &Tensor) -> Tensor {
+        let a = &layer.attn;
+        let t = x.size()[0];
+        let k = *x.size().last().unwrap();
+        let Some(mine) = a.qakv_mine.as_ref().filter(|m| gemv_on() && !parity() && mx_gemv_ok(t, k, m.n())) else { return a.qakv.mm(x); };
+        let blk = mine.n();
+        let world = self.sp.world as i64;
+        let y = mine.mm(x).contiguous();                                                // [T, blk] BF16
+        let out = Tensor::empty([world, t, blk], (Kind::BFloat16, self.dev));
+        extern "C" { fn rs_sp_all_gather(i: *const std::ffi::c_void, o: *mut std::ffi::c_void, bytes: i64, async_: i32) -> i32; }
+        let rc = prof("allreduce", || unsafe { rs_sp_all_gather(y.data_ptr(), out.data_ptr(), t * blk * 2, 0) });
+        assert_eq!(rc, 0, "rs_sp_all_gather (qakv)");
+        let full = if t == 1 { out.view([1, world * blk]) } else { out.permute([1, 0, 2]).contiguous().view([t, world * blk]) };
+        full.narrow(1, 0, a.qakv.n())
     }
     /// attn_in from the joint low-rank projection qakv = x . [wq_a; wkv]^T [T, q_lora + head_dim] (BF16).
     pub(super) fn attn_in_qakv(&self, layer: &Layer, qakv: &Tensor, pos: &Tensor) -> (Tensor, Tensor, Tensor) {

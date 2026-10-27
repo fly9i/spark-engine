@@ -276,3 +276,4 @@ extern "C" int ds41_act_quant32(const void* x,void* out,long long numel,cudaStre
   pdl_launch(act_quant32,dim3((unsigned)((blocks+7)/8)),dim3(256),0,st,(const __nv_bfloat16*)x,(__nv_bfloat16*)out,blocks);
   return (int)cudaGetLastError();
 }
+extern "C" int ds41_pdl_enabled(){return pdl_on()?1:0;}

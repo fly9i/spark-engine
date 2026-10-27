@@ -11,6 +11,7 @@
 #include <cuda_fp8.h>
 #include <cstdint>
 #include <cstdlib>
+#include <vector>
 
 namespace {
 __global__ void rms_norm_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y,
@@ -107,6 +108,126 @@ __global__ void rms_norm_vec_kernel(const __nv_bfloat16* __restrict__ x, const _
       oe[j] = __float2bfloat16(z);
     }
     yr[i] = o;
+  }
+}
+
+// The clamped sublayer norm for decode-sized calls (DS41_RMS_CLP, default on): rms_norm_vec_kernel (R = 1) /
+// rms_norm_cl2_kernel (R = 2) with the k <= KM clamp directions and w loaded into registers (16-byte loads) before the
+// PDL wait -- they are constants -- instead of 2 x 16 x k scalar loads per thread inside the dot and update loops (a
+// chain of L2 round trips: 14-16 us for one row, on the critical path twice per layer). Per row the same arithmetic in
+// the same order and expression forms (sums of squares, reductions, acc[q] += z * d in (u, j, q) order, block reduction
+// + count gate row by row, z -= e[q] * d, roundings): bitwise both kernels (ds41-kernel-test).
+template <int KM, int R>
+__global__ void __launch_bounds__(320) rms_norm_clp_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+                                                           __nv_bfloat16* __restrict__ y, int rows, int n, float eps, SparkClamp cl) {
+  pdl_trigger();
+  const int nv = n / 8;
+  float dv[KM][2][8];
+  uint4 wv[2];
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int i = threadIdx.x + u * blockDim.x;
+    const bool live = i < nv;
+    wv[u] = live ? __ldg(reinterpret_cast<const uint4*>(w) + i) : make_uint4(0, 0, 0, 0);
+#pragma unroll
+    for (int q = 0; q < KM; ++q) {
+      float4 a = make_float4(0.f, 0.f, 0.f, 0.f), b = a;
+      if (live && q < cl.k) { a = __ldg(reinterpret_cast<const float4*>(cl.d + (long long)q * n + i * 8)); b = __ldg(reinterpret_cast<const float4*>(cl.d + (long long)q * n + i * 8 + 4)); }
+      dv[q][u][0] = a.x; dv[q][u][1] = a.y; dv[q][u][2] = a.z; dv[q][u][3] = a.w; dv[q][u][4] = b.x; dv[q][u][5] = b.y; dv[q][u][6] = b.z; dv[q][u][7] = b.w;
+    }
+  }
+  pdl_wait();
+  const int r0 = blockIdx.x * R;
+  uint4 v[R][2];
+  float s[R];
+#pragma unroll
+  for (int rr = 0; rr < R; ++rr) {
+    const int row = (r0 + rr < rows) ? r0 + rr : r0;
+    const uint4* xr = reinterpret_cast<const uint4*>(x + (long long)row * n);
+    s[rr] = 0.f;
+#pragma unroll
+    for (int u = 0; u < 2; ++u) { const int i = threadIdx.x + u * blockDim.x; v[rr][u] = i < nv ? xr[i] : make_uint4(0, 0, 0, 0); }
+  }
+#pragma unroll
+  for (int u = 0; u < 2; ++u)
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+      for (int rr = 0; rr < R; ++rr) { const float f = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&v[rr][u])[j]); s[rr] += f * f; }
+  __shared__ float red[R][32];
+  __shared__ float cred[SPARK_CLAMP_MAX_K * 32];
+  __shared__ float ce[SPARK_CLAMP_MAX_K];
+  for (int o = 16; o; o >>= 1)
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) s[rr] += __shfl_xor_sync(0xffffffffu, s[rr], o);
+  if ((threadIdx.x & 31) == 0)
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) red[rr][threadIdx.x >> 5] = s[rr];
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    float t[R];
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) t[rr] = threadIdx.x < (blockDim.x >> 5) ? red[rr][threadIdx.x] : 0.f;
+    for (int o = 16; o; o >>= 1)
+#pragma unroll
+      for (int rr = 0; rr < R; ++rr) t[rr] += __shfl_xor_sync(0xffffffffu, t[rr], o);
+    __syncwarp();
+    if (threadIdx.x == 0)
+#pragma unroll
+      for (int rr = 0; rr < R; ++rr) red[rr][0] = rsqrtf(t[rr] / n + eps);
+  }
+  __syncthreads();
+  float rr_[R];
+#pragma unroll
+  for (int rr = 0; rr < R; ++rr) rr_[rr] = red[rr][0];
+  float acc[R][KM];
+  float zf[R][2][8];
+#pragma unroll
+  for (int rr = 0; rr < R; ++rr)
+#pragma unroll
+    for (int q = 0; q < KM; ++q) acc[rr][q] = 0.f;
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int i = threadIdx.x + u * blockDim.x;
+    const bool live = i < nv;
+    const __nv_bfloat16* we = reinterpret_cast<const __nv_bfloat16*>(&wv[u]);
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+      for (int rr = 0; rr < R; ++rr) {
+        const float z = live ? __fmul_rn(__bfloat162float(we[j]), __fmul_rn(__bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&v[rr][u])[j]), rr_[rr])) : 0.f;
+        zf[rr][u][j] = z;
+#pragma unroll
+        for (int q = 0; q < KM; ++q) if (q < cl.k) acc[rr][q] += z * dv[q][u][j];
+      }
+  }
+  float e[R][KM];
+#pragma unroll
+  for (int rr = 0; rr < R; ++rr) {
+    if (rr > 0 && r0 + rr >= rows) { for (int q = 0; q < KM; ++q) e[rr][q] = 0.f; continue; }
+    spark_clamp_reduce(cl, acc[rr], cred, ce, r0 + rr);
+#pragma unroll
+    for (int q = 0; q < KM; ++q) e[rr][q] = q < cl.k ? ce[q] : 0.f;
+    if (R > 1) __syncthreads();   // ce is rewritten by the next row's reduction
+  }
+#pragma unroll
+  for (int rr = 0; rr < R; ++rr) {
+    if (r0 + rr >= rows) break;
+    uint4* yr = reinterpret_cast<uint4*>(y + (long long)(r0 + rr) * n);
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+      const int i = threadIdx.x + u * blockDim.x;
+      if (i >= nv) break;
+      uint4 o; __nv_bfloat16* oe = reinterpret_cast<__nv_bfloat16*>(&o);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        float z = zf[rr][u][j];
+#pragma unroll
+        for (int q = 0; q < KM; ++q) if (q < cl.k) z -= e[rr][q] * dv[q][u][j];
+        oe[j] = __float2bfloat16(z);
+      }
+      yr[i] = o;
+    }
   }
 }
 
@@ -452,6 +573,13 @@ int ds41_rms_norm_cl(const void* x, const void* w, void* y, int rows, int n, flo
   const int nv = n / 8, threads = ((nv + 1) / 2 + 31) / 32 * 32;
   const SparkClamp c = *cl;
   static const bool two = !(std::getenv("DS41_RMS_CL2") && std::getenv("DS41_RMS_CL2")[0] == '0');
+  static const bool clp = !(std::getenv("DS41_RMS_CLP") && std::getenv("DS41_RMS_CLP")[0] == '0');
+  // one row per CTA (the R = 2 instance agreed bitwise in the stand-alone test but made batched decode nondeterministic
+  // under PDL in the clamp golden, cause not found: not used)
+  if (clp && c.k <= 4 && threads <= 320 && rows <= 16) {
+    pdl_launch((rms_norm_clp_kernel<4, 1>), dim3(rows), dim3(threads), 0, st, (const __nv_bfloat16*)x, (const __nv_bfloat16*)w, (__nv_bfloat16*)y, rows, n, eps, c);
+    return (int)cudaGetLastError();
+  }
   if (two && c.k <= 4 && rows >= 2) {
     pdl_launch(rms_norm_cl2_kernel<4>, dim3((rows + 1) / 2), dim3(threads), 0, st, (const __nv_bfloat16*)x, (const __nv_bfloat16*)w, (__nv_bfloat16*)y, rows, n, eps, c);
     return (int)cudaGetLastError();
@@ -478,3 +606,41 @@ int ds41_rope_act_quant(const void* x, const int64_t* pos, const float* freqs, v
 // PDL suspended during prefill (ds41_pdl.cuh): returns the previous value
 extern "C" int ds41_pdl_suspend = 0;
 extern "C" int ds41_pdl_prefill(int on) { const int was = ds41_pdl_suspend; ds41_pdl_suspend = on; return was; }
+
+// ds41-kernel-test: the clamped norm kernels on random rows, thresholds tight enough that the clamp and the count gate
+// trigger: old vec (1 row / CTA), old cl2 (2 rows / CTA), clp<4,1>, clp<4,2>; outputs and counts compared bitwise
+// (mismatching elements returned: [0] clp1 vs vec, [1] clp2 vs vec, [2] cl2 vs vec, [3] count mismatches)
+extern "C" int ds41_rms_clp_selftest(int rows, int n, int k, int minc, long long* out) {
+  const int nv = n / 8, threads = ((nv + 1) / 2 + 31) / 32 * 32;
+  std::vector<__nv_bfloat16> hx((size_t)rows * n), hw(n);
+  std::vector<float> hd((size_t)k * n), ht(k), hl(k);
+  unsigned s = 12345;
+  auto rnd = [&]() { s = s * 1664525u + 1013904223u; return ((s >> 8) & 0xffff) / 32768.f - 1.f; };
+  for (auto& v : hx) v = __float2bfloat16(rnd() * 3.f);
+  for (auto& v : hw) v = __float2bfloat16(1.f + 0.2f * rnd());
+  for (auto& v : hd) v = rnd() * 0.02f;
+  for (int j = 0; j < k; ++j) { ht[j] = 0.05f * (j - 1); hl[j] = -0.05f; }
+  __nv_bfloat16 *x, *w, *y[4]; float *d, *t, *l; int* cnt[4];
+  cudaMalloc(&x, hx.size() * 2); cudaMalloc(&w, n * 2); cudaMalloc(&d, hd.size() * 4); cudaMalloc(&t, k * 4); cudaMalloc(&l, k * 4);
+  for (int i = 0; i < 4; ++i) { cudaMalloc(&y[i], hx.size() * 2); cudaMalloc(&cnt[i], rows * 4); cudaMemset(cnt[i], 0, rows * 4); }
+  cudaMemcpy(x, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice); cudaMemcpy(w, hw.data(), n * 2, cudaMemcpyHostToDevice);
+  cudaMemcpy(d, hd.data(), hd.size() * 4, cudaMemcpyHostToDevice); cudaMemcpy(t, ht.data(), k * 4, cudaMemcpyHostToDevice); cudaMemcpy(l, hl.data(), k * 4, cudaMemcpyHostToDevice);
+  for (int pass = 0; pass < 3; ++pass)   // three sites of a pass: reset on the first, the count accumulates
+    for (int i = 0; i < 4; ++i) {
+      SparkClamp c{d, t, l, nullptr, k, cnt[i], minc, pass == 0};
+      if (i == 0) rms_norm_vec_kernel<<<rows, threads>>>(x, w, y[i], n, 1e-6f, c);
+      if (i == 1) rms_norm_clp_kernel<4, 1><<<rows, threads>>>(x, w, y[i], rows, n, 1e-6f, c);
+      if (i == 2) rms_norm_clp_kernel<4, 2><<<(rows + 1) / 2, threads>>>(x, w, y[i], rows, n, 1e-6f, c);
+      if (i == 3) rms_norm_cl2_kernel<4><<<(rows + 1) / 2, threads>>>(x, w, y[i], rows, n, 1e-6f, c);
+    }
+  if (cudaDeviceSynchronize()) return 1;
+  std::vector<uint16_t> hy[4]; std::vector<int> hc[4];
+  for (int i = 0; i < 4; ++i) { hy[i].resize(hx.size()); hc[i].resize(rows); cudaMemcpy(hy[i].data(), y[i], hx.size() * 2, cudaMemcpyDeviceToHost); cudaMemcpy(hc[i].data(), cnt[i], rows * 4, cudaMemcpyDeviceToHost); }
+  for (int i = 0; i < 4; ++i) out[i] = 0;
+  for (size_t e = 0; e < hx.size(); ++e) { out[0] += hy[1][e] != hy[0][e]; out[1] += hy[2][e] != hy[0][e]; out[2] += hy[3][e] != hy[0][e]; }
+  for (int r = 0; r < rows; ++r) out[3] += (hc[1][r] != hc[0][r]) + (hc[2][r] != hc[0][r]) + (hc[3][r] != hc[0][r]);
+  long long trig = 0; for (int r = 0; r < rows; ++r) trig += hc[0][r];
+  out[4] = trig;
+  cudaFree(x); cudaFree(w); cudaFree(d); cudaFree(t); cudaFree(l); for (int i = 0; i < 4; ++i) { cudaFree(y[i]); cudaFree(cnt[i]); }
+  return 0;
+}

@@ -18,16 +18,16 @@ RDMA all-reduce、FP8 KV、NVMe 前缀缓存、服务前端。只链接 PyTorch 
 
 ## 概览
 
-GLM 与 Qwen：2026-10-08 实测（v0.1.1 二进制；之后未重测），默认配置、贪心、关思考。DeepSeek：2026-10-26 用当前代码
-服务的 1017 检查点实测（贪心、关思考、开启可选的条件钳制）。方法与更多数据见 [docs/benchmarks.zh-CN.md](docs/benchmarks.zh-CN.md)、
+GLM 与 Qwen：2026-10-08 实测（v0.1.1 二进制；之后未重测），默认配置、贪心、关思考。DeepSeek：decode 2026-10-27（v0.3.1）、prefill 2026-10-26（之后 prefill 代码未变）实测，用当前代码
+服务的 1017 检查点（贪心、关思考、开启可选的条件钳制）。方法与更多数据见 [docs/benchmarks.zh-CN.md](docs/benchmarks.zh-CN.md)、
 [docs/ds41.zh-CN.md](docs/ds41.zh-CN.md#7-性能)。
 
 | | **GLM-5.3-Flash** | **DeepSeek-V4.1-Flash** | **Qwen3.8-Flash-Next** |
 | --- | --- | --- | --- |
 | 硬件 | 2× DGX Spark（TP2，RoCE）；也支持 3× | 3× DGX Spark（TP3，RoCE 全互连） | 1× DGX Spark |
 | 架构 | 45 层：KDA 线性注意力 + MLA/DSA 稀疏注意力，288 专家 MoE | 40 层（20 编码器 + 20 解码器）：带分层 indexer 的压缩稀疏注意力，384 专家 top-6 MoE，Engram n-gram 表，mHC | 48 层：门控 DeltaNet + QSA 稀疏注意力，512 专家 top-10 MoE，逐层 n-gram |
-| **解码 — prose**（1/2/3/4 路） | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 55.3 / 74.8 / — / 93.1 tok/s | 64.1 / 85.5 / 105.0 / 119.5 tok/s |
-| **解码 — structured**（1/2/3/4 路） | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 103.6 / 136.7 / — / 186.6 tok/s | 149.8 / 192.9 / 232.6 / 226.5 tok/s |
+| **解码 — prose**（1/2/3/4 路） | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 59.1 / 82.1 / — / 105.5 tok/s | 64.1 / 85.5 / 105.0 / 119.5 tok/s |
+| **解码 — structured**（1/2/3/4 路） | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 114.8 / 158.1 / — / 195.3 tok/s | 149.8 / 192.9 / 232.6 / 226.5 tok/s |
 | **prefill** | ~1,560 tok/s（10K–55K 提示） | ~5,400 tok/s（8K–64K 提示，新文本；4K 约 4,600） | ~1,900 tok/s（13K–77K 提示） |
 | **TTFT**（短提示） | ~370 ms | ~200 ms；7K 提示从 NVMe 前缀缓存恢复时 185 ms | ~150 ms |
 | **启动**（加载→可服务） | ~33 s | ~30 s（检查点在 page cache 中） | ~54 s |

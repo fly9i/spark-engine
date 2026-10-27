@@ -173,3 +173,102 @@ extern "C" int glm53_q4d_gemm_cuda(const float* x,const void* q,const void* sm,i
   const Q4View w{(const uint8_t*)q,(const half2*)sm,n,k};
   return skinny_q4d_launch(x,w,y,m,out,ks,st);
 }
+
+// ---- FP32-arithmetic warp-per-row GEMV on the C12 coding (first user: DS41's BF16 weights, ds41.cu bf16_gemv).
+// The decoded weight is the exact BF16 value widened to FP32 (no Half rounding). Each output row is one warp; lane l
+// takes k = i*256 + l*8 .. +7 for i = 0, 1, ... in order, FMAs x * w into one FP32 accumulator per input row and the
+// warp sums with shfl_down 16..1: the same operands, FMA sequence and reduction as ds41.cu bf16_gemv, hence bitwise
+// equal to it (and, like it, each row's value does not depend on m). The GLM m8 / e4 layout puts those 8 weights of a
+// lane in 8 contiguous m8 bytes and one e4 word (warp reads 256 + 128 contiguous bytes per i). Needs k % 256 == 0.
+__device__ __forceinline__ void c12_dec8_f32(uint2 mm,uint32_t e,uint32_t eb,const C12View& w,int row,int kbase,float f[8]){
+#pragma unroll
+  for(int i=0;i<8;i++){
+    const uint32_t m=((i<4?mm.x:mm.y)>>(8*(i&3)))&0xffu, idx=(e>>(4*i))&0xfu;
+    f[i]=__uint_as_float(((m&0x80u)<<24)|((eb-idx)<<23)|((m&0x7fu)<<16));
+  }
+  if(__builtin_expect((e&(e>>1)&(e>>2)&(e>>3)&0x11111111u)!=0,0)){
+#pragma unroll
+    for(int i=0;i<8;i++) if(((e>>(4*i))&0xfu)==15u) f[i]=c12_escape(w,row,kbase+i);
+  }
+}
+template<int M,int U>
+__global__ void __launch_bounds__(256) c12_gemv_f32(const __nv_bfloat16* __restrict__ x,const C12View w,float* __restrict__ y,int m){
+  pdl_trigger();
+  const int lane=threadIdx.x&31,row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
+  if(row>=w.n)return;
+  const int K=w.k,t=lane&3,iters=K>>8;
+  const uint8_t* mr=w.m8+(size_t)row*K;const uint8_t* er=w.e4+(size_t)row*(K>>1);
+  const uint32_t eb=w.eb[row];
+  float acc[M];
+#pragma unroll
+  for(int r=0;r<M;++r)acc[r]=0.f;
+  // the weights (and the escape tables) do not depend on earlier kernels: the first U steps load before the PDL wait
+  bool waited=false;
+  for(int i0=0;i0<iters;i0+=U){
+    // U steps' weights in flight; consumed in step order (the FMA sequence does not depend on U)
+    uint2 mm[U];uint32_t ee[U];
+#pragma unroll
+    for(int v=0;v<U;v++){
+      const int c=(i0+v)*256+lane*8;
+      if(i0+v<iters){mm[v]=__ldg(reinterpret_cast<const uint2*>(mr+((c>>6)*4+t)*16+((c>>5)&1)*8));
+                     ee[v]=__ldg(reinterpret_cast<const uint32_t*>(er+((c>>7)*4+t)*16+((c>>5)&3)*4));}
+    }
+    if(!waited){pdl_wait();waited=true;}
+#pragma unroll
+    for(int v=0;v<U;v++){
+      if(i0+v>=iters)break;
+      const int c=(i0+v)*256+lane*8;
+      float wv[8];c12_dec8_f32(mm[v],ee[v],eb,w,row,c,wv);
+#pragma unroll
+      for(int r=0;r<M;++r){
+        if(r<m){
+          const uint4 xp=*reinterpret_cast<const uint4*>(x+(long long)r*K+c);
+          const __nv_bfloat162* xb=reinterpret_cast<const __nv_bfloat162*>(&xp);
+#pragma unroll
+          for(int j=0;j<4;++j){const float2 f=__bfloat1622float2(xb[j]);acc[r]=__fmaf_rn(f.x,wv[2*j],acc[r]);acc[r]=__fmaf_rn(f.y,wv[2*j+1],acc[r]);}
+        }
+      }
+    }
+  }
+#pragma unroll
+  for(int r=0;r<M;++r){
+    float v=acc[r];
+    for(int o=16;o;o>>=1)v+=__shfl_down_sync(0xffffffffu,v,o);
+    if(lane==0&&r<m)y[(long long)r*w.n+row]=v;
+  }
+}
+extern "C" int glm53_c12_gemv_f32_cuda(const void* x,const void* m8,const void* e4,const void* eb,const int* ptr,const int* col,const void* val,
+                                       float* y,int m,int n,int k,int pdl,cudaStream_t st){
+  if(m<1||m>8||k%256!=0||n%16!=0)return int(cudaErrorInvalidValue);
+  const C12View w{(const uint8_t*)m8,(const uint8_t*)e4,(const uint8_t*)eb,ptr,col,(const uint16_t*)val,n,k};
+  const __nv_bfloat16* xx=(const __nv_bfloat16*)x;const dim3 g((n+7)/8),b(256);const bool p=pdl!=0;
+  // few rows (routers [384 or 128, 5120]): one warp per row leaves too few loads in flight (3.9 MB in 33 us), so
+  // every lane loads all 20 of its steps up front (U = 20; the FMA sequence is the same)
+  static const int deep_rows=std::getenv("DS41_C12_DEEP_ROWS")?std::atoi(std::getenv("DS41_C12_DEEP_ROWS")):4096;
+  if(n<=deep_rows&&k==5120){
+    switch(m){case 1:pdl_launch_if(p,c12_gemv_f32<1,20>,g,b,0,st,xx,w,y,m);break;case 2:pdl_launch_if(p,c12_gemv_f32<2,20>,g,b,0,st,xx,w,y,m);break;
+      case 3:case 4:pdl_launch_if(p,c12_gemv_f32<4,20>,g,b,0,st,xx,w,y,m);break;default:pdl_launch_if(p,c12_gemv_f32<8,20>,g,b,0,st,xx,w,y,m);}
+    return int(cudaGetLastError());
+  }
+  switch(m){case 1:pdl_launch_if(p,c12_gemv_f32<1,4>,g,b,0,st,xx,w,y,m);break;case 2:pdl_launch_if(p,c12_gemv_f32<2,4>,g,b,0,st,xx,w,y,m);break;
+    case 3:case 4:pdl_launch_if(p,c12_gemv_f32<4,4>,g,b,0,st,xx,w,y,m);break;default:pdl_launch_if(p,c12_gemv_f32<8,4>,g,b,0,st,xx,w,y,m);}
+  return int(cudaGetLastError());
+}
+// Load-time proof for the FP32 users: every decoded weight equals its BF16 source bits exactly (mismatches -> *bad).
+__global__ void c12_verify_exact(const uint16_t* __restrict__ W,const C12View w,unsigned long long* bad){
+  const long long t=(long long)blockIdx.x*blockDim.x+threadIdx.x;const int per_row=w.k/8;
+  if(t>=(long long)w.n*per_row)return;
+  const int row=(int)(t/per_row),kbase=(int)(t%per_row)*8,chunk=kbase>>5,lt=(kbase>>3)&3;
+  const uint2 mm=*reinterpret_cast<const uint2*>(w.m8+(((size_t)row*(w.k>>6)+(chunk>>1))*4+lt)*16+(chunk&1)*8);
+  const uint32_t e=*reinterpret_cast<const uint32_t*>(w.e4+(((size_t)row*(w.k>>7)+(chunk>>2))*4+lt)*16+(chunk&3)*4);
+  float f[8];c12_dec8_f32(mm,e,w.eb[row],w,row,kbase,f);unsigned n=0;
+  for(int i=0;i<8;i++) n+=__float_as_uint(f[i])!=((uint32_t)W[(size_t)row*w.k+kbase+i]<<16);
+  if(n)atomicAdd(bad,(unsigned long long)n);
+}
+extern "C" int glm53_c12_verify_exact_cuda(const void* src,const void* m8,const void* e4,const void* eb,const int* ptr,const int* col,const void* val,
+                                           int n,int k,unsigned long long* bad,cudaStream_t st){
+  const C12View v{(const uint8_t*)m8,(const uint8_t*)e4,(const uint8_t*)eb,ptr,col,(const uint16_t*)val,n,k};
+  const long long th=(long long)n*(k/8);
+  c12_verify_exact<<<(unsigned)((th+255)/256),256,0,st>>>((const uint16_t*)src,v,bad);
+  return int(cudaGetLastError());
+}
