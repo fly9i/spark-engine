@@ -25,6 +25,8 @@ pub struct Checkpoint {
     /// Shard loads to the GPU: the files opened with O_DIRECT and a pinned staging buffer (`whole_direct`).
     direct: Vec<Option<File>>,
     staging: std::cell::RefCell<Option<Tensor>>,
+    /// Shard loads: the files read ahead on a background thread (Prefetch), until `finish_prefetch`.
+    prefetch: std::cell::RefCell<Option<Prefetch>>,
 }
 
 /// Bytes per O_DIRECT read of the shard loader (DS41_LOAD_CHUNK_MB, 64).
@@ -58,7 +60,7 @@ impl Checkpoint {
         let meta = &idx["metadata"]["ds41_shard"];
         let mut ck = Checkpoint { dir: dir.into(), maps: vec![], files: vec![], tensors: HashMap::new(), dev, sliced: meta.is_object(),
                                   source: meta["source"].as_str().map(PathBuf::from), record: Default::default(),
-                                  direct: vec![], staging: Default::default() };
+                                  direct: vec![], staging: Default::default(), prefetch: Default::default() };
         // shards go to the GPU through O_DIRECT reads (page-cache reads of the mmap ran at ~0.5 GB/s, O_DIRECT ~10 GB/s)
         let use_direct = ck.sliced && dev.is_cuda() && std::env::var("DS41_DIRECT_LOAD").map_or(true, |v| v != "0");
         for (fi, name) in files.iter().enumerate() {
@@ -80,8 +82,13 @@ impl Checkpoint {
                 std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(&path).ok()
             } else { None });
         }
+        if use_direct && std::env::var("DS41_LOAD_PREFETCH").map_or(true, |v| v != "0") {
+            *ck.prefetch.borrow_mut() = Some(Prefetch::start(&ck.files, dev));
+        }
         ck
     }
+    /// Ends the read-ahead (after the last tensor is loaded): the reader stops, its device buffers are freed.
+    pub fn finish_prefetch(&self) { self.prefetch.borrow_mut().take(); }
     pub fn has(&self, k: &str) -> bool { self.tensors.contains_key(k) }
     /// The files holding none of the tensors `keep`.
     pub fn files_without(&self, keep: &[String]) -> Vec<PathBuf> {
@@ -123,6 +130,11 @@ impl Checkpoint {
     /// The stored tensor in full (shard path).
     fn whole(&self, k: &str, kind: Kind) -> Tensor {
         let t = self.info(k);
+        if t.len > 0 {
+            if let Some(raw) = self.prefetch.borrow_mut().as_mut().and_then(|p| p.get(t.file, t.offset, t.len)) {
+                return from_raw(raw, &t.shape, &t.dtype, kind);
+            }
+        }
         if let Some(Some(f)) = self.direct.get(t.file) {
             if t.len > 0 { return from_raw(self.read_direct(f, t.offset, t.len), &t.shape, &t.dtype, kind); }
         }
@@ -184,6 +196,124 @@ impl Checkpoint {
             done += want;
         }
         dst
+    }
+}
+
+/// Shard read-ahead (DS41_LOAD_PREFETCH, default on; 0: each tensor read when asked). The loader takes the shard files
+/// strictly one after another (global, layer00.., mtp) but the tensors within a file in no particular order, so a
+/// reader thread reads whole files ahead with O_DIRECT into two host buffers of the largest file's size (file i into
+/// buffer i % 2; PageBuf), and the loader copies its tensors out of the file it is on with a GPU kernel that reads the
+/// host memory in place (GB10: CPU and GPU share it; cudaMemcpyAsync from pinned memory held the calling thread for the
+/// copy, ~34 GB/s). The reads (~12 GB/s) overlap the loader's layer processing (the serial read + synchronous copy
+/// per tensor ran at ~6.7 GB/s). Buffer i % 2 is refilled with file i + 2 once the loader moved past file i and the
+/// copies out of it ran (an event).
+struct Prefetch {
+    ready: std::sync::mpsc::Receiver<(usize, usize)>,
+    release: Option<std::sync::mpsc::Sender<super::kern::Event>>,
+    held: std::collections::BTreeMap<usize, usize>,
+    cur: Option<usize>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    dev: Device,
+    /// time the loader waited for the reader, and the time since the start (reported at the end)
+    waited: std::time::Duration, t0: std::time::Instant,
+}
+extern "C" { fn ds41_copy_bytes(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, n: i64, st: *mut std::ffi::c_void) -> i32; }
+/// Anonymous memory on transparent huge pages (the read-ahead buffers: the GPU reads it in place, GB10's pageable
+/// memory access at ~95 GB/s; pinning 2.8 GB with cudaHostAlloc took 1.5 s and freeing it 0.7 s, faulting it in by 4 KiB
+/// pages ~0.7 s, by 2 MiB pages ~0.04 s).
+struct PageBuf { p: *mut u8, n: usize }
+unsafe impl Send for PageBuf {}
+extern "C" {
+    fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
+    fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
+    fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+}
+impl PageBuf {
+    fn new(n: usize) -> PageBuf {
+        const PROT_RW: i32 = 3; const MAP_PRIVATE_ANON: i32 = 0x22; const MADV_HUGEPAGE: i32 = 14;
+        let p = unsafe { mmap(std::ptr::null_mut(), n, PROT_RW, MAP_PRIVATE_ANON, -1, 0) };
+        assert!(!p.is_null() && p as isize != -1, "mmap {n} B");
+        unsafe { madvise(p, n, MADV_HUGEPAGE); }
+        PageBuf { p: p as *mut u8, n }
+    }
+    fn as_mut(&mut self) -> &mut [u8] { unsafe { std::slice::from_raw_parts_mut(self.p, self.n) } }
+}
+impl Drop for PageBuf { fn drop(&mut self) { unsafe { munmap(self.p.cast(), self.n); } } }
+impl Prefetch {
+    fn start(files: &[PathBuf], dev: Device) -> Prefetch {
+        let lens: Vec<usize> = files.iter().map(|p| std::fs::metadata(p).map_or(0, |m| m.len() as usize)).collect();
+        let cap = lens.iter().copied().max().unwrap_or(0).div_ceil(ALIGN) * ALIGN;
+        let (tx_ready, ready) = std::sync::mpsc::channel();
+        let (release, rx_release) = std::sync::mpsc::channel::<super::kern::Event>();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let st = stop.clone();
+        let files: Vec<(PathBuf, usize)> = files.iter().cloned().zip(lens).collect();
+        let thread = std::thread::spawn(move || {
+            use std::os::unix::fs::{FileExt, OpenOptionsExt};
+            const READ: usize = 64 << 20;
+            let mut bufs: Vec<PageBuf> = Vec::new();
+            for (i, (path, len)) in files.iter().enumerate() {
+                let b = i % 2;
+                if bufs.len() <= b { bufs.push(PageBuf::new(cap)); }
+                if i >= 2 {
+                    // released in file order: the next release is file i - 2's, the holder of buffer b; its copies ran
+                    match rx_release.recv() { Ok(ev) => ev.sync(), Err(_) => return }
+                }
+                let Ok(f) = std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path) else { return };
+                let dst = bufs[b].as_mut();
+                let span = len.div_ceil(ALIGN) * ALIGN;
+                let mut off = 0usize;
+                while off < *len {
+                    if st.load(std::sync::atomic::Ordering::Relaxed) { return; }
+                    let end = (off + READ).min(span);
+                    match f.read_at(&mut dst[off..end], off as u64) { Ok(0) | Err(_) => return, Ok(n) => off += n }
+                }
+                if tx_ready.send((i, dst.as_ptr() as usize)).is_err() { return; }
+            }
+            // the buffers stay until the loader is done with them (Drop: device synchronized, release sender dropped)
+            while rx_release.recv().is_ok() {}
+        });
+        Prefetch { ready, release: Some(release), held: Default::default(), cur: None, stop, thread: Some(thread), dev,
+                   waited: Default::default(), t0: std::time::Instant::now() }
+    }
+    /// Bytes [off, off + len) of file `f` as a new device Uint8 tensor; None when that file was already given back.
+    fn get(&mut self, f: usize, off: usize, len: usize) -> Option<Tensor> {
+        if self.cur.is_some_and(|c| f < c) { return None; }
+        // files before this one are done: give their buffers back (in file order) before waiting for this one
+        if self.cur != Some(f) {
+            loop {
+                while let Ok((fi, p)) = self.ready.try_recv() { self.held.insert(fi, p); }
+                let done: Vec<usize> = self.held.keys().copied().filter(|&fi| fi < f).collect();
+                for fi in done {
+                    self.held.remove(&fi);
+                    let ev = super::kern::Event::new();
+                    ev.record();
+                    let _ = self.release.as_ref()?.send(ev);
+                }
+                if self.held.contains_key(&f) { break; }
+                let tw = std::time::Instant::now();
+                let r = self.ready.recv();
+                self.waited += tw.elapsed();
+                let (fi, p) = r.ok()?;
+                self.held.insert(fi, p);
+            }
+            self.cur = Some(f);
+        }
+        let src = self.held[&f] + off;
+        let dst = Tensor::empty([len as i64], (Kind::Uint8, self.dev));
+        assert_eq!(unsafe { ds41_copy_bytes(dst.data_ptr(), src as *const std::ffi::c_void, len as i64, super::kern::current_stream()) }, 0, "ds41_copy_bytes");
+        Some(dst)
+    }
+}
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        eprintln!("[ds41] shard read-ahead: the loader waited {:.1}s of {:.1}s for reads", self.waited.as_secs_f64(), self.t0.elapsed().as_secs_f64());
+        // every copy out of the pinned buffers ran before the reader frees them
+        tch::Cuda::synchronize(0);
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.release.take();
+        if let Some(t) = self.thread.take() { let _ = t.join(); }
     }
 }
 

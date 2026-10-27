@@ -15,6 +15,22 @@ read -ra MASTERS <<< "${SPARK_MASTER_ADDRS:-}"
 (( ${#MASTERS[@]} )) || MASTERS=("${GLM_MASTER_ADDR:-}" "${GLM_MASTER_ADDR:-}" "${GLM_MASTER_ADDR:-}")
 unset _w
 ssho=(-o ControlMaster=auto -o ControlPath=/tmp/spark-ssh-%r@%h:%p -o ControlPersist=60)
+# wait_memory WORLD: after stopping an engine, wait (up to 2 min) until every node has its memory back (MemAvailable >=
+# SPARK_START_MIN_GIB, 100): a rank started while its node still frees the old process stalls in its CUDA / NCCL set-up
+wait_memory() {
+  local world=$1 min=${SPARK_START_MIN_GIB:-100} r a ok
+  for _ in $(seq 240); do
+    ok=1
+    for ((r = 0; r < world; r++)); do
+      if (( r == 0 )); then a=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+      else a=$(ssh "${ssho[@]}" "${WORKERS[$r]}" "awk '/MemAvailable/{print int(\$2/1048576)}' /proc/meminfo" 2>/dev/null || echo "$min"); fi
+      (( a >= min )) || ok=0
+    done
+    (( ok )) && return 0
+    sleep 0.5
+  done
+  echo "MemAvailable stays below $min GiB on some node; starting anyway" >&2
+}
 # need_nodes WORLD: every rank has a worker and an address of rank 0, and runs the same engine binary as this node
 need_nodes() {
   local world=$1 r s0 s

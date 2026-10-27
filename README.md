@@ -34,7 +34,7 @@ checkpoint as served by the current code (greedy, thinking off, the optional con
 | **Decode — structured** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 115.5 / 158.4 / — / 197.9 tok/s | 149.8 / 192.9 / 232.6 / 226.5 tok/s |
 | **Prefill** | ~1,560 tok/s (10K–55K prompts) | ~5,400 tok/s (8K–64K prompts, new text; 4K ~4,600) | ~1,900 tok/s (13K–77K prompts) |
 | **TTFT** (short prompt) | ~370 ms | ~200 ms; 185 ms for a 7K prompt restored from the NVMe prefix cache | ~150 ms |
-| **Startup** (load → serving) | ~33 s | ~30 s (checkpoint in page cache) | ~54 s |
+| **Startup** (load → serving) | ~33 s | ~16 s (cold start, shards read from NVMe) | ~54 s |
 | Speculative decoding | DFlash2 drafter, tree/chain verify | DSpark (the checkpoint's draft stages), drafts per sequence from a cost model | native MTP + prompt-lookup |
 
 "Prose" = a long explanation (lower draft acceptance); "structured" = counting 1–200 (high acceptance). Aggregate is the

@@ -979,10 +979,18 @@ def main():
     p.add_argument("--media-deny-private", action="store_true", help="also refuse private-network media hosts")
     p.add_argument("--canvas-dir", default="/dev/shm/glm53-mm")
     p.add_argument("--canvas-cache-mb", type=int, default=1024, help="LRU of decoded canvases (in-flight ones are always kept)")
+    p.add_argument("--ready-file", default=None, help="start before the engine is ready: load everything, then wait for this file "
+                   "(its content: the max model length) before listening")
     args = p.parse_args()
+    app = App(args)
+    if args.ready_file:
+        # the imports, tokenizer and media set-up above overlapped the engine's start; listen once it is ready
+        while not (os.path.exists(args.ready_file) and open(args.ready_file).read().strip()):
+            time.sleep(0.02)
+        app.max_len = int(open(args.ready_file).read().strip())
     # listen backlog: socketserver default is 5; bursts of 8+ concurrent clients were reset
     ThreadingHTTPServer.request_queue_size = 128
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(App(args)))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(app))
     server.daemon_threads = True
     print(f"[openai-server] http://{args.host}:{args.port}/v1 -> {args.socket}", flush=True)
     server.serve_forever()

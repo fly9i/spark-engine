@@ -409,6 +409,8 @@ extern "C" {
     fn ds41_event_record(e: *mut std::ffi::c_void, st: *mut std::ffi::c_void) -> i32;
     fn ds41_event_sync(e: *mut std::ffi::c_void) -> i32;
     fn ds41_event_free(e: *mut std::ffi::c_void) -> i32;
+    fn ds41_host_alloc(n: usize) -> *mut std::ffi::c_void;
+    fn ds41_host_free(p: *mut std::ffi::c_void) -> i32;
     fn ds41_win_commit_rows(rings: *const std::ffi::c_void, kv: *const std::ffi::c_void, pos: *const i64, t: i32, w: i32, d: i32, st: *mut std::ffi::c_void) -> i32;
 }
 /// DS41_MID_GRAPH: bytes of the device descriptor (shim Multi) of one captured sparse_attn_multi_dev launch.
@@ -447,6 +449,8 @@ pub fn win_commit_rows(rings: *const std::ffi::c_void, kv: &Tensor, pos: &Tensor
     assert!(kv.is_contiguous() && kv.kind() == Kind::BFloat16 && pos.is_contiguous());
     assert_eq!(unsafe { ds41_win_commit_rows(rings, kv.data_ptr(), pos.data_ptr() as *const i64, t as i32, w as i32, d as i32, rs_current_stream()) }, 0, "ds41_win_commit_rows");
 }
+/// The current CUDA stream (raw handle).
+pub fn current_stream() -> *mut std::ffi::c_void { unsafe { rs_current_stream() } }
 /// A CUDA event (fences a decode graph's descriptor staging buffers).
 pub struct Event(*mut std::ffi::c_void);
 impl Drop for Event { fn drop(&mut self) { unsafe { ds41_event_free(self.0); } } }
@@ -456,6 +460,44 @@ impl Event {
     pub fn record(&self) { assert_eq!(unsafe { ds41_event_record(self.0, rs_current_stream()) }, 0, "cudaEventRecord"); }
     /// Waits (host) until the recorded work has run.
     pub fn sync(&self) { assert_eq!(unsafe { ds41_event_sync(self.0) }, 0, "cudaEventSynchronize"); }
+}
+// (the handles are plain CUDA objects, usable from any thread)
+unsafe impl Send for Event {}
+/// Pinned host memory (cudaHostAlloc).
+pub struct HostBuf { p: *mut u8, n: usize }
+unsafe impl Send for HostBuf {}
+impl HostBuf {
+    pub fn new(n: usize) -> HostBuf { let p = unsafe { ds41_host_alloc(n.max(1)) } as *mut u8; assert!(!p.is_null(), "cudaHostAlloc {n} B"); HostBuf { p, n } }
+    pub fn len(&self) -> usize { self.n }
+    pub fn as_mut(&mut self) -> &mut [u8] { unsafe { std::slice::from_raw_parts_mut(self.p, self.n) } }
+    /// The bytes through a shared reference (the caller orders writes against the copies reading them).
+    #[allow(clippy::mut_from_ref)]
+    pub fn bytes(&self) -> &mut [u8] { unsafe { std::slice::from_raw_parts_mut(self.p, self.n) } }
+}
+impl Drop for HostBuf { fn drop(&mut self) { unsafe { ds41_host_free(self.p.cast()); } } }
+thread_local! {
+    /// staged_upload's pinned slots, used in turn, each with the event of its last copy.
+    static STAGED: std::cell::RefCell<(usize, Vec<(HostBuf, Event)>)> = std::cell::RefCell::new((0, Vec::new()));
+}
+/// Small host bytes -> a new device Uint8 tensor without blocking the host: copied into the next of 8 pinned slots
+/// (waiting only for that slot's previous copy), then uploaded on the current stream. A blocking copy from pageable
+/// memory waits for all queued work first.
+pub fn staged_upload(src: &[u8], dev: tch::Device) -> Tensor {
+    let dst = Tensor::empty([src.len() as i64], (Kind::Uint8, dev));
+    if src.is_empty() { return dst; }
+    STAGED.with(|s| {
+        let mut s = s.borrow_mut();
+        let i = s.0;
+        s.0 = (i + 1) % 8;
+        while s.1.len() <= i { s.1.push((HostBuf::new(1 << 16), Event::new())); }
+        let (buf, ev) = &mut s.1[i];
+        ev.sync();
+        if buf.len() < src.len() { *buf = HostBuf::new(src.len().next_power_of_two()); }
+        buf.as_mut()[..src.len()].copy_from_slice(src);
+        h2d(dst.data_ptr(), &buf.as_mut()[..src.len()]);
+        ev.record();
+    });
+    dst
 }
 /// Host bytes -> device memory on the current stream (async: a pinned source must stay put until the copy has run).
 pub fn h2d(dst: *mut std::ffi::c_void, src: &[u8]) {

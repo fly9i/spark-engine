@@ -533,6 +533,40 @@ __global__ void win_commit_rows_kernel(const unsigned long long* __restrict__ ri
 } // namespace
 
 extern "C" {
+// pinned host memory for staged uploads (cudaHostAlloc: torch's pin_memory(device) warns on every call)
+void* ds41_host_alloc(size_t n) { void* p = nullptr; return cudaHostAlloc(&p, n, cudaHostAllocDefault) ? nullptr : p; }
+int ds41_host_free(void* p) { return (int)cudaFreeHost(p); }
+// dst <- src (n bytes) by the GPU; src may be pinned host memory (GB10: the GPU reads it in place, where cudaMemcpyAsync
+// from pinned memory kept the calling thread for the copy's duration)
+}  // extern "C"
+template <class V>
+__global__ void copy_vec_kernel(V* __restrict__ d, const V* __restrict__ s, long long n) {
+  for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) d[i] = s[i];
+}
+template <class V>
+static void copy_vec(void* dst, const void* src, long long n, cudaStream_t st) {
+  if (n <= 0) return;
+  const long long b = (n + 255) / 256;
+  copy_vec_kernel<V><<<(int)(b < 4096 ? b : 4096), 256, 0, st>>>((V*)dst, (const V*)src, n);
+}
+extern "C" {
+int ds41_copy_bytes(void* dst, const void* src, long long n, cudaStream_t st) {
+  if (n <= 0) return 0;
+  // the widest unit dst and src share the alignment of: bytes up to src's boundary, that unit, bytes for the rest
+  const uintptr_t x = (uintptr_t)dst ^ (uintptr_t)src;
+  const int u = (x & 15) == 0 ? 16 : (x & 7) == 0 ? 8 : (x & 3) == 0 ? 4 : 1;
+  long long h = (u - ((uintptr_t)src & (u - 1))) & (u - 1);
+  if (h > n) h = n;
+  const long long nv = (n - h) / u, tail = (n - h) - nv * u;
+  char* d = (char*)dst; const char* s = (const char*)src;
+  copy_vec<unsigned char>(d, s, h, st);
+  if (u == 16) copy_vec<uint4>(d + h, s + h, nv, st);
+  else if (u == 8) copy_vec<uint2>(d + h, s + h, nv, st);
+  else if (u == 4) copy_vec<unsigned int>(d + h, s + h, nv, st);
+  else copy_vec<unsigned char>(d + h, s + h, nv, st);
+  copy_vec<unsigned char>(d + h + nv * u, s + h + nv * u, tail, st);
+  return (int)cudaGetLastError();
+}
 int ds41_win_commit_rows(const void* rings, const void* kv, const int64_t* pos, int t, int w, int d, cudaStream_t st) {
   if (t < 1 || t > w || d % 8) return 1;
   pdl_launch(win_commit_rows_kernel, dim3(t), dim3(64), 0, st, (const unsigned long long*)rings, (const __nv_bfloat16*)kv, pos, w, d);

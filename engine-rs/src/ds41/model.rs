@@ -490,8 +490,8 @@ pub fn take_rows_debug() -> Vec<(String, Tensor)> { ROWS_DBG.with(|d| std::mem::
 /// stream, not when issued, and the host may run calls ahead of the GPU): `fence[i]` follows the last call's uploads
 /// from `host[i]`, waited for before the buffer is rewritten.
 pub struct MidGraph { eager: Vec<Option<usize>>, segs: Vec<crate::tp::graph::Owned>, seg_layers: Vec<Vec<usize>>, seg_eng: Vec<Vec<usize>>, desc: Tensor, slot: usize, rings_at: usize, fence: [super::kern::Event; 2],
-                      host: [Tensor; 2], calls: std::cell::Cell<usize> }
-fn pinned_bytes(t: &Tensor) -> &mut [u8] { unsafe { std::slice::from_raw_parts_mut(t.data_ptr() as *mut u8, t.numel()) } }
+                      host: [super::kern::HostBuf; 2], calls: std::cell::Cell<usize> }
+fn pinned_bytes(b: &super::kern::HostBuf) -> &mut [u8] { b.bytes() }
 pub struct DecodeGraph {
     mg: Option<MidGraph>,
     pos: Tensor, h0: Tensor, rows: HashMap<usize, Tensor>,
@@ -552,9 +552,19 @@ impl Model {
     /// Loads this rank's share of the backbone (layers [0, n_layers); MTP not yet). `engram_hash`: the exported hash
     /// constants (None disables engram, debug only).
     pub fn load(ckpt: &Path, rank: usize, world: usize, n_layers: usize, engram_hash: Option<&Path>, dev: Device) -> Model {
+        Self::load_then(ckpt, rank, world, n_layers, engram_hash, dev, |_| ()).0
+    }
+    /// `load`, also running `side` on the original checkpoint on the thread that opens it, while the shards load
+    /// (serving: the vision encoder).
+    pub fn load_then<T: Send + 'static>(ckpt: &Path, rank: usize, world: usize, n_layers: usize, engram_hash: Option<&Path>, dev: Device,
+                                       side: impl FnOnce(&Checkpoint) -> T + Send + 'static) -> (Model, T) {
         let c = Cfg::load(ckpt);
         let sp = Split::new(&c, rank, world);
         let ck = Checkpoint::open(ckpt, dev);
+        // the original checkpoint (engram tables, vision encoder): its 48 headers (~96k tensors) parsed on a thread
+        // while the shards load (~2 s on the critical path before)
+        let src = ck.source.clone().unwrap_or_else(|| ckpt.to_path_buf());
+        let tables_open = std::thread::spawn(move || { let t = Checkpoint::open(&src, dev); let x = side(&t); (t, x) });
         let fp4 = fp4_table(dev);
         let t0 = std::time::Instant::now();
         let embed = ck.rows("embed.weight", sp.v0, sp.v1 - sp.v0, Kind::BFloat16);
@@ -572,7 +582,7 @@ impl Model {
                     t0.elapsed().as_secs_f64(), a as f64 / (1u64 << 30) as f64, r as f64 / (1u64 << 30) as f64);
             }
         }
-        let tables = Checkpoint::open(ck.source.as_deref().unwrap_or(ckpt), dev);
+        let (tables, side_out) = tables_open.join().expect("checkpoint open thread");
         if hash.is_some() { for l in &c.engram_layers { tables.advise_random(&format!("layers.{l}.engram.embed.weight")); } }
         let mtp = (std::env::var("DS41_MTP").as_deref() == Ok("1") && n_layers >= c.n_layers).then(|| super::spec::Mtp::load(&ck, &c, &sp, &fp4, dev));
         if mtp.is_some() {
@@ -580,6 +590,7 @@ impl Model {
             eprintln!("[ds41] rank{rank} DSpark stages loaded in {:.0}s (allocated {:.1} GiB, reserved {:.1} GiB)", t0.elapsed().as_secs_f64(),
                 a as f64 / (1u64 << 30) as f64, r as f64 / (1u64 << 30) as f64);
         }
+        ck.finish_prefetch();
         if dev.is_cuda() { super::kern::gemv_mx_init(); }
         let head8 = (mtp.is_some() && std::env::var("DS41_DRAFT_HEAD_FP8").map_or(true, |v| v != "0")).then(|| quant_fp8_blocks(&head));
         if dev.is_cuda() && super::kern::c12_on() {
@@ -596,9 +607,9 @@ impl Model {
             let (a, _) = crate::tp::graph::memory();
             eprintln!("[ds41] rank{rank} C12 codings: {:.0} MB in {:.1}s (allocated {:.1} GiB)", bytes as f64 / 1e6, t1.elapsed().as_secs_f64(), a as f64 / (1u64 << 30) as f64);
         }
-        Model { c, sp, ck, tables, dev, embed, head, norm, layers, hash, fp4, graph: std::cell::RefCell::new(HashMap::new()), graph_clock: std::cell::Cell::new(0), mtp, head8,
+        (Model { c, sp, ck, tables, dev, embed, head, norm, layers, hash, fp4, graph: std::cell::RefCell::new(HashMap::new()), graph_clock: std::cell::Cell::new(0), mtp, head8,
                 last_hidden: std::cell::RefCell::new(None), draft_debug: std::cell::RefCell::new(None),
-                mtp_graphs: std::cell::RefCell::new(HashMap::new()) }
+                mtp_graphs: std::cell::RefCell::new(HashMap::new()) }, side_out)
     }
 
     /// The fused kernel's tile layout of the routed experts (the checkpoint layout dropped).
@@ -1230,7 +1241,7 @@ impl Model {
             let slot = rings_at + 16 * 8;
             let nl = self.layers.len();
             let desc = Tensor::zeros([(nl * slot) as i64], (Kind::Uint8, dev));
-            let pinned = [Tensor::zeros([(nl * slot) as i64], (Kind::Uint8, Device::Cpu)).pin_memory(dev), Tensor::zeros([(nl * slot) as i64], (Kind::Uint8, Device::Cpu)).pin_memory(dev)];
+            let pinned = [super::kern::HostBuf::new(nl * slot), super::kern::HostBuf::new(nl * slot)];
             let host = pinned_bytes(&pinned[0]);
             let (mut eager, mut segs, mut seg_layers, mut seg_eng) = (Vec::new(), Vec::new(), vec![Vec::new()], vec![Vec::new()]);
             let scale = (c.head_dim as f64).powf(-0.5);

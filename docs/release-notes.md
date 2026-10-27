@@ -1,21 +1,16 @@
-spark-engine v0.3.2 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
+spark-engine v0.3.3 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
 
-Changes since v0.3.1: DeepSeek-V4.1-Flash only (GLM-5.3-Flash and Qwen3.8-Flash-Next outputs were checked identical).
-Outputs stay bitwise identical. Measured on three DGX Sparks, served, with the 1017 checkpoint (docs/ds41.md §7),
-median of 3 runs:
+Changes since v0.3.2: DeepSeek-V4.1-Flash startup (GLM-5.3-Flash and Qwen3.8-Flash-Next outputs were checked identical).
+Outputs stay bitwise identical; decode speed is unchanged (docs/ds41.md §7).
 
-- **Speculative decoding verifies more drafts per round:** the cost model that picks each sequence's draft count
-  (`DS41_SPEC_COST`) was refitted to the faster decode steps of v0.3.1 (`24,0.6,5` → `22,0.5,2.5`). It changes only
-  how many drafts are verified, never the output. Prose 59.1 → 62.4 tok/s for one stream, 82.1 → 89.6 for two,
-  105.5 → 112.6 for four; structured 115.5 / 158.4 / 197.9; code 100.2 / 133.3 / 148.3 (code for one stream is within
-  run-to-run spread of v0.3.1; in a same-session A/B the refit gave 100.3 → 101.6).
-- **Fix:** with several sequences, the shared expert's parallel stream could still be using mHC-mix scratch buffers that
-  the main stream had already released and reallocated (rare corruption of batched decode). The buffers are now held
-  until the streams join.
-- **Engram rows for decode** are uploaded through pinned memory without blocking, so the upload no longer waits for all
-  queued work; their gather starts on background threads at the beginning of each step.
-- **Experimental, off by default:** `DS41_MID_GRAPH=1` captures the attention middle (sparse attention and window
-  commit) of the layers that are neither KV nor index sources into the decode / verify graphs, with per-step device
-  descriptors. It is bitwise identical but not faster yet; the remaining idle time is in the source layers.
-
-Prefill is unchanged (~5,400 tok/s for 8K–64K prompts).
+- **Startup ~31 s → ~16 s** (cold start, launch to serving, three DGX Sparks):
+  - Shard files are read ahead whole on a thread with O_DIRECT into huge-page host memory, and the loader copies its
+    tensors out with a GPU kernel that reads that memory in place (GB10's CPU and GPU share it). The reads run at about
+    the disk's speed (~11.7 GB/s) while the layers are processed: loading 14 s → 8 s (`DS41_LOAD_PREFETCH`).
+  - The original checkpoint (Engram tables) is opened and the vision encoder loaded on a thread during the shard load.
+  - Only the single-sequence decode / verify graphs are captured before serving; the batched ones are captured in the
+    first ~5 s of idle time after, with their memory set aside when the KV pool is sized (`DS41_WARM_DEFER`):
+    warm-up 8 s → 4 s.
+  - `start-ds41.sh` starts the workers together and the front end alongside the engine (it listens once the engine is
+    ready; `openai_server.py --ready-file`).
+- **Fix:** the decode Engram upload no longer logs two `Tensor.pin_memory(device)` deprecation warnings per step.
