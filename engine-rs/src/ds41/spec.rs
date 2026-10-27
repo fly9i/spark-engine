@@ -92,6 +92,17 @@ const SALT_U: u64 = 0x3c6e_f372_fe94_f82b;
 fn draft_seed(seed: u64, temp: f32, p0: i64) -> u64 {
     if rs_on() && temp > 0.0 { seed ^ SALT_D ^ (p0 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) } else { seed }
 }
+/// DS41_DRAFT_TSCALE (key coupling only, T > 0): the drafts sample at temperature T x this. With the shared keys the
+/// draft is argmax(draft logits / (T s) + G) against the target's argmax(logits / T + G): a sharper draft distribution
+/// matches the target's sample more often. Only which drafts are proposed changes; every emitted token is the target's
+/// own keyed sample, bitwise the same for a seed. Measured 2026-10-28 (DS41_RS_STATS_X, open texts + thinking at T = 1,
+/// 3455 rows): expected acceptance 0.609 at 1.0, 0.619 at 0.6 / 0.7, 0.618 at 0.8, 0.601 at 1.1 (1 - TV: 0.622). Service
+/// A/B with fixed seeds (same 15 texts byte for byte in every arm): tokens per round 1.972 / 1.984 -> 2.013 / 2.022,
+/// 44.3 -> 45.5 tok/s. Default 0.7 (1 = the earlier behaviour).
+fn draft_tscale() -> f32 {
+    static E: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("DS41_DRAFT_TSCALE").ok().and_then(|v| v.parse::<f32>().ok()).filter(|&x| x > 0.0).unwrap_or(0.7))
+}
 /// A uniform in [0, 1) from a key (splitmix64 finalizer, 53 bits).
 fn unif(k: u64) -> f64 {
     let mut z = k.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -185,6 +196,8 @@ impl Model {
     /// Drafts for each sequence (toks[b] at position seqs[b].pos): (draft tokens, confidences), `block` each.
     pub fn mtp_draft(&self, seqs: &[&mut Seq], toks: &[i64], temps: &[f32], seeds: &[u64]) -> (Vec<Vec<i64>>, Vec<Vec<f32>>) {
         let _g = tch::no_grad_guard();
+        let scaled: Vec<f32> = temps.iter().map(|&t| if rs_on() { t } else { t * draft_tscale() }).collect();
+        let temps = &scaled[..];
         assert!(self.mtp.is_some(), "DSpark stages not loaded (DS41_MTP=1)");
         let c = &self.c;
         let dev = self.dev;
@@ -330,13 +343,34 @@ pub fn spec_stats(lg: &Tensor, q: &Tensor, drafts: &[i64], temp: f32, dseed: u64
     // m[r, i, j] = max(p_j / p_i, q_j / q_i)
     let m = (pk.unsqueeze(1) / pk.unsqueeze(2)).maximum(&(qk.unsqueeze(1) / qk.unsqueeze(2)));
     let cpl = m.sum_dim_intlist(&[2i64][..], false, Kind::Double).reciprocal().sum_dim_intlist(&[1i64][..], false, Kind::Double);
-    let h: Vec<f64> = Vec::<f64>::try_from(Tensor::stack(&[ovl, cpl], 1).to_device(Device::Cpu).view(-1)).unwrap();
+    // DS41_RS_STATS_X=1: also the coupling with a tempered draft q^(1 / a) (renormalized over the 512 tokens) for a in
+    // DS41_RS_ALPHAS (0.6,0.7,0.8,0.9,1.1), and the list coupling: P(the target's Gumbel argmax is among the draft's
+    // top 2 / top 3 under the same noise), Monte Carlo over 256 shared Gumbel draws on the 512 tokens
+    let mut cols = vec![ovl, cpl];
+    if std::env::var("DS41_RS_STATS_X").as_deref() == Ok("1") {
+        let alphas: Vec<f64> = std::env::var("DS41_RS_ALPHAS").ok().map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or(vec![0.6, 0.7, 0.8, 0.9, 1.1]);
+        let pkn = &pk / pk.sum_dim_intlist(&[-1i64][..], true, Kind::Double);
+        for &a in &alphas {
+            let qa = qk.log() / a;
+            let qa = (&qa - qa.logsumexp(&[-1i64][..], true)).exp().clamp_min(1e-300);
+            let m = (pkn.unsqueeze(1) / pkn.unsqueeze(2)).maximum(&(qa.unsqueeze(1) / qa.unsqueeze(2)));
+            cols.push(m.sum_dim_intlist(&[2i64][..], false, Kind::Double).reciprocal().sum_dim_intlist(&[1i64][..], false, Kind::Double));
+        }
+        let g = -(-Tensor::rand([d, 256, 512], (Kind::Double, lg.device())).clamp_min(1e-300).log()).log();   // Gumbel
+        let tp = (pk.log().unsqueeze(1) + &g).argmax(-1, false);                                             // [d, 256]
+        let (_, tq) = (qk.log().unsqueeze(1) + &g).topk(3, -1, true, true);                                   // [d, 256, 3]
+        let hit = |k: i64| tq.narrow(2, 0, k).eq_tensor(&tp.unsqueeze(2)).any_dim(2, false).to_kind(Kind::Double).mean_dim(&[1i64][..], false, Kind::Double);
+        cols.push(hit(1)); cols.push(hit(2)); cols.push(hit(3));
+    }
+    let nc = cols.len();
+    let h: Vec<f64> = Vec::<f64>::try_from(Tensor::stack(&cols, 1).to_device(Device::Cpu).view(-1)).unwrap();
     let mut f = f.lock().unwrap();
     use std::io::Write;
     for j in 0..d as usize {
         let chk = super::serve::sample(&q.narrow(0, j as i64, 1), temp, dseed, p0 + j as i64 + 1) == drafts[j];
         let acc = if j < k { 1 } else if j == k { 0 } else { -1 };
-        let _ = writeln!(f, "{} {j} {:.6} {:.6} {acc} {}", rs_on() as i32, h[2 * j], h[2 * j + 1], chk as i32);
+        let extra: String = (2..nc).map(|c| format!(" {:.6}", h[nc * j + c])).collect();
+        let _ = writeln!(f, "{} {j} {:.6} {:.6} {acc} {}{extra}", rs_on() as i32, h[nc * j], h[nc * j + 1], chk as i32);
     }
 }
 /// (the draft key seed under rejection sampling, for ds41-kernel-test)

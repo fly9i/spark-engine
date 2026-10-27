@@ -27,14 +27,18 @@ PROMPTS = {
 
 TEMP = 0.0
 EFFORT = "none"
+DUMP = None   # --dump FILE: append every completion's text (one JSON line per request), to compare arms
 
 
-def stream(url, prompt, n):
+def stream(url, prompt, n, seed=None):
     body = {"model": "x", "messages": [{"role": "user", "content": prompt}], "max_tokens": n, "temperature": TEMP, "top_p": 1,
             "reasoning_effort": EFFORT, "stream": True}
+    if seed is not None:
+        body["seed"] = seed
     t0 = time.time()
     first = last = None
     toks = 0
+    text = []
     req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=900) as r:
         for raw in r:
@@ -44,11 +48,15 @@ def stream(url, prompt, n):
             ch = d.get("choices") or []
             dl = (ch[0].get("delta") or {}) if ch else {}
             if dl.get("content") or dl.get("reasoning_content"):   # (thinking: the reasoning tokens count too)
+                text.append((dl.get("reasoning_content") or "") + (dl.get("content") or ""))
                 now = time.time()
                 first = first or now
                 last = now
             if d.get("usage"):
                 toks = d["usage"].get("completion_tokens", toks)
+    if DUMP:
+        with open(DUMP, "a") as f:
+            f.write(json.dumps({"prompt": prompt, "seed": seed, "text": "".join(text)}, ensure_ascii=False) + "\n")
     return {"ttft_ms": (first - t0) * 1e3, "first": first, "last": last, "tokens": toks or n}
 
 
@@ -60,15 +68,19 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--effort", default="none", help="reasoning_effort (none: thinking off)")
+    ap.add_argument("--seed", type=int, default=None, help="request i of a run gets seed + i (sampled runs reproducible across arms)")
+    ap.add_argument("--dump", default=None)
     a = ap.parse_args()
     global TEMP, EFFORT
     TEMP, EFFORT = a.temperature, a.effort
+    global DUMP
+    DUMP = a.dump
     stream(a.url, PROMPTS["prose"], 32)   # warmup
     for kind in a.types.split(","):
         for c in [int(x) for x in a.conc.split(",")]:
             out = [None] * c
             # one prompt per stream with a distinct first line (no shared prefix-cache block)
-            th = [threading.Thread(target=lambda i=i: out.__setitem__(i, stream(a.url, f"{i}\n{PROMPTS[kind]}", a.max_tokens))) for i in range(c)]
+            th = [threading.Thread(target=lambda i=i: out.__setitem__(i, stream(a.url, f"{i}\n{PROMPTS[kind]}", a.max_tokens, None if a.seed is None else a.seed + i))) for i in range(c)]
             [t.start() for t in th]
             [t.join() for t in th]
             per = [(o["tokens"] - 1) / (o["last"] - o["first"]) for o in out]
