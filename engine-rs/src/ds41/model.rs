@@ -224,6 +224,12 @@ fn ar_prefill(y: &Tensor) {
     prof("allreduce", || crate::tp::allreduce(y));
 }
 /// DS41_ENGRAM_JIT (default on; 0 off): decode graphs upload an engram layer's rows right before its first segment.
+/// DS41_MID_GRAPH=1 (default off): the decode / verify graphs include the attention middle of the layers that are
+/// neither KV nor index sources (MidGraph), up to 16 rows. Bitwise the default path (golden suite, 32-step batched
+/// decode), but no measured gain (2026-10-27: ds41-spec p2 59.5 vs 59.6 tok/s, decode B=1 26.33 vs 26.36 ms, service
+/// prose c1 59.5 vs 59.7): the rounds are GPU-bound, the idle left sits at the eight source layers, whose middle
+/// (compressor, indexer) stays eager; kept for when that part takes device-side lengths too.
+fn mid_graph_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_MID_GRAPH").is_ok_and(|v| v == "1")) }
 fn engram_jit_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_ENGRAM_JIT").map_or(true, |v| v != "0")) }
 /// DS41_QAKV_SPLIT (default on; 0 off): decode-sized joint q / kv projections split by rows over the ranks plus an
 /// all-gather (Attn::qakv_mine) instead of every rank projecting all rows.
@@ -470,11 +476,24 @@ fn rows_dbg(i: usize, mid: &[Tensor; 4], o: &Tensor, h: &[Tensor; 5]) {
         let mut d = d.borrow_mut();
         for (nm, t) in [("x", &mid[0]), ("qr", &mid[1]), ("q", &mid[2]), ("kv", &mid[3]), ("o", o), ("y", &h[0]), ("h2", &h[1]), ("x2", &h[2]), ("moe", &h[3]), ("h", &h[4])] {
             d.push((format!("L{i}.{nm}"), t.narrow(0, 0, 1).to_kind(Kind::Float).to_device(Device::Cpu)));
+            d.push((format!("L{i}.{nm}#last"), t.narrow(0, t.size()[0] - 1, 1).to_kind(Kind::Float).to_device(Device::Cpu)));
         }
     });
 }
 pub fn take_rows_debug() -> Vec<(String, Tensor)> { ROWS_DBG.with(|d| std::mem::take(&mut *d.borrow_mut())) }
+/// DS41_MID_GRAPH: the step as segments cut only at the layers whose middle stays eager (`eager`, in order): segment k
+/// runs up to the attention input of eager[k] (then its middle runs eagerly), segment k + 1 from its attention output on
+/// (eager[k] None: a plain cut, before the first engram layer -- its rows are uploaded between the two);
+/// the other layers' middles are inside the segments, reading `desc` (per layer `slot` bytes: the attention's Multi, the
+/// rows' ring pointers at `rings_at`), rewritten before each segment.
+/// `host`: two pinned staging copies of `desc` used by alternate calls (an upload reads its source when it runs on the
+/// stream, not when issued, and the host may run calls ahead of the GPU): `fence[i]` follows the last call's uploads
+/// from `host[i]`, waited for before the buffer is rewritten.
+pub struct MidGraph { eager: Vec<Option<usize>>, segs: Vec<crate::tp::graph::Owned>, seg_layers: Vec<Vec<usize>>, seg_eng: Vec<Vec<usize>>, desc: Tensor, slot: usize, rings_at: usize, fence: [super::kern::Event; 2],
+                      host: [Tensor; 2], calls: std::cell::Cell<usize> }
+fn pinned_bytes(t: &Tensor) -> &mut [u8] { unsafe { std::slice::from_raw_parts_mut(t.data_ptr() as *mut u8, t.numel()) } }
 pub struct DecodeGraph {
+    mg: Option<MidGraph>,
     pos: Tensor, h0: Tensor, rows: HashMap<usize, Tensor>,
     s1: Vec<crate::tp::graph::Owned>, s3: Vec<crate::tp::graph::Owned>, fin: crate::tp::graph::Owned,
     mid: Vec<[Tensor; 4]>,   // S1 outputs read by the middle: x, qr, q, kv
@@ -1065,6 +1084,15 @@ impl Model {
         let flat: Vec<i64> = ids.iter().flatten().copied().collect();
         let e = self.embed(&Tensor::from_slice(&flat).to_device(dev));                  // [R, dim]
         let engram_layers: Vec<usize> = self.hash.as_ref().map_or(vec![], |h| h.layer_ids.iter().copied().filter(|l| self.layers.iter().any(|x| x.id == *l)).collect());
+        // the engram rows of every engram layer gathered (host) on background threads from here on, so the reads overlap
+        // this call's set-up and the layers before them (engram_rows takes them; the same bytes)
+        if let (Some(hs), true) = (&self.hash, engram_jit_on() && total <= 16) {
+            for (li, &l) in engram_layers.iter().enumerate() {
+                let all: Vec<i64> = hashes.iter().flat_map(|h| h[li].iter().copied()).collect();
+                let hd = engram::rows_async(&self.tables, l, all, hs.head_dim);
+                ENGRAM_PENDING.with(|p| p.borrow_mut().insert(l, hd));
+            }
+        }
         let rows_now = |li: usize, l: usize| -> Tensor {
             let all: Vec<i64> = hashes.iter().flat_map(|h| h[li].iter().copied()).collect();
             self.engram_rows(l, &all, total)
@@ -1126,15 +1154,44 @@ impl Model {
             // uploaded right before its S1, so the fetch overlaps the GPU running the layers before it (same rows,
             // same stream order before their only reader)
             let jit = engram_jit_on();
-            let mut upload = |l: usize, g: &mut DecodeGraph| {
+            let upload = |l: usize, rows: &mut HashMap<usize, Tensor>| {
                 if let Some(li) = engram_layers.iter().position(|x| *x == l) {
-                    if let Some(r) = g.rows.get_mut(&l) { let _ = r.copy_(&prof("engram", || rows_now(li, l))); }
+                    if let Some(r) = rows.get_mut(&l) { let _ = r.copy_(&prof("engram", || rows_now(li, l))); }
                 }
             };
-            if !jit { for &l in &engram_layers { upload(l, g); } }
+            if !jit { for &l in &engram_layers { upload(l, &mut g.rows); } }
             let mut sh: Vec<Shared> = (0..seqs.len()).map(|_| Shared::default()).collect();
+            if g.mg.is_some() {
+                let DecodeGraph { mg, rows, mid, pos, obuf, hs, .. } = &mut *g;
+                let mg = mg.as_ref().unwrap();
+                // this call's staging buffer: the call two back uploaded from it, wait until those copies ran
+                let cur = mg.calls.get() % 2;
+                mg.fence[cur].sync();
+                for k in 0..mg.segs.len() {
+                    if jit { for &l in &mg.seg_eng[k] { upload(l, rows); } }
+                    if let (Some(&f), Some(&last)) = (mg.seg_layers[k].first(), mg.seg_layers[k].last()) {
+                        let buf = pinned_bytes(&mg.host[cur]);
+                        for &i in &mg.seg_layers[k] {
+                            assert!(self.mid_fill(&self.layers[i], &mid[i][3], pos, seqs, &offs, &key, &starts, &mut sh, mg.rings_at, &mut buf[i * mg.slot..(i + 1) * mg.slot]),
+                                    "captured attention middle no longer applicable");
+                        }
+                        super::kern::h2d(unsafe { (mg.desc.data_ptr() as *mut u8).add(f * mg.slot) }.cast(), &buf[f * mg.slot..(last + 1) * mg.slot]);
+                    }
+                    let snaps = self.mid_ck_pre(&mg.seg_layers[k], seqs, &key, &starts);
+                    prof("graph.seg", || mg.segs[k].replay());
+                    self.mid_ck_post(snaps, mid, pos, seqs, &offs, &starts);
+                    if let Some(&Some(i)) = mg.eager.get(k) { let _ = run_mid(&self.layers[i], &mid[i], pos, Some(&obuf[i]), &mut sh, seqs); }
+                }
+                mg.fence[cur].record();
+                mg.calls.set(mg.calls.get() + 1);
+                for i in 0..self.layers.len() { rows_dbg(i, &mid[i], &obuf[i], &hs[i]); }
+                prof("graph.fin", || g.fin.replay());
+                if debug_rows() { ROWS_DBG.with(|d| d.borrow_mut().push(("logits".into(), g.logits.narrow(0, 0, 1).to_device(Device::Cpu)))); }
+                for (s, &n) in seqs.iter_mut().zip(&key) { s.advance(n as i64); }
+                return (g.logits.copy(), g.hid.as_ref().map(|h| h.copy()));
+            }
             for (i, layer) in self.layers.iter().enumerate() {
-                if jit { upload(layer.id, g); }
+                if jit { upload(layer.id, &mut g.rows); }
                 prof("graph.s1", || g.s1[i].replay());
                 let _ = run_mid(layer, &g.mid[i], &g.pos, Some(&g.obuf[i]), &mut sh, seqs);
                 prof("graph.s3", || g.s3[i].replay());
@@ -1165,6 +1222,108 @@ impl Model {
         let (mut h, mut pre_mix) = (h0.shallow_clone(), pre0.shallow_clone());
         let mut sh: Vec<Shared> = (0..seqs.len()).map(|_| Shared::default()).collect();
         let mut hid_parts = Vec::new();
+        if mid_graph_on() && total <= 16 && attn_fused() && attn_multi_on() && ops_fused() && !parity() && graph_on() {
+            // DS41_MID_GRAPH: one capture per segment (see MidGraph); a captured middle's descriptor for this step is
+            // filled while capturing and uploaded before the segment's first replay
+            let mb = super::kern::attn_multi_bytes();
+            let rings_at = (mb + 255) / 256 * 256;
+            let slot = rings_at + 16 * 8;
+            let nl = self.layers.len();
+            let desc = Tensor::zeros([(nl * slot) as i64], (Kind::Uint8, dev));
+            let pinned = [Tensor::zeros([(nl * slot) as i64], (Kind::Uint8, Device::Cpu)).pin_memory(dev), Tensor::zeros([(nl * slot) as i64], (Kind::Uint8, Device::Cpu)).pin_memory(dev)];
+            let host = pinned_bytes(&pinned[0]);
+            let (mut eager, mut segs, mut seg_layers, mut seg_eng) = (Vec::new(), Vec::new(), vec![Vec::new()], vec![Vec::new()]);
+            let scale = (c.head_dim as f64).powf(-0.5);
+            // ends the open capture, uploads its descriptors, replays it (checkpoint rings around the replay)
+            let close = |segs: &mut Vec<Owned>, layers_k: &[usize], host: &[u8], mid: &[[Tensor; 4]], seqs: &mut [&mut Seq]| {
+                end().expect("capture end");
+                let g = Owned::take();
+                if let (Some(&f), Some(&last)) = (layers_k.first(), layers_k.last()) {
+                    super::kern::h2d(unsafe { (desc.data_ptr() as *mut u8).add(f * slot) }.cast(), &host[f * slot..(last + 1) * slot]);
+                }
+                let snaps = self.mid_ck_pre(layers_k, seqs, &key, &starts);
+                g.replay();
+                self.mid_ck_post(snaps, mid, &pos, seqs, &offs, &starts);
+                segs.push(g);
+            };
+            begin_pool(super::mem::GRAPH_POOL).expect("capture begin");
+            for (i, layer) in self.layers.iter().enumerate() {
+                let l = layer.id;
+                // the first segment ends before an engram layer: its rows' upload (waiting for their gather) then
+                // overlaps the layers before it on the GPU
+                if engram_jit_on() && engram_layers.contains(&l) && segs.is_empty() && i > 0 {
+                    close(&mut segs, seg_layers.last().unwrap(), host, &mid, seqs);
+                    eager.push(None);
+                    seg_layers.push(Vec::new());
+                    seg_eng.push(Vec::new());
+                    begin_pool(super::mem::GRAPH_POOL).expect("capture begin");
+                }
+                if engram_layers.contains(&l) { seg_eng.last_mut().unwrap().push(l); }
+                let hh = match (&layer.engram, rows.get(&l)) { (Some(en), Some(r)) => self.engram(en, &h, r), _ => h.shallow_clone() };
+                if want_hid && c.dspark_targets.contains(&l) { hid_parts.push(hh.mean_dim([1].as_slice(), false, Kind::BFloat16)); }
+                let (a_pre, a_post, a_comb) = self.hc_mixes_jobs(&hh, &layer.hc.attn_fn, &layer.hc.attn_scale, &layer.hc.attn_base);
+                let x = site_z(&layer.attn_norm, &Self::hc_pre(&hh, &pre_mix), c.norm_eps);
+                let (qr, q, kv) = self.attn_in(layer, &x, &pos);
+                assert!(super::kern::hc_jobs_done(), "mHC mix jobs left after the attention input");
+                let m4 = [x, qr, q, kv];
+                let in_graph = self.mid_in_graph(l)
+                    && self.mid_fill(layer, &m4[3], &pos, seqs, &offs, &key, &starts, &mut sh, rings_at, &mut host[i * slot..(i + 1) * slot]);
+                let o = if in_graph {
+                    let v = self.mid_seqs(layer, &m4[3], &pos, seqs, &offs, &key, &starts, &mut sh);
+                    let refs: Vec<_> = v.iter().map(|(a, b, cc, ix, st, lo)| (a, b, cc.as_ref(), ix, *st, *lo)).collect();
+                    let o = Tensor::empty_like(&m4[2]);
+                    let md = unsafe { (desc.data_ptr() as *const u8).add(i * slot) };
+                    let _ = super::kern::sparse_attn_multi_dev(&m4[2], &refs, c.window, &pos, &layer.attn.sink, scale, &o, md.cast());
+                    super::kern::win_commit_rows(unsafe { md.add(rings_at) }.cast(), &m4[3], &pos, c.window);
+                    seg_layers.last_mut().unwrap().push(i);
+                    o
+                } else {
+                    close(&mut segs, seg_layers.last().unwrap(), host, &mid, seqs);
+                    eager.push(Some(i));
+                    // (the middle reads the S1 outputs of this layer, already in `m4`; earlier layers' via `mid`)
+                    let o = run_mid(layer, &m4, &pos, None, &mut sh, seqs).unwrap();
+                    seg_layers.push(Vec::new());
+                    seg_eng.push(Vec::new());
+                    begin_pool(super::mem::GRAPH_POOL).expect("capture begin");
+                    o
+                };
+                let y = self.attn_out(layer, &o, &pos);
+                let h2 = Self::hc_post(&y, &hh, &a_post, &a_comb);
+                let (f_pre, f_post, f_comb) = self.hc_mixes_jobs(&h2, &layer.hc.ffn_fn, &layer.hc.ffn_scale, &layer.hc.ffn_base);
+                let x2 = site_z(&layer.ffn_norm, &Self::hc_pre(&h2, &a_pre), c.norm_eps);
+                let m = self.moe(&layer.moe, &x2);
+                assert!(super::kern::hc_jobs_done(), "mHC mix jobs left after the MoE");
+                let h3 = Self::hc_post(&m, &h2, &f_post, &f_comb);
+                let hd = [y.shallow_clone(), h2.shallow_clone(), x2.shallow_clone(), m.shallow_clone(), h3.shallow_clone()];
+                keep.extend([hh, a_pre, a_post, a_comb, y, h2, f_post, f_comb, x2, m]);
+                mid.push(m4);
+                obuf.push(o);
+                hs.push(hd);
+                h = h3;
+                pre_mix = f_pre;
+                keep.extend([h.shallow_clone(), pre_mix.shallow_clone()]);
+            }
+            close(&mut segs, seg_layers.last().unwrap(), host, &mid, seqs);
+            for i in 0..mid.len() { rows_dbg(i, &mid[i], &obuf[i], &hs[i]); }
+            begin_pool(super::mem::GRAPH_POOL).expect("capture begin");
+            let x = crate::ablate::clamp_final(rmsn(&Self::hc_pre(&h, &pre_mix), &self.norm, c.norm_eps));
+            let logits = self.logits(&x);
+            let hid = (!hid_parts.is_empty()).then(|| Tensor::cat(&hid_parts, 1));
+            end().expect("capture end");
+            let fin = Owned::take();
+            fin.replay();
+            if debug_rows() { ROWS_DBG.with(|d| d.borrow_mut().push(("logits".into(), logits.narrow(0, 0, 1).to_device(Device::Cpu)))); }
+            keep.push(x);
+            keep.extend(hid_parts);
+            for (s, &n) in seqs.iter_mut().zip(&key) { s.advance(n as i64); }
+            let out = (logits.copy(), hid.as_ref().map(|h| h.copy()));
+            let fence = [super::kern::Event::new(), super::kern::Event::new()];
+            fence[0].record();
+            let mg = MidGraph { eager, segs, seg_layers, seg_eng, desc, slot, rings_at, fence, host: pinned, calls: std::cell::Cell::new(1) };
+            graphs.insert(gkey, DecodeGraph { mg: Some(mg), pos, h0, rows, s1: Vec::new(), s3: Vec::new(), fin, mid, obuf, hs, logits, hid, used: self.graph_clock.get(), _keep: keep });
+            super::mem::occupy();
+            return out;
+        }
         for layer in &self.layers {
             let l = layer.id;
             begin_pool(super::mem::GRAPH_POOL).expect("capture begin");
@@ -1219,9 +1378,63 @@ impl Model {
         keep.extend(hid_parts);
         for (s, &n) in seqs.iter_mut().zip(&key) { s.advance(n as i64); }
         let out = (logits.copy(), hid.as_ref().map(|h| h.copy()));
-        graphs.insert(gkey, DecodeGraph { pos, h0, rows, s1, s3, fin, mid, obuf, hs, logits, hid, used: self.graph_clock.get(), _keep: keep });
+        graphs.insert(gkey, DecodeGraph { mg: None, pos, h0, rows, s1, s3, fin, mid, obuf, hs, logits, hid, used: self.graph_clock.get(), _keep: keep });
         super::mem::occupy();
         out
+    }
+
+    /// DS41_MID_GRAPH: layers whose middle (sparse attention + window commit) runs inside the decode / verify graphs: not a
+    /// KV or index source (those keep their compressor / indexer in the eager middle).
+    fn mid_in_graph(&self, l: usize) -> bool { !self.c.is_kv_source(l) && !self.c.is_index_source(l) }
+    /// The sparse attention inputs of a captured middle for this step's sequences: (ring, the sequence's chunk keys,
+    /// compressed pool, indices, start, lo) as attn_prep gives them (no compressor / indexer work for these layers).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn mid_seqs(&self, layer: &Layer, kv: &Tensor, pos: &Tensor, seqs: &mut [&mut Seq], offs: &[i64], key: &[usize], starts: &[i64], sh: &mut [Shared])
+        -> Vec<(Tensor, Tensor, Option<Tensor>, Tensor, i64, i64)> {
+        seqs.iter_mut().enumerate().map(|(b, seq)| {
+            let r = |t: &Tensor| t.narrow(0, offs[b], key[b] as i64);
+            let kb = r(kv);
+            let (ring, ckv, ci) = self.attn_prep(layer, &kb, &kb, seq, &r(pos), starts[b], &mut sh[b]);
+            (ring, kb, ckv, ci, starts[b], sh[b].win_lo)
+        }).collect()
+    }
+    /// The device descriptor bytes of a captured middle (attention Multi at 0, ring pointers per row at `rings_at`) for
+    /// this step; false when the batched attention does not take these sequences.
+    #[allow(clippy::too_many_arguments)]
+    fn mid_fill(&self, layer: &Layer, kv: &Tensor, pos: &Tensor, seqs: &mut [&mut Seq], offs: &[i64], key: &[usize], starts: &[i64], sh: &mut [Shared],
+                rings_at: usize, buf: &mut [u8]) -> bool {
+        let v = self.mid_seqs(layer, kv, pos, seqs, offs, key, starts, sh);
+        if v.iter().any(|s| !s.0.is_contiguous() || s.0.kind() != Kind::BFloat16) { return false; }
+        let refs: Vec<_> = v.iter().map(|(a, b, c, i, s, l)| (a, b, c.as_ref(), i, *s, *l)).collect();
+        // (a fused capture needs at most MAXT tiles per split: K <= window + index top-k stays far below that)
+        if super::kern::attn_multi_build(&refs, self.c.window, pos, self.sp.local_heads(&self.c), &mut buf[..rings_at]) != Some(true) { return false; }
+        let mut row = 0;
+        for (b, s) in v.iter().enumerate() {
+            for _ in 0..key[b] { buf[rings_at + 8 * row..rings_at + 8 * row + 8].copy_from_slice(&(s.0.data_ptr() as u64).to_le_bytes()); row += 1; }
+        }
+        true
+    }
+    /// Checkpoint positions (prefix cache) inside this step's rows: the ring of every captured-middle layer in `layers`
+    /// as a chunk ending there leaves it (attn_commit's ck_req handling): copies taken before the replay commits ...
+    fn mid_ck_pre(&self, layers: &[usize], seqs: &[&mut Seq], key: &[usize], starts: &[i64]) -> Vec<(usize, i64, usize, Tensor)> {
+        let mut v = Vec::new();
+        if !ops_fused() { return v; }
+        for (b, seq) in seqs.iter().enumerate() {
+            for &p in &seq.ck_req {
+                if p > starts[b] && p <= starts[b] + key[b] as i64 {
+                    for &i in layers { let l = self.layers[i].id; if seq.win[l].is_contiguous() { v.push((b, p, i, seq.win[l].copy())); } }
+                }
+            }
+        }
+        v
+    }
+    /// ... and, after it, the chunk's rows up to the checkpoint committed into those copies.
+    fn mid_ck_post(&self, snaps: Vec<(usize, i64, usize, Tensor)>, mid: &[[Tensor; 4]], pos: &Tensor, seqs: &mut [&mut Seq], offs: &[i64], starts: &[i64]) {
+        for (b, p, i, ring) in snaps {
+            let n = p - starts[b];
+            super::kern::win_commit(&ring, &mid[i][3].narrow(0, offs[b], n), &pos.narrow(0, offs[b], n));
+            seqs[b].ck_cap.entry(p).or_default().win.insert(self.layers[i].id, ring);
+        }
     }
 
     /// One chunk: tokens `ids` at positions [seq.pos, seq.pos + T). Returns the final hidden states [T, dim] BF16 of the

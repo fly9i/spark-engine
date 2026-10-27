@@ -172,9 +172,14 @@ pub fn dequant(q: &Tensor, s: &Tensor) -> Tensor {
 
 /// Rows as BF16 [n, head_dim] on `dev` from the gathered FP8 bytes and E8M0 scales; the buffers go back to the pool.
 pub fn upload(wbuf: Vec<u8>, sbuf: Vec<u8>, n: i64, head_dim: i64, dev: tch::Device) -> Tensor {
-    // straight from the buffers (no CPU tensor copy first); a blocking copy from pageable memory, so the buffers are free
-    // again when it returns
-    let dev_bytes = |b: &Vec<u8>| unsafe { Tensor::from_blob(b.as_ptr(), &[b.len() as i64], &[], Kind::Uint8, tch::Device::Cpu) }.to_device(dev);
+    // large (prefill): straight from the buffers, a blocking copy from pageable memory, so the buffers are free again
+    // when it returns. Small (decode): staged in pinned memory and copied without blocking -- a blocking copy waits for
+    // everything queued before it (the layers before the engram layer, ~6 ms of a verify step), and the GPU then waits
+    // for the host to queue the rest; the pinned block is reused only after its copy ran (torch's host allocator)
+    let dev_bytes = |b: &Vec<u8>| {
+        let t = unsafe { Tensor::from_blob(b.as_ptr(), &[b.len() as i64], &[], Kind::Uint8, tch::Device::Cpu) };
+        if b.len() <= 1 << 20 { t.pin_memory(dev).to_device_(dev, Kind::Uint8, true, false) } else { t.to_device(dev) }
+    };
     let (wd, sd) = (dev_bytes(&wbuf), dev_bytes(&sbuf));
     give(wbuf);
     give(sbuf);

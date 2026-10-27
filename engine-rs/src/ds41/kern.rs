@@ -383,9 +383,7 @@ pub fn sparse_attn_multi(q: &Tensor, seqs: &[(&Tensor, &Tensor, Option<&Tensor>,
     if d != 512 || h > 32 || t > 16 || !bf(q) || !bf(out) || out.size() != q.size() || pos.kind() != Kind::Int64 || !pos.is_contiguous() { return false; }
     if seqs.iter().any(|(a, b, c, i, _, _)| !bf(a) || !bf(b) || c.is_some_and(|c| !bf(c)) || i.kind() != Kind::Int64 || !i.is_contiguous()) { return false; }
     if seqs.iter().map(|s| s.1.size()[0]).sum::<i64>() != t { return false; }
-    let desc: Vec<AttnSeq> = seqs.iter().map(|(a, b, c, i, start, lo)| AttnSeq {
-        a: a.data_ptr(), b: b.data_ptr(), c: c.map_or(std::ptr::null(), |c| c.data_ptr() as *const std::ffi::c_void), idx: i.data_ptr() as *const i64,
-        start: *start, lo: *lo, na: a.size()[0] as i32, n: b.size()[0] as i32, k: (w + i.size()[1]) as i32, pad: 0 }).collect();
+    let desc = attn_descs(seqs, w);
     let sink = sink.to_kind(Kind::Float).contiguous();
     let wsb = unsafe { ds41_sparse_attn_ws_bytes(t as i32, h as i32) } as i64;
     let ws = Tensor::empty([wsb], (Kind::Uint8, q.device()));
@@ -394,6 +392,74 @@ pub fn sparse_attn_multi(q: &Tensor, seqs: &[(&Tensor, &Tensor, Option<&Tensor>,
     if rc == 2 { return false; }
     assert_eq!(rc, 0, "ds41_sparse_attn_multi");
     true
+}
+
+fn attn_descs(seqs: &[(&Tensor, &Tensor, Option<&Tensor>, &Tensor, i64, i64)], w: i64) -> Vec<AttnSeq> {
+    seqs.iter().map(|(a, b, c, i, start, lo)| AttnSeq {
+        a: a.data_ptr(), b: b.data_ptr(), c: c.map_or(std::ptr::null(), |c| c.data_ptr() as *const std::ffi::c_void), idx: i.data_ptr() as *const i64,
+        start: *start, lo: *lo, na: a.size()[0] as i32, n: b.size()[0] as i32, k: (w + i.size()[1]) as i32, pad: 0 }).collect()
+}
+extern "C" {
+    fn ds41_sparse_attn_multi_dev(q: *const std::ffi::c_void, seqs: *const AttnSeq, nseq: i32, w: i32, pos: *const i64, sink: *const f32, out: *mut std::ffi::c_void,
+                                  h: i32, scale: f32, ws: *mut std::ffi::c_void, md: *const std::ffi::c_void, fused: *mut i32, st: *mut std::ffi::c_void) -> i32;
+    fn ds41_attn_multi_build(seqs: *const AttnSeq, nseq: i32, w: i32, pos: *const i64, h: i32, out: *mut std::ffi::c_void) -> i32;
+    fn ds41_attn_multi_bytes() -> usize;
+    fn ds41_h2d(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, n: usize, st: *mut std::ffi::c_void) -> i32;
+    fn ds41_event_new() -> *mut std::ffi::c_void;
+    fn ds41_event_record(e: *mut std::ffi::c_void, st: *mut std::ffi::c_void) -> i32;
+    fn ds41_event_sync(e: *mut std::ffi::c_void) -> i32;
+    fn ds41_event_free(e: *mut std::ffi::c_void) -> i32;
+    fn ds41_win_commit_rows(rings: *const std::ffi::c_void, kv: *const std::ffi::c_void, pos: *const i64, t: i32, w: i32, d: i32, st: *mut std::ffi::c_void) -> i32;
+}
+/// DS41_MID_GRAPH: bytes of the device descriptor (shim Multi) of one captured sparse_attn_multi_dev launch.
+pub fn attn_multi_bytes() -> usize { unsafe { ds41_attn_multi_bytes() } }
+/// The descriptor sparse_attn_multi would pass for these sequences, written into `out` (host bytes for the device copy
+/// a captured sparse_attn_multi_dev reads). None: not supported (as sparse_attn_multi); Some(false): written, but a
+/// fused launch does not take these rows (too many tiles per split).
+pub fn attn_multi_build(seqs: &[(&Tensor, &Tensor, Option<&Tensor>, &Tensor, i64, i64)], w: i64, pos: &Tensor, h: i64, out: &mut [u8]) -> Option<bool> {
+    assert!(out.len() >= attn_multi_bytes());
+    let desc = attn_descs(seqs, w);
+    match unsafe { ds41_attn_multi_build(desc.as_ptr(), desc.len() as i32, w as i32, pos.data_ptr() as *const i64, h as i32, out.as_mut_ptr().cast()) } {
+        0 => Some(true),
+        1 => Some(false),
+        _ => None,
+    }
+}
+/// sparse_attn_multi reading the rows' pools, indices, K and splits from the device descriptor `md` (graph capture;
+/// the sequences here only fix the row count and the launch kind, which a replay keeps). Returns whether the fused
+/// launch was captured (a replay needs attn_multi_build's Some(true) then).
+#[allow(clippy::too_many_arguments)]
+pub fn sparse_attn_multi_dev(q: &Tensor, seqs: &[(&Tensor, &Tensor, Option<&Tensor>, &Tensor, i64, i64)], w: i64, pos: &Tensor, sink: &Tensor, scale: f64, out: &Tensor, md: *const std::ffi::c_void) -> bool {
+    let (t, h) = (q.size()[0], q.size()[1]);
+    assert!(q.is_contiguous() && out.is_contiguous() && out.size() == q.size() && t <= 16 && pos.is_contiguous());
+    let desc = attn_descs(seqs, w);
+    let sink = sink.to_kind(Kind::Float).contiguous();
+    let wsb = unsafe { ds41_sparse_attn_ws_bytes(t as i32, h as i32) } as i64;
+    let ws = Tensor::empty([wsb], (Kind::Uint8, q.device()));
+    let mut fused = 0i32;
+    assert_eq!(unsafe { ds41_sparse_attn_multi_dev(q.data_ptr(), desc.as_ptr(), desc.len() as i32, w as i32, pos.data_ptr() as *const i64, sink.data_ptr() as *const f32,
+        out.data_ptr(), h as i32, scale as f32, ws.data_ptr(), md, &mut fused, rs_current_stream()) }, 0, "ds41_sparse_attn_multi_dev");
+    fused != 0
+}
+/// win_commit of every row into its own sequence's ring: rings = device array of t ring pointers (rewritten per replay).
+pub fn win_commit_rows(rings: *const std::ffi::c_void, kv: &Tensor, pos: &Tensor, w: i64) {
+    let (t, d) = (kv.size()[0], kv.size()[1]);
+    assert!(kv.is_contiguous() && kv.kind() == Kind::BFloat16 && pos.is_contiguous());
+    assert_eq!(unsafe { ds41_win_commit_rows(rings, kv.data_ptr(), pos.data_ptr() as *const i64, t as i32, w as i32, d as i32, rs_current_stream()) }, 0, "ds41_win_commit_rows");
+}
+/// A CUDA event (fences a decode graph's descriptor staging buffers).
+pub struct Event(*mut std::ffi::c_void);
+impl Drop for Event { fn drop(&mut self) { unsafe { ds41_event_free(self.0); } } }
+impl Event {
+    pub fn new() -> Event { let e = unsafe { ds41_event_new() }; assert!(!e.is_null(), "cudaEventCreate"); Event(e) }
+    /// Records the current stream's work so far.
+    pub fn record(&self) { assert_eq!(unsafe { ds41_event_record(self.0, rs_current_stream()) }, 0, "cudaEventRecord"); }
+    /// Waits (host) until the recorded work has run.
+    pub fn sync(&self) { assert_eq!(unsafe { ds41_event_sync(self.0) }, 0, "cudaEventSynchronize"); }
+}
+/// Host bytes -> device memory on the current stream (async: a pinned source must stay put until the copy has run).
+pub fn h2d(dst: *mut std::ffi::c_void, src: &[u8]) {
+    assert_eq!(unsafe { ds41_h2d(dst, src.as_ptr().cast(), src.len(), rs_current_stream()) }, 0, "ds41_h2d");
 }
 
 /// The indexer's selection: the k largest of each score row [T, Tc] BF16 (ties to the lower index) in ascending index
@@ -526,6 +592,10 @@ extern "C" { fn ds41_fp8_gemv_mx_job(x: *const std::ffi::c_void, aq: *const std:
 thread_local! {
     /// Jobs the next MX GEMVs take, in order (with the tensors they use, kept until the job is launched).
     static GEMV_JOBS: std::cell::RefCell<std::collections::VecDeque<(HcJobC, Vec<Tensor>)>> = std::cell::RefCell::new(Default::default());
+    /// Inside moe_mx_par's parallel branch: the tensors of the jobs launched there, kept until the branch is joined.
+    /// They come from the main stream's allocations; dropped at launch, the main stream's next allocations (the routed
+    /// experts, running beside the branch) could take their blocks while the branch's GEMVs still use them.
+    static SIDE_HOLD: std::cell::RefCell<Option<Vec<Tensor>>> = const { std::cell::RefCell::new(None) };
 }
 /// `hc_mix` of a few rows (1..16, the 160-slice path) as side jobs of the next two MX GEMVs on this stream: the partial
 /// sums in the first one's grid, the finalize in the second's (shim/ds41_hc_job.cuh; the same operations as hc_mix's
@@ -578,6 +648,7 @@ fn gemv_mx(x: &Tensor, w: &Tensor, ws: &Tensor, ob16: bool) -> Tensor {
         Some((j, _)) => assert_eq!(unsafe { ds41_fp8_gemv_mx_job(x.data_ptr(), aq, asc, w.data_ptr(), ws.data_ptr(), y.data_ptr(), m as i32, n as i32, k as i32, ob16 as i32, j, rs_current_stream()) }, 0, "ds41_fp8_gemv_mx_job"),
         None => assert_eq!(unsafe { ds41_fp8_gemv_mx_q(x.data_ptr(), aq, asc, w.data_ptr(), ws.data_ptr(), y.data_ptr(), m as i32, n as i32, k as i32, ob16 as i32, rs_current_stream()) }, 0, "ds41_fp8_gemv_mx"),
     }
+    if let Some((_, ts)) = job { SIDE_HOLD.with(|h| if let Some(v) = h.borrow_mut().as_mut() { v.extend(ts) }); }
     y
 }
 
@@ -687,7 +758,9 @@ impl MoeRows {
 pub fn moe_mx_par(x: &Tensor, route: impl FnOnce() -> (Tensor, Tensor), w: [&Tensor; 6], shared: impl FnOnce() -> Tensor) -> Tensor {
     assert_eq!(unsafe { rs_stream_fork(1) }, 0, "rs_stream_fork");
     assert_eq!(unsafe { rs_stream_set(0) }, 0, "rs_stream_set");
+    SIDE_HOLD.with(|h| *h.borrow_mut() = Some(Vec::new()));
     let ys = shared().to_kind(Kind::Float).contiguous();
+    let hold = SIDE_HOLD.with(|h| h.borrow_mut().take());
     assert_eq!(unsafe { rs_stream_set(-1) }, 0, "rs_stream_set");
     let (idx, rw) = route();
     let r = x.size()[0];
@@ -705,6 +778,7 @@ pub fn moe_mx_par(x: &Tensor, route: impl FnOnce() -> (Tensor, Tensor), w: [&Ten
     };
     assert_eq!(rc, 0, "ds41_moe_mx_ex");
     assert_eq!(unsafe { rs_stream_join(1) }, 0, "rs_stream_join");
+    drop(hold);
     assert_eq!(unsafe { ds41_moe_mx_combine(ws.data_ptr(), r as i32, i as i32, topk as i32, e as i32, ys.data_ptr() as *const f32, y.data_ptr() as *mut f32, rs_current_stream()) }, 0, "ds41_moe_mx_combine");
     y
 }

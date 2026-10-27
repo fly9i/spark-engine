@@ -134,16 +134,20 @@ fn spec_max_batch() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("DS41_SPEC_MAX_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(4))
 }
-/// Verify cost model of a speculative round (DS41_SPEC_COST="base,seq,row" ms, default 24,0.6,5: a verify of R rows of B
+/// Verify cost model of a speculative round (DS41_SPEC_COST="base,seq,row" ms, default 22,0.5,2.5: a verify of R rows of B
 /// sequences costs about base + seq B + row R; every row reads its own routed experts, every sequence runs its own
-/// attention middle; fitted to plain steps of 1, 2, 4 and 8 sequences, 29.5 / 35.7 / 46.7 / 64.6 ms): the draft counts that maximize expected tokens per
-/// millisecond, with sigmoid(confidence) of a draft as its chance of acceptance given its predecessors; each sequence
-/// gets its own count.
+/// attention middle): the draft counts that maximize expected tokens per millisecond, with sigmoid(confidence) of a
+/// draft as its chance of acceptance given its predecessors; each sequence gets its own count. Only the number of
+/// verified drafts changes, never the output. The old 24,0.6,5 was fitted to plain steps of 1, 2, 4 and 8 sequences
+/// (29.5 / 35.7 / 46.7 / 64.6 ms); after the decode work of 2026-10-27 (26.3 / 33.5 / 43.7 / 57.0 ms) the extra rows
+/// are relatively cheaper, and the row cost was set by service decode_bench (median of 2, prose / structured / code
+/// tok/s): c1 59.7 / 113.3 / 100.3 -> 62.1 / 113.5 / 101.6, c2 82.8 / 156.0 / 125.0 -> 86.2 / 157.2 / 132.5,
+/// c4 103.8 / 196.5 / 146.3 -> 110.0 / 197.6 / 154.1 (row 3.0: prose c1 63.4 but c2 / code no better; 2.0: prose c1 62.6).
 fn spec_cost() -> (f64, f64, f64) {
     static C: std::sync::OnceLock<(f64, f64, f64)> = std::sync::OnceLock::new();
     *C.get_or_init(|| {
         let v: Vec<f64> = std::env::var("DS41_SPEC_COST").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
-        if v.len() == 3 { (v[0], v[1], v[2]) } else { (24.0, 0.6, 5.0) }
+        if v.len() == 3 { (v[0], v[1], v[2]) } else { (22.0, 0.5, 2.5) }
     })
 }
 fn choose_drafts(confs: &[Vec<f32>], maxd: &[usize]) -> Vec<usize> {

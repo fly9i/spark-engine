@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <cub/block/block_scan.cuh>
 #include "topk_select.cuh"
@@ -82,7 +83,9 @@ __device__ __forceinline__ void token_barrier(int t, int S) {
   }
   __syncthreads();
 }
-template <int MT, int MODE, bool CACHE = false, bool MULTI = false>
+// DEVM (with MULTI; DS41_MID_GRAPH): the rows' pools and index pointers come from a device copy of Multi passed in `idx`
+// (rewritten before every replay of a captured graph), with each row's K and split count (the grid has MAXSPLIT splits)
+template <int MT, int MODE, bool CACHE = false, bool MULTI = false, bool DEVM = false>
 __global__ __launch_bounds__(WARPS * 32, 1) void sparse_attn_kernel(const __nv_bfloat16* __restrict__ q, Pools pl0, const int64_t* __restrict__ idx, const float* __restrict__ sink, __nv_bfloat16* __restrict__ out, int H, int K0, float scale,
     float* __restrict__ pmx, float* __restrict__ pden, float* __restrict__ po, const __grid_constant__ Multi mt) {
   pdl_entry();
@@ -96,13 +99,14 @@ __global__ __launch_bounds__(WARPS * 32, 1) void sparse_attn_kernel(const __nv_b
   int* const rows = rows_all;
   const int t = MODE == 3 ? blockIdx.y : blockIdx.x, sp_id = MODE == 3 ? blockIdx.x : blockIdx.y;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, qd = lane & 3;
-  const Pools pl = MULTI ? mt.pl[t] : pl0;
-  const int K = MULTI ? mt.K[t] : K0;
-  const int S = MULTI ? mt.S[t] : MODE == 3 ? gridDim.x : gridDim.y;
+  const Multi* const md = DEVM ? reinterpret_cast<const Multi*>(idx) : nullptr;
+  const Pools pl = MULTI ? (DEVM ? md->pl[t] : mt.pl[t]) : pl0;
+  const int K = MULTI ? (DEVM ? md->K[t] : mt.K[t]) : K0;
+  const int S = MULTI ? (DEVM ? md->S[t] : mt.S[t]) : MODE == 3 ? gridDim.x : gridDim.y;
   if (MULTI && sp_id >= S) return;                                       // (the grid has the batch's largest split)
   const int SS = MULTI ? MAXSPLIT : S;                                   // workspace slots per token
   const int K2 = K - pl.W;                                               // explicit indices per query
-  const int64_t* ix = MULTI ? mt.idx[t] : idx + (long long)t * K2;
+  const int64_t* ix = MULTI ? (DEVM ? md->idx[t] : mt.idx[t]) : idx + (long long)t * K2;
   const long long pt = pl.W ? pl.pos[t] : 0;
   for (int i = threadIdx.x; i < H * D / 8; i += blockDim.x) {
     const int h = i / (D / 8), c = (i % (D / 8)) * 8;
@@ -414,13 +418,14 @@ __global__ __launch_bounds__(WARPS * 32, 1) void sparse_attn_kernel(const __nv_b
 }
 
 // out[t][h] = sum_s po[t][s][h] / (sum_s pden[t][s][h] + exp(sink[h] - mx)), mx = max_s pmx (clamped)
-// (MULTI: the token's own split count, slots MAXSPLIT apart)
-template <bool MULTI = false>
+// (MULTI: the token's own split count, slots MAXSPLIT apart; DEVM: the split counts of the device Multi `md`)
+template <bool MULTI = false, bool DEVM = false>
 __global__ void attn_fin_kernel(const float* __restrict__ pmx, const float* __restrict__ pden, const float* __restrict__ po,
-                                const float* __restrict__ sink, __nv_bfloat16* __restrict__ out, int H, int S0, const __grid_constant__ Multi mt) {
+                                const float* __restrict__ sink, __nv_bfloat16* __restrict__ out, int H, int S0, const __grid_constant__ Multi mt,
+                                const Multi* __restrict__ md) {
   pdl_entry();
   const int t = blockIdx.x, h = blockIdx.y;
-  const int S = MULTI ? mt.S[t] : S0, SS = MULTI ? MAXSPLIT : S0;
+  const int S = MULTI ? (DEVM ? md->S[t] : mt.S[t]) : S0, SS = MULTI ? MAXSPLIT : S0;
   float mx = -INFINITY, den = 0.f;
   for (int sp = 0; sp < S; ++sp) { mx = fmaxf(mx, pmx[((long long)t * SS + sp) * 32 + h]); den += pden[((long long)t * SS + sp) * 32 + h]; }
   mx = fmaxf(mx, -1e30f);
@@ -647,7 +652,7 @@ extern "C" int ds41_sparse_attn(const void* q, const void* a, int na, const void
     else if (S == 1) pdl_launch((sparse_attn_kernel<MT, 0>), dim3(T), dim3(WARPS * 32), sm, st, Q, pl, idx, sink, O, H, K, scale, nullptr, nullptr, nullptr, none); \
     else { pdl_launch((sparse_attn_kernel<MT, 1>), dim3(dim3(T, S)), dim3(WARPS * 32), sm, st, Q, pl, idx, sink, O, H, K, scale, pmx, pden, po, none); \
            pdl_launch((sparse_attn_kernel<MT, 2>), dim3(dim3(T, S)), dim3(WARPS * 32), sm, st, Q, pl, idx, sink, O, H, K, scale, pmx, pden, po, none); \
-           pdl_launch(attn_fin_kernel<false>, dim3(dim3(T, H)), dim3(128), 0, st, pmx, pden, po, sink, O, H, S, none); } } while (0)
+           pdl_launch(attn_fin_kernel<false>, dim3(dim3(T, H)), dim3(128), 0, st, pmx, pden, po, sink, O, H, S, none, (const Multi*)nullptr); } } while (0)
   if (H <= 16) DS41_ATTN_LAUNCH(1); else DS41_ATTN_LAUNCH(2);
 #undef DS41_ATTN_LAUNCH
   return (int)cudaGetLastError();
@@ -659,11 +664,13 @@ extern "C" int ds41_sparse_attn(const void* q, const void* a, int na, const void
 // sequence would get alone (the same bits); <= 16 rows, each sequence's keys over >= 2 tiles, else 2 (the caller runs
 // the sequences one by one). DS41_ATTN_MULTI=2 always takes the three-launch path (tests).
 struct Ds41AttnSeq { const void* a; const void* b; const void* c; const int64_t* idx; long long start, lo; int na, n, K, pad; };
-extern "C" int ds41_sparse_attn_multi(const void* q, const Ds41AttnSeq* seqs, int nseq, int W, const int64_t* pos, const float* sink, void* out,
-                                      int H, float scale, void* ws, cudaStream_t st) {
+// md_dev: launch the DEVM kernels reading pools / indices from that device Multi (graph capture); host_out: only write
+// this call's Multi into host_out (the bytes to upload to md_dev before a replay) and launch nothing
+static int sparse_attn_multi_impl(const void* q, const Ds41AttnSeq* seqs, int nseq, int W, const int64_t* pos, const float* sink, void* out,
+                                  int H, float scale, void* ws, cudaStream_t st, const void* md_dev, void* host_out, int* fused_out = nullptr) {
   static int sms = 0; if (!sms) cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
   static const bool fused_on = !(std::getenv("DS41_ATTN_FUSED") && std::getenv("DS41_ATTN_FUSED")[0] == '0');
-  if (!fused_on || !ws || H < 1 || H > 32 || nseq < 1) return 2;
+  if (!fused_on || (!ws && !host_out) || H < 1 || H > 32 || nseq < 1) return 2;
   Multi mt{};
   int T = 0, ctas = 0, smax = 1;
   for (int i = 0; i < nseq; ++i) {
@@ -681,6 +688,8 @@ extern "C" int ds41_sparse_attn_multi(const void* q, const Ds41AttnSeq* seqs, in
   static const bool force3 = std::getenv("DS41_ATTN_MULTI") && std::getenv("DS41_ATTN_MULTI")[0] == '2';
   bool fused = ctas <= sms && !force3;
   for (int i = 0; i < T; ++i) { const int tiles = (mt.K[i] + TILE - 1) / TILE; fused = fused && (tiles + mt.S[i] - 1) / mt.S[i] <= MAXT; }
+  // host_out: 0, or 1 when some row's tiles per split exceed MAXT (a graph captured with the fused launch no longer applies)
+  if (host_out) { memcpy(host_out, &mt, sizeof(Multi)); for (int i = 0; i < T; ++i) if ((((mt.K[i] + TILE - 1) / TILE) + mt.S[i] - 1) / mt.S[i] > MAXT) return 1; return 0; }
   const size_t sm = smem_bytes(H);
   float* pmx = (float*)ws; float* pden = pmx + (size_t)T * MAXSPLIT * 32; float* po = pden + (size_t)T * MAXSPLIT * 32;
   const __nv_bfloat16* Q = (const __nv_bfloat16*)q; __nv_bfloat16* O = (__nv_bfloat16*)out;
@@ -692,14 +701,52 @@ extern "C" int ds41_sparse_attn_multi(const void* q, const Ds41AttnSeq* seqs, in
           cudaFuncSetAttribute(sparse_attn_kernel<MT, 1, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) || \
           cudaFuncSetAttribute(sparse_attn_kernel<MT, 2, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm)) { cudaGetLastError(); return 2; } \
       set = sm; } \
+    if (md_dev) { \
+      static size_t setd = 0; \
+      if (sm > setd) { \
+        if (cudaFuncSetAttribute(sparse_attn_kernel<MT, 3, true, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) || \
+            cudaFuncSetAttribute(sparse_attn_kernel<MT, 1, false, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) || \
+            cudaFuncSetAttribute(sparse_attn_kernel<MT, 2, false, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm)) { cudaGetLastError(); return 2; } \
+        setd = sm; } \
+      const int64_t* MD = (const int64_t*)md_dev; \
+      const bool fd = T * MAXSPLIT <= sms && fused && !force3; \
+      if (fused_out) *fused_out = fd; \
+      if (fd) pdl_launch((sparse_attn_kernel<MT, 3, true, true, true>), dim3(dim3(MAXSPLIT, T)), dim3(WARPS * 32), sm, st, Q, none, MD, sink, O, H, 0, scale, pmx, pden, po, mt); \
+      else { pdl_launch((sparse_attn_kernel<MT, 1, false, true, true>), dim3(dim3(T, MAXSPLIT)), dim3(WARPS * 32), sm, st, Q, none, MD, sink, O, H, 0, scale, pmx, pden, po, mt); \
+             pdl_launch((sparse_attn_kernel<MT, 2, false, true, true>), dim3(dim3(T, MAXSPLIT)), dim3(WARPS * 32), sm, st, Q, none, MD, sink, O, H, 0, scale, pmx, pden, po, mt); \
+             pdl_launch((attn_fin_kernel<true, true>), dim3(dim3(T, H)), dim3(128), 0, st, pmx, pden, po, sink, O, H, 0, mt, (const Multi*)md_dev); } \
+      break; } \
     if (fused) pdl_launch((sparse_attn_kernel<MT, 3, true, true>), dim3(dim3(smax, T)), dim3(WARPS * 32), sm, st, Q, none, (const int64_t*)nullptr, sink, O, H, 0, scale, pmx, pden, po, mt); \
     else { pdl_launch((sparse_attn_kernel<MT, 1, false, true>), dim3(dim3(T, smax)), dim3(WARPS * 32), sm, st, Q, none, (const int64_t*)nullptr, sink, O, H, 0, scale, pmx, pden, po, mt); \
            pdl_launch((sparse_attn_kernel<MT, 2, false, true>), dim3(dim3(T, smax)), dim3(WARPS * 32), sm, st, Q, none, (const int64_t*)nullptr, sink, O, H, 0, scale, pmx, pden, po, mt); \
-           pdl_launch(attn_fin_kernel<true>, dim3(dim3(T, H)), dim3(128), 0, st, pmx, pden, po, sink, O, H, 0, mt); } } while (0)
+           pdl_launch(attn_fin_kernel<true>, dim3(dim3(T, H)), dim3(128), 0, st, pmx, pden, po, sink, O, H, 0, mt, (const Multi*)nullptr); } } while (0)
   if (H <= 16) DS41_ATTN_MULTI(1); else DS41_ATTN_MULTI(2);
 #undef DS41_ATTN_MULTI
   return (int)cudaGetLastError();
 }
+
+extern "C" int ds41_sparse_attn_multi(const void* q, const Ds41AttnSeq* seqs, int nseq, int W, const int64_t* pos, const float* sink, void* out,
+                                      int H, float scale, void* ws, cudaStream_t st) {
+  return sparse_attn_multi_impl(q, seqs, nseq, W, pos, sink, out, H, scale, ws, st, nullptr, nullptr);
+}
+// DS41_MID_GRAPH: the same launch reading the rows' pools / indices from md_dev (a device Multi of ds41_attn_multi_bytes();
+// fill it with ds41_attn_multi_build for this step's sequences before every replay)
+// (*fused_out: whether the fused single launch was captured)
+extern "C" int ds41_sparse_attn_multi_dev(const void* q, const Ds41AttnSeq* seqs, int nseq, int W, const int64_t* pos, const float* sink, void* out,
+                                          int H, float scale, void* ws, const void* md_dev, int* fused_out, cudaStream_t st) {
+  return sparse_attn_multi_impl(q, seqs, nseq, W, pos, sink, out, H, scale, ws, st, md_dev, nullptr, fused_out);
+}
+extern "C" int ds41_attn_multi_build(const Ds41AttnSeq* seqs, int nseq, int W, const int64_t* pos, int H, void* host_out) {
+  return sparse_attn_multi_impl(nullptr, seqs, nseq, W, pos, nullptr, nullptr, H, 1.f, nullptr, nullptr, nullptr, host_out);
+}
+extern "C" size_t ds41_attn_multi_bytes() { return sizeof(Multi); }
+extern "C" int ds41_h2d(void* dst, const void* src, size_t n, cudaStream_t st) { return (int)cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, st); }
+// staging-buffer fences (DS41_MID_GRAPH): an event recorded after a call's uploads; the host waits on it before
+// rewriting that buffer (the uploads read pinned memory when they run, not when issued)
+extern "C" void* ds41_event_new() { cudaEvent_t e = nullptr; return cudaEventCreateWithFlags(&e, cudaEventDisableTiming) ? nullptr : (void*)e; }
+extern "C" int ds41_event_record(void* e, cudaStream_t st) { return (int)cudaEventRecord((cudaEvent_t)e, st); }
+extern "C" int ds41_event_sync(void* e) { return (int)cudaEventSynchronize((cudaEvent_t)e); }
+extern "C" int ds41_event_free(void* e) { return (int)cudaEventDestroy((cudaEvent_t)e); }
 
 extern "C" int ds41_topk_idx(const void* score, const int64_t* pos, int ratio, int T, int Tc, int k, long long offset, int64_t* out, cudaStream_t st) {
   if (T < 1 || k < 1 || k > Tc) return 1;

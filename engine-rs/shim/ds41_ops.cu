@@ -519,9 +519,25 @@ __global__ void win_commit_kernel(__nv_bfloat16* __restrict__ ring, const __nv_b
   for (int c = threadIdx.x * 8; c < d; c += blockDim.x * 8)
     *reinterpret_cast<uint4*>(ring + slot * d + c) = *reinterpret_cast<const uint4*>(kv + (long long)i * d + c);
 }
+// DS41_MID_GRAPH: win_commit_kernel for the rows of several sequences in one launch (row i of kv into its sequence's
+// ring rings[i], slot pos[i] % w; at most 16 rows, all of them kept); rings is a device array rewritten before each replay
+__global__ void win_commit_rows_kernel(const unsigned long long* __restrict__ rings, const __nv_bfloat16* __restrict__ kv,
+                                       const int64_t* __restrict__ pos, int w, int d) {
+  pdl_entry();
+  const int i = blockIdx.x;
+  __nv_bfloat16* ring = reinterpret_cast<__nv_bfloat16*>(rings[i]);
+  const long long slot = pos[i] % w;
+  for (int c = threadIdx.x * 8; c < d; c += blockDim.x * 8)
+    *reinterpret_cast<uint4*>(ring + slot * d + c) = *reinterpret_cast<const uint4*>(kv + (long long)i * d + c);
+}
 } // namespace
 
 extern "C" {
+int ds41_win_commit_rows(const void* rings, const void* kv, const int64_t* pos, int t, int w, int d, cudaStream_t st) {
+  if (t < 1 || t > w || d % 8) return 1;
+  pdl_launch(win_commit_rows_kernel, dim3(t), dim3(64), 0, st, (const unsigned long long*)rings, (const __nv_bfloat16*)kv, pos, w, d);
+  return (int)cudaGetLastError();
+}
 int ds41_route(const float* logits, const float* bias, int64_t* idx, float* w, int T, int E, int K, float scale, cudaStream_t st) {
   if (T < 1) return 0;
   if (E > 384 || K > 8 || K < 1) return 1;
