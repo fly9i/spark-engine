@@ -416,6 +416,9 @@ pub struct Model {
     pub last_hidden: std::cell::RefCell<Option<Tensor>>,
     /// Debug (ds41-dspark-golden): when Some, mtp_draft appends the full draft logits of every draft step.
     pub draft_debug: std::cell::RefCell<Option<Vec<Tensor>>>,
+    /// the last draft's per-step distributions' logits, every vocabulary column ([block, B, vocab] FP32, every rank):
+    /// set by mtp_draft when a sequence samples (T > 0) under DS41_SPEC_RS, read by rs_tokens
+    pub draft_q: std::cell::RefCell<Option<Tensor>>,
     pub(super) mtp_graphs: std::cell::RefCell<HashMap<usize, super::spec::MtpGraph>>,
 }
 
@@ -608,7 +611,7 @@ impl Model {
             eprintln!("[ds41] rank{rank} C12 codings: {:.0} MB in {:.1}s (allocated {:.1} GiB)", bytes as f64 / 1e6, t1.elapsed().as_secs_f64(), a as f64 / (1u64 << 30) as f64);
         }
         (Model { c, sp, ck, tables, dev, embed, head, norm, layers, hash, fp4, graph: std::cell::RefCell::new(HashMap::new()), graph_clock: std::cell::Cell::new(0), mtp, head8,
-                last_hidden: std::cell::RefCell::new(None), draft_debug: std::cell::RefCell::new(None),
+                last_hidden: std::cell::RefCell::new(None), draft_debug: std::cell::RefCell::new(None), draft_q: std::cell::RefCell::new(None),
                 mtp_graphs: std::cell::RefCell::new(HashMap::new()) }, side_out)
     }
 
@@ -618,6 +621,19 @@ impl Model {
         if moe_mx_on() {
             if let Some(p) = layer.moe.experts.packed.as_mut() {
                 for i in [0usize, 2, 4] { p[i] = super::kern::moe_pack_mx(&p[i]); }
+                // the scales in the 2-bit coding (DS41_MX_S2; lossless, checked when coded)
+                if super::kern::moe_s2_on() {
+                    let (mut nraw, mut tiles, mut before) = (0, 0, 0);
+                    for i in [1usize, 3, 5] {
+                        before += p[i].numel();
+                        let (b, r, t) = super::kern::moe_scales_s2(&p[i]);
+                        p[i] = b; nraw += r; tiles += t;
+                    }
+                    if std::env::var("DS41_MX_S2_LOG").is_ok() {
+                        eprintln!("[ds41] expert scales 2-bit: {:.1} -> {:.1} MB, {nraw} of {tiles} tiles raw", before as f64 / 1e6,
+                                  [1usize, 3, 5].iter().map(|&i| p[i].numel()).sum::<usize>() as f64 / 1e6);
+                    }
+                }
             }
         }
     }

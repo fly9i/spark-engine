@@ -26,6 +26,7 @@ extern "C" {
     fn ds41_fp8_gemv_mx_smem_max() -> usize;
     fn ds41_bf16_gemv_mx(x: *const std::ffi::c_void, w: *const std::ffi::c_void, y: *mut f32, m: i32, n: i32, k: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_moe_mx_ws_bytes(r: i32, i: i32, topk: i32, e: i32) -> usize;
+    fn ds41_moe_mx_set_s2(on: i32);
     fn rs_lt_rows_find(w: *const f32, full: i32, n: i32, k: i32, verbose: i32) -> i32;
     fn rs_lt_rows_mm(x: *const f32, w: *const f32, y: *mut f32, full: i32, m: i32, n: i32, k: i32) -> i32;
     #[allow(clippy::too_many_arguments)]
@@ -598,6 +599,42 @@ pub fn moe_pack_mx(wp: &Tensor) -> Tensor {
     let (e, rows, kb) = (wp.size()[0], wp.size()[1], wp.size()[2]);
     let steps = kb / 64;
     wp.view([e * rows / 8, steps, 8, 4, 4, 4]).permute([0, 1, 2, 4, 3, 5]).contiguous().view([e, rows, kb])
+}
+/// DS41_MX_S2 (default on with the MX experts): the routed-expert scales stay in memory as the 2-bit coding of
+/// shim/ds41_mx.cu (`moe_scales_s2`); the first call tells the expert kernels so (one format per process).
+pub fn moe_s2_on() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| { let on = std::env::var("DS41_MX_S2").map_or(true, |v| v != "0"); unsafe { ds41_moe_mx_set_s2(on as i32) }; on })
+}
+/// (ds41-kernel-test: switch the kernels' scale format; the scales passed must match)
+pub fn moe_s2_set(on: bool) { unsafe { ds41_moe_mx_set_s2(on as i32) } }
+/// The 2-bit coding of tile-packed expert scales (moe_pack: [E, rows, K/32] = [tiles][K/128][8][4] bytes) as one Uint8
+/// blob: desc [tiles][16] (row bases, raw index int32 / -1), codes [tiles][K/128][8], raw words of the tiles that have a
+/// row spanning more than 3 (layout in shim/ds41_mx.cu). Lossless: decoded on the device here and compared byte for
+/// byte with the source (panics otherwise). Returns (blob, raw tiles, tiles).
+pub fn moe_scales_s2(s: &Tensor) -> (Tensor, i64, i64) {
+    let (e, rows, nb) = (s.size()[0], s.size()[1], s.size()[2]);
+    assert!(rows % 8 == 0 && nb % 4 == 0 && s.kind() == Kind::Uint8 && s.is_contiguous(), "moe_scales_s2 {:?}", s.size());
+    let (tiles, steps) = (e * rows / 8, nb / 4);
+    let dev = s.device();
+    let v = s.view([tiles, steps, 8, 4]).to_kind(Kind::Int16);
+    let mn = v.amin(&[1i64, 3][..], false);   // [tiles, 8]
+    let raw = (v.amax(&[1i64, 3][..], false) - &mn).gt(3).any_dim(1, false);   // [tiles]
+    let code = (&v - mn.view([tiles, 1, 8, 1])).clamp(0, 3);
+    let wts = Tensor::from_slice(&[1i16, 4, 16, 64]).to_device(dev).view([1, 1, 1, 4]);
+    let cb = (&code * wts).sum_dim_intlist(&[3i64][..], false, Kind::Int16).to_kind(Kind::Uint8).contiguous();   // [tiles, steps, 8]
+    let ri = raw.to_kind(Kind::Int).cumsum(0, Kind::Int) - 1;
+    let ri = ri.where_self(&raw, &Tensor::full([tiles], -1, (Kind::Int, dev))).contiguous();
+    let nraw = i64::try_from(raw.sum(Kind::Int64)).unwrap();
+    let rawt = s.view([tiles, steps * 32]).index_select(0, &raw.nonzero().view([-1]));
+    let desc = Tensor::cat(&[mn.to_kind(Kind::Uint8), ri.view_dtype(Kind::Uint8).view([tiles, 4]), Tensor::zeros([tiles, 4], (Kind::Uint8, dev))], 1);
+    let blob = Tensor::cat(&[desc.view([-1]), cb.view([-1]), rawt.contiguous().view([-1])], 0);
+    // decode check: coded tiles give base + code, raw tiles their copy
+    let dec = (mn.view([tiles, 1, 8, 1]) + &code).to_kind(Kind::Uint8);
+    let coded_ok = dec.eq_tensor(&s.view([tiles, steps, 8, 4])).logical_or(&raw.view([tiles, 1, 1, 1])).all();
+    assert!(bool::try_from(coded_ok).unwrap(), "moe_scales_s2: coded tiles do not decode to the source");
+    assert!(rawt.equal(&s.view([tiles, steps * 32]).index_select(0, &raw.nonzero().view([-1]))), "moe_scales_s2: raw tiles");
+    (blob, nraw, tiles)
 }
 /// act_quant into E4M3 bytes + UE8M0 bytes per 32: x BF16 [R, K] -> (q Uint8 [R, K], s Uint8 [R, K / 32]).
 pub fn act_quant_fp8(x: &Tensor) -> (Tensor, Tensor) {
@@ -1219,6 +1256,133 @@ fn mx_table(dev: tch::Device) {
     }
 }
 
+/// ds41-kernel-test (DS41_KT_ONLY=s2): the routed experts with 2-bit coded scales (DS41_MX_S2) against the raw scales,
+/// real weights (layer `DS41_KT_LAYER`, default 3, TP3 rank 0 slice), every kernel path by row count: bitwise; then the
+/// same with a few tiles forced raw (scales spanning > 3); then cold timing of both formats at decode row counts.
+fn s2_test(ck: &super::load::Checkpoint, dev: tch::Device) {
+    let layer = std::env::var("DS41_KT_LAYER").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(3);
+    let (i0, il) = (0i64, 768i64);
+    let f = format!("layers.{layer}.ffn.experts");
+    let mut st: Vec<Vec<Tensor>> = (0..6).map(|_| Vec::new()).collect();
+    for e in 0..384 {
+        st[0].push(ck.rows(&format!("{f}.{e}.w1.weight"), i0, il, Kind::Uint8));
+        st[1].push(ck.rows(&format!("{f}.{e}.w1.scale"), i0, il, Kind::Uint8));
+        st[2].push(ck.rows(&format!("{f}.{e}.w3.weight"), i0, il, Kind::Uint8));
+        st[3].push(ck.rows(&format!("{f}.{e}.w3.scale"), i0, il, Kind::Uint8));
+        st[4].push(ck.cols(&format!("{f}.{e}.w2.weight"), i0 / 2, il / 2, Kind::Uint8));
+        st[5].push(ck.cols(&format!("{f}.{e}.w2.scale"), i0 / 32, il / 32, Kind::Uint8));
+    }
+    let st: Vec<Tensor> = st.iter().map(|v| Tensor::stack(v, 0)).collect();
+    let (p1, q1) = moe_pack(&st[0], &st[1]);
+    let (p3, q3) = moe_pack(&st[2], &st[3]);
+    let (p2, q2) = moe_pack(&st[4], &st[5]);
+    let (p1, p3, p2) = (moe_pack_mx(&p1), moe_pack_mx(&p3), moe_pack_mx(&p2));
+    let run = |qs: [&Tensor; 3], cs: [&Tensor; 3], tag: &str| {
+        let mut bad = 0;
+        for r in [1i64, 2, 3, 4, 6, 8, 16, 40, 64, 65, 300, 2048, 4096, 8192] {
+            let x = (Tensor::randn([r, 5120], (Kind::Float, dev)) * 0.5).to_kind(Kind::BFloat16);
+            let (_, idx) = Tensor::rand([r, 384], (Kind::Float, dev)).topk(6, -1, true, true);
+            let rw = Tensor::rand([r, 6], (Kind::Float, dev)) * 0.5;
+            moe_s2_set(false);
+            let a = moe_mx(&x, &idx, &rw, [&p1, qs[0], &p3, qs[1], &p2, qs[2]], None);
+            moe_s2_set(true);
+            let b = moe_mx(&x, &idx, &rw, [&p1, cs[0], &p3, cs[1], &p2, cs[2]], None);
+            moe_s2_set(false);
+            let same = a.view_dtype(Kind::Int).equal(&b.view_dtype(Kind::Int));
+            if !same { bad += 1; }
+            eprintln!("[ds41-kernel-test] s2 {tag} R={r}: {}", if same { "bitwise equal" } else { "DIFFERENT" });
+        }
+        bad
+    };
+    let (c1, n1, t1) = moe_scales_s2(&q1);
+    let (c3, n3, t3) = moe_scales_s2(&q3);
+    let (c2, n2, t2) = moe_scales_s2(&q2);
+    eprintln!("[ds41-kernel-test] s2 layer {layer}: scales {:.1} -> {:.1} MB; raw tiles w1 {n1}/{t1} w3 {n3}/{t3} w2 {n2}/{t2}",
+              (q1.numel() + q3.numel() + q2.numel()) as f64 / 1e6, (c1.numel() + c3.numel() + c2.numel()) as f64 / 1e6);
+    let mut bad = run([&q1, &q3, &q2], [&c1, &c3, &c2], "real");
+    // force raw tiles: every 7th tile of w1 / every 5th of w2 gets one scale +5 (still a valid E8M0 near the others)
+    let bump = |q: &Tensor, every: i64| {
+        let (e, rows, nb) = (q.size()[0], q.size()[1], q.size()[2]);
+        let v = q.view([e * rows / 8, nb / 4, 8, 4]).copy();
+        let _ = v.slice(0, 0, e * rows / 8, every).select(1, 0).select(1, 3).select(1, 2).g_add_scalar_(5);
+        v.view([e, rows, nb])
+    };
+    let (b1, b2) = (bump(&q1, 7), bump(&q2, 5));
+    let (d1, m1, _) = moe_scales_s2(&b1);
+    let (d2, m2, _) = moe_scales_s2(&b2);
+    eprintln!("[ds41-kernel-test] s2 forced raw tiles: w1 {m1}, w2 {m2}");
+    bad += run([&b1, &q3, &b2], [&d1, &c3, &d2], "forced-raw");
+    assert_eq!(bad, 0, "2-bit expert scales differ from the raw scales");
+    // cold timing (random experts of 384 per call, 64 index sets), interleaved
+    let time = |f: &dyn Fn() -> Tensor| { for _ in 0..5 { let _ = f(); } tch::Cuda::synchronize(0);
+        let t = std::time::Instant::now(); for _ in 0..200 { let _ = f(); } tch::Cuda::synchronize(0); t.elapsed().as_secs_f64() * 1e6 / 200.0 };
+    for r in [1i64, 2, 4, 8, 16] {
+        let x = (Tensor::randn([r, 5120], (Kind::Float, dev)) * 0.5).to_kind(Kind::BFloat16);
+        let ids: Vec<Tensor> = (0..64).map(|_| Tensor::rand([r, 384], (Kind::Float, dev)).topk(6, -1, true, true).1).collect();
+        let rw = Tensor::full([r, 6], 0.2, (Kind::Float, dev));
+        let mut tr = Vec::new(); let mut tc = Vec::new();
+        for _ in 0..3 {
+            let it = std::cell::Cell::new(0usize);
+            moe_s2_set(false);
+            tr.push(time(&|| { let i = it.get(); it.set(i + 1); moe_mx(&x, &ids[i % 64], &rw, [&p1, &q1, &p3, &q3, &p2, &q2], None) }));
+            moe_s2_set(true);
+            tc.push(time(&|| { let i = it.get(); it.set(i + 1); moe_mx(&x, &ids[i % 64], &rw, [&p1, &c1, &p3, &c3, &p2, &c2], None) }));
+            moe_s2_set(false);
+        }
+        tr.sort_by(|a, b| a.partial_cmp(b).unwrap()); tc.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!("[ds41-kernel-test] s2 timing R={r}: raw {:.1} us, 2-bit {:.1} us (medians of 3 x 200 calls)", tr[1], tc[1]);
+    }
+}
+
+/// ds41-kernel-test (DS41_KT_ONLY=rs): rejection-sampling verification (spec::rs_tokens) on a small vocabulary: target
+/// and draft logits fixed, for N trials (seeds) the draft samples its chain from q (Markov-free here: q per row fixed)
+/// with the draft keys, the verdict decides; the first emitted token must be distributed as p0 = softmax(lg0 / T), the
+/// second (given the first was an accepted draft) as p1, and the acceptance rate of draft 1 must be sum min(p, q).
+/// Chi-square against p with the bins' counts; DS41_RS_N trials (100000).
+fn rs_test(dev: tch::Device) {
+    let n_tr = std::env::var("DS41_RS_N").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(100000);
+    let v = 48i64;
+    for &(temp, spread) in &[(1.0f32, 2.0f64), (0.7, 1.0), (1.0, 4.0)] {
+        tch::manual_seed(11);
+        let lg = (Tensor::randn([3, v], (Kind::Float, dev)) * spread).to_kind(Kind::Float);       // target rows 0, 1 (+ bonus 2)
+        let q = (&lg.narrow(0, 0, 2) + Tensor::randn([2, v], (Kind::Float, dev)) * spread * 0.8).to_kind(Kind::Float);   // drafts' logits
+        let p = (&lg / temp as f64).softmax(-1, Kind::Double);
+        let qd = (&q / temp as f64).softmax(-1, Kind::Double);
+        let ph: Vec<f64> = Vec::<f64>::try_from(p.to_device(tch::Device::Cpu).view(-1)).unwrap();
+        let tv_acc: f64 = f64::try_from((p.narrow(0, 0, 1).minimum(&qd.narrow(0, 0, 1))).sum(Kind::Double)).unwrap();
+        let mut c0 = vec![0usize; v as usize];
+        let mut c1 = vec![0usize; v as usize];
+        let (mut acc1, mut n1) = (0usize, 0usize);
+        let p0 = 1000i64;
+        for t in 0..n_tr {
+            let seed = 0x5eed_0000 + t as u64;
+            let ds = super::spec::rs_draft_seed(seed, temp, p0);
+            let d1 = super::serve::sample(&q.narrow(0, 0, 1), temp, ds, p0 + 1);
+            let d2 = super::serve::sample(&q.narrow(0, 1, 1), temp, ds, p0 + 2);
+            let ys = super::spec::rs_tokens(&lg, &q, &[d1, d2], temp, seed, p0);
+            c0[ys[0] as usize] += 1;
+            if ys[0] == d1 { acc1 += 1; c1[ys[1] as usize] += 1; n1 += 1; }
+        }
+        // chi-square with the bins of expected count < 5 pooled into one: (statistic, degrees of freedom)
+        let chi = |c: &[usize], row: usize, n: usize| -> (f64, usize) {
+            let (mut x, mut bins, mut pe, mut pc) = (0.0, 0usize, 0.0, 0usize);
+            for i in 0..v as usize {
+                let e = ph[row * v as usize + i] * n as f64;
+                if e < 5.0 { pe += e; pc += c[i]; continue; }
+                x += (c[i] as f64 - e).powi(2) / e; bins += 1;
+            }
+            if pe > 0.0 { x += (pc as f64 - pe).powi(2) / pe; bins += 1; }
+            (x, bins - 1)
+        };
+        let ((x0, f0), (x1, f1)) = (chi(&c0, 0, n_tr), chi(&c1, 1, n1));
+        // limit: dof + 5 sd (sd = sqrt(2 dof)), p ~ 1e-5
+        let lim = |f: usize| f as f64 + 5.0 * (2.0 * f as f64).sqrt();
+        eprintln!("[ds41-kernel-test] rs T={temp} spread {spread}: {n_tr} trials, first token chi2 {x0:.1} ({f0} dof), second (after an accepted first, n={n1}) chi2 {x1:.1} ({f1} dof); acceptance {:.4} vs sum min(p, q) {tv_acc:.4}",
+                  acc1 as f64 / n_tr as f64);
+        assert!(x0 < lim(f0) && x1 < lim(f1), "rejection sampling: emitted tokens not distributed as p");
+    }
+}
+
 pub fn test(ckpt: &std::path::Path) {
     use super::load::{dequant_fp8, dequant_mxfp4, fp4_table, Checkpoint};
     let _g = tch::no_grad_guard();
@@ -1237,6 +1401,8 @@ pub fn test(ckpt: &std::path::Path) {
         if std::env::var("DS41_KT_ONLY").as_deref() == Ok("clp") { return; }
         if std::env::var("DS41_KT_ONLY").as_deref() == Ok("mx") { mx_table(dev); return; }
     }
+    if std::env::var("DS41_KT_ONLY").as_deref() == Ok("s2") { s2_test(&ck, dev); return; }
+    if std::env::var("DS41_KT_ONLY").as_deref() == Ok("rs") { rs_test(dev); return; }
     // act_quant
     let x = Tensor::randn([8, 5120], (Kind::Float, dev)) * 3.0;
     let a = act_quant(&x.to_kind(Kind::BFloat16));

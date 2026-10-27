@@ -61,6 +61,35 @@ __device__ __forceinline__ void b_split(uint32_t w, uint32_t& even, uint32_t& od
   odd = ((w >> 4) & 0x0F0F0F0Fu) << 2;
 }
 
+// ---- Routed-expert scales in a 2-bit coding (DS41_MX_S2, default on; lossless, the MMA gets the same scale bytes).
+// The checkpoint's expert E8M0 scales are nearly constant (99.9% are 120 or 121; within a row of a rank's slice the
+// span exceeds 3 for ~4e-5 of the rows), so per tile (8 weight rows) the coding keeps a base byte per row and per
+// 128-wide K step one byte of four 2-bit offsets per row (one per 32-block): 8 bytes per tile and step instead of 32
+// (expert bytes read -4.4%, scale memory / 4). A tile with any row spanning more than 3 keeps its raw words.
+// Blob for T tiles of S steps (kern::moe_scales_s2): desc [T] x 16 bytes (bytes 0-7 the rows' bases, 8-11 the raw
+// index (int32, -1: coded)), codes [T][S][8 rows] (byte = c0 | c1 << 2 | c2 << 4 | c3 << 6), raw [n_raw][S][8][4] (the
+// raw layout of those tiles). The word of 4 scales of a row (block b in byte b) = base * 0x01010101 + spread(code).
+struct ScaleV { const uint8_t* raw; const uint8_t* code; const uint4* desc; };
+inline ScaleV scale_v(const void* s, bool c2, long long tiles, int steps) {
+  const uint8_t* b = (const uint8_t*)s;
+  if (!c2) return ScaleV{b, nullptr, nullptr};
+  return ScaleV{b + tiles * 16 + tiles * steps * 8, b + tiles * 16, (const uint4*)b};
+}
+__device__ __forceinline__ uint32_t s2_spread(uint32_t c) { return (c & 3u) | ((c & 0xCu) << 6) | ((c & 0x30u) << 12) | ((c & 0xC0u) << 18); }
+// where row g's scale words of a tile come from, steps from s0 on: raw (p: words, 32 bytes per step) or coded (p: code
+// bytes, 8 per step; bmul = base * 0x01010101)
+struct SSrc { const uint8_t* p; uint32_t bmul; bool raw; };
+template <bool C2> __device__ __forceinline__ SSrc s_src(const ScaleV& v, long long tile, int steps, int s0, int g) {
+  if (!C2) return SSrc{v.raw + (tile * steps + s0) * 32 + g * 4, 0u, true};
+  const uint4 d = __ldg(v.desc + tile);
+  const int ri = (int)d.z;
+  if (ri >= 0) return SSrc{v.raw + ((long long)ri * steps + s0) * 32 + g * 4, 0u, true};
+  return SSrc{v.code + (tile * steps + s0) * 8 + g, (((g < 4 ? d.x : d.y) >> (8 * (g & 3))) & 0xFFu) * 0x01010101u, false};
+}
+__device__ __forceinline__ uint32_t s_word(const SSrc& c, int s) {
+  return c.raw ? __ldg(reinterpret_cast<const uint32_t*>(c.p + s * 32)) : c.bmul + s2_spread(__ldg(c.p + s * 8));
+}
+
 struct Item { int e, off, n, pad; };
 
 __global__ __launch_bounds__(1024) void group_kernel(const int64_t* __restrict__ idx, int P, int GR, int E, int* __restrict__ G,
@@ -97,9 +126,9 @@ __global__ __launch_bounds__(1024) void group_kernel(const int64_t* __restrict__
 
 // gate/up + SwiGLU + act_quant -> h E4M3 [P, I] + scales [P, I/32]. 4 warps, MT m16 tiles; KS = 1: grid (I / 128, Gmax),
 // warp = 32 columns over all of K; KS = 4 (decode): grid (I / 32, Gmax), warps split K, warp 0 sums in warp order.
-template <int MT, int KS>
+template <int MT, int KS, bool C2>
 __global__ __launch_bounds__(KS > 4 ? 32 * KS : 128) void up_mx(const uint8_t* __restrict__ xq, const uint8_t* __restrict__ xs, const uint8_t* __restrict__ w1,
-    const uint8_t* __restrict__ s1, const uint8_t* __restrict__ w3, const uint8_t* __restrict__ s3, int I,
+    const ScaleV s1, const uint8_t* __restrict__ w3, const ScaleV s3, int I,
     const float* __restrict__ rw, const int* __restrict__ G, const Item* __restrict__ items, const int* __restrict__ prow,
     uint8_t* __restrict__ hq, uint8_t* __restrict__ hs, int topk) {
   pdl_entry();
@@ -109,11 +138,11 @@ __global__ __launch_bounds__(KS > 4 ? 32 * KS : 128) void up_mx(const uint8_t* _
   const int j0 = KS == 1 ? blockIdx.x * 128 + warp * 32 : blockIdx.x * 32;
   constexpr int ALL = H / 128, STEPS = ALL / KS;
   const int s0 = KS == 1 ? 0 : warp * STEPS;
-  const uint8_t* wr[8]; const uint8_t* sr[8];
+  const uint8_t* wr[8]; SSrc sr[8];
   for (int t = 0; t < 8; ++t) {
     const long long tile = ((long long)it.e * I + j0 + 8 * (t & 3)) / 8;
     wr[t] = (t < 4 ? w1 : w3) + (tile * ALL + s0) * 512 + (g * 4 + q) * 16;
-    sr[t] = (t < 4 ? s1 : s3) + (tile * ALL + s0) * 32 + g * 4;
+    sr[t] = s_src<C2>(t < 4 ? s1 : s3, tile, ALL, s0, g);
   }
   // A rows (source token of the pair; rows past the item read row 0 and are not stored), and the scale row this lane
   // provides for each m tile
@@ -129,14 +158,14 @@ __global__ __launch_bounds__(KS > 4 ? 32 * KS : 128) void up_mx(const uint8_t* _
   float acc[MT][8][4];
   for (int m = 0; m < MT; ++m) for (int t = 0; t < 8; ++t) for (int c = 0; c < 4; ++c) acc[m][t][c] = 0.f;
   uint4 bw[8]; uint32_t bs[8];
-  for (int t = 0; t < 8; ++t) { bw[t] = __ldg(reinterpret_cast<const uint4*>(wr[t])); bs[t] = __ldg(reinterpret_cast<const uint32_t*>(sr[t])); }
+  for (int t = 0; t < 8; ++t) { bw[t] = __ldg(reinterpret_cast<const uint4*>(wr[t])); bs[t] = s_word(sr[t], 0); }
   constexpr bool PF = MT <= 2;   // prefetch the next step's weights (registers allow it up to 2 m tiles)
   for (int s = 0; s < STEPS; ++s) {
     uint4 nw[PF ? 8 : 1]; uint32_t ns[PF ? 8 : 1];
     if (PF && s + 1 < STEPS)
-      for (int t = 0; t < 8; ++t) { nw[t] = __ldg(reinterpret_cast<const uint4*>(wr[t] + (s + 1) * 512)); ns[t] = __ldg(reinterpret_cast<const uint32_t*>(sr[t] + (s + 1) * 32)); }
+      for (int t = 0; t < 8; ++t) { nw[t] = __ldg(reinterpret_cast<const uint4*>(wr[t] + (s + 1) * 512)); ns[t] = s_word(sr[t], s + 1); }
     if (!PF && s > 0)
-      for (int t = 0; t < 8; ++t) { bw[t] = __ldg(reinterpret_cast<const uint4*>(wr[t] + s * 512)); bs[t] = __ldg(reinterpret_cast<const uint32_t*>(sr[t] + s * 32)); }
+      for (int t = 0; t < 8; ++t) { bw[t] = __ldg(reinterpret_cast<const uint4*>(wr[t] + s * 512)); bs[t] = s_word(sr[t], s); }
     uint32_t sfa4[MT];
     for (int m = 0; m < MT; ++m) sfa4[m] = __ldg(reinterpret_cast<const uint32_t*>(xsa[m] + s * 4));
 #pragma unroll
@@ -194,9 +223,9 @@ __global__ __launch_bounds__(KS > 4 ? 32 * KS : 128) void up_mx(const uint8_t* _
 }
 
 // down: out [P, H] FP32 = h . w2_e^T. grid (H / 128, Gmax), 4 warps of 32 output columns.
-template <int MT>
+template <int MT, bool C2>
 __global__ __launch_bounds__(128) void down_mx(const uint8_t* __restrict__ hq, const uint8_t* __restrict__ hs, const uint8_t* __restrict__ w2,
-    const uint8_t* __restrict__ s2, int I, const int* __restrict__ G, const Item* __restrict__ items, float* __restrict__ out) {
+    const ScaleV s2, int I, const int* __restrict__ G, const Item* __restrict__ items, float* __restrict__ out) {
   pdl_entry();
   const int bi = blockIdx.y, bc = blockIdx.x;
   if (bi >= *G) return;
@@ -204,11 +233,11 @@ __global__ __launch_bounds__(128) void down_mx(const uint8_t* __restrict__ hq, c
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, q = lane & 3;
   const int n0 = bc * 128 + warp * 32;
   const int steps = I / 128;
-  const uint8_t* wr[4]; const uint8_t* sr[4];
+  const uint8_t* wr[4]; SSrc sr[4];
   for (int t = 0; t < 4; ++t) {
     const long long tile = ((long long)it.e * H + n0 + 8 * t) / 8;
     wr[t] = w2 + tile * steps * 512 + (g * 4 + q) * 16;
-    sr[t] = s2 + tile * steps * 32 + g * 4;
+    sr[t] = s_src<C2>(s2, tile, steps, 0, g);
   }
   const uint8_t* ha[MT][2]; const uint8_t* hsa[MT];
   for (int m = 0; m < MT; ++m) {
@@ -224,13 +253,13 @@ __global__ __launch_bounds__(128) void down_mx(const uint8_t* __restrict__ hq, c
   // the next step's weights load while this step computes (MT <= 2; registers)
   constexpr bool PF = MT <= 2;
   uint4 bw[4]; uint32_t bs[4];
-  for (int t = 0; t < 4; ++t) { bw[t] = __ldg(reinterpret_cast<const uint4*>(wr[t])); bs[t] = __ldg(reinterpret_cast<const uint32_t*>(sr[t])); }
+  for (int t = 0; t < 4; ++t) { bw[t] = __ldg(reinterpret_cast<const uint4*>(wr[t])); bs[t] = s_word(sr[t], 0); }
   for (int s = 0; s < steps; ++s) {
     uint4 nw[PF ? 4 : 1]; uint32_t ns[PF ? 4 : 1];
     if (PF && s + 1 < steps)
-      for (int t = 0; t < 4; ++t) { nw[t] = __ldg(reinterpret_cast<const uint4*>(wr[t] + (s + 1) * 512)); ns[t] = __ldg(reinterpret_cast<const uint32_t*>(sr[t] + (s + 1) * 32)); }
+      for (int t = 0; t < 4; ++t) { nw[t] = __ldg(reinterpret_cast<const uint4*>(wr[t] + (s + 1) * 512)); ns[t] = s_word(sr[t], s + 1); }
     if (!PF && s > 0)
-      for (int t = 0; t < 4; ++t) { bw[t] = __ldg(reinterpret_cast<const uint4*>(wr[t] + s * 512)); bs[t] = __ldg(reinterpret_cast<const uint32_t*>(sr[t] + s * 32)); }
+      for (int t = 0; t < 4; ++t) { bw[t] = __ldg(reinterpret_cast<const uint4*>(wr[t] + s * 512)); bs[t] = s_word(sr[t], s); }
     uint32_t sfa4[MT];
     for (int m = 0; m < MT; ++m) sfa4[m] = *reinterpret_cast<const uint32_t*>(hsa[m] + s * 4);
 #pragma unroll
@@ -633,7 +662,7 @@ int g_gemm_version = 0;   // 0: default; ds41_gemm_version (benches) forces one
 constexpr int UG_NS = 3, UG_AP = 144;
 // RT rows per block (64, or 128: an expert's rows up to 128 share one read of its weights), RT / 32 row groups x 8 / (RT
 // / 32) column groups of warps (the 64-row block: 2 x 4 warps of 32 rows x 32 columns, up_mx<2, 1>'s tile); NS stages.
-template <int RT> struct UgStageT { uint8_t a[RT][UG_AP]; uint32_t as[RT]; uint4 b[32][32]; uint32_t bs[32][8]; };
+template <int RT> struct UgStageT { uint8_t a[RT][UG_AP]; uint32_t as[RT]; uint4 b[32][32]; uint32_t bs[32][8]; uint8_t bc[32][8]; };   // bc: 2-bit codes (C2)
 using UgStage = UgStageT<64>;
 __device__ __forceinline__ void cpa16(void* dst, const void* src, bool valid) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"((unsigned)__cvta_generic_to_shared(dst)), "l"(src), "r"(valid ? 16 : 0));
@@ -641,12 +670,15 @@ __device__ __forceinline__ void cpa16(void* dst, const void* src, bool valid) {
 __device__ __forceinline__ void cpa4(void* dst, const void* src, bool valid) {
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" :: "r"((unsigned)__cvta_generic_to_shared(dst)), "l"(src), "r"(valid ? 4 : 0));
 }
+__device__ __forceinline__ void cpa8(void* dst, const void* src) {
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"((unsigned)__cvta_generic_to_shared(dst)), "l"(src));
+}
 __device__ __forceinline__ void cpa_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
 template <int N> __device__ __forceinline__ void cpa_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory"); }
 
-template <int RT, int NS>
+template <int RT, int NS, bool C2>
 __global__ __launch_bounds__(256, 1) void up_gemm(const uint8_t* __restrict__ xq, const uint8_t* __restrict__ xs, const uint8_t* __restrict__ w1,
-    const uint8_t* __restrict__ s1, const uint8_t* __restrict__ w3, const uint8_t* __restrict__ s3, int I,
+    const ScaleV s1, const uint8_t* __restrict__ w3, const ScaleV s3, int I,
     const float* __restrict__ rw, const int* __restrict__ G, const Item* __restrict__ items, const int* __restrict__ prow,
     uint8_t* __restrict__ hq, uint8_t* __restrict__ hs, int topk) {
   constexpr int WMR = RT / 32, WNC = 8 / WMR, TPW = 16 / WNC, AJ = RT * 8 / 256;   // TPW: n8 tiles per warp and matrix
@@ -673,18 +705,38 @@ __global__ __launch_bounds__(256, 1) void up_gemm(const uint8_t* __restrict__ xq
     const long long tile = ((long long)it.e * I + jb + 8 * (t & 15)) / 8;
     b_src[j] = (t < 16 ? w1 : w3) + tile * ALL * 512 + l * 16;
   }
-  const uint8_t* bs_src = nullptr;
+  // B scales: raw words (threads < 64: half a tile's 32 bytes each) or a coded tile's 8 code bytes (even threads)
+  const uint8_t* bs_src = nullptr; bool bs_raw = true;
   if (tid < 64) {
     const int t = tid >> 1;
     const long long tile = ((long long)it.e * I + jb + 8 * (t & 15)) / 8;
-    bs_src = (t < 16 ? s1 : s3) + tile * ALL * 32 + (tid & 1) * 16;
+    const ScaleV& v = t < 16 ? s1 : s3;
+    if (!C2) bs_src = v.raw + tile * ALL * 32 + (tid & 1) * 16;
+    else {
+      const int ri = (int)__ldg(v.desc + tile).z;
+      bs_raw = ri >= 0;
+      bs_src = bs_raw ? v.raw + (long long)ri * ALL * 32 + (tid & 1) * 16 : v.code + tile * ALL * 8;
+    }
   }
   auto load = [&](int s, UgStageT<RT>& b) {
     for (int j = 0; j < AJ; ++j) cpa16(&b.a[a_row[j]][((tid + 256 * j) & 7) * 16], a_src[j] + s * 128, a_ok[j]);
     if (tid < RT) cpa4(&b.as[tid], as_src + s * 4, tid < it.n);
     for (int j = 0; j < 4; ++j) { const int i = tid + 256 * j; cpa16(&b.b[i >> 5][i & 31], b_src[j] + s * 512, true); }
-    if (tid < 64) cpa16(reinterpret_cast<uint8_t*>(&b.bs[tid >> 1][0]) + (tid & 1) * 16, bs_src + s * 32, true);
+    if (tid < 64) {
+      if (bs_raw) cpa16(reinterpret_cast<uint8_t*>(&b.bs[tid >> 1][0]) + (tid & 1) * 16, bs_src + s * 32, true);
+      else if (!(tid & 1)) cpa8(&b.bc[tid >> 1][0], bs_src + s * 8);
+    }
   };
+  // this lane's row base (x 0x01010101) of each of its tiles, and which of them are raw
+  uint32_t bmul[2 * TPW]; uint32_t rawm = 0;
+  if (C2)
+    for (int t = 0; t < 2 * TPW; ++t) {
+      const int tb = (t < TPW ? 0 : 16) + wn * TPW + (t % TPW);
+      const long long tile = ((long long)it.e * I + jb + 8 * (tb & 15)) / 8;
+      const uint4 d = __ldg((tb < 16 ? s1 : s3).desc + tile);
+      if ((int)d.z >= 0) rawm |= 1u << t;
+      bmul[t] = (((g < 4 ? d.x : d.y) >> (8 * (g & 3))) & 0xFFu) * 0x01010101u;
+    }
   float acc[2][2 * TPW][4];
   for (int m = 0; m < 2; ++m) for (int t = 0; t < 2 * TPW; ++t) for (int c = 0; c < 4; ++c) acc[m][t][c] = 0.f;
 #pragma unroll
@@ -699,7 +751,7 @@ __global__ __launch_bounds__(256, 1) void up_gemm(const uint8_t* __restrict__ xq
 #pragma unroll
     for (int t = 0; t < 2 * TPW; ++t) {
       const int tb = (t < TPW ? 0 : 16) + wn * TPW + (t % TPW);
-      bw[t] = b.b[tb][lane]; bsc[t] = b.bs[tb][g];
+      bw[t] = b.b[tb][lane]; bsc[t] = (!C2 || ((rawm >> t) & 1)) ? b.bs[tb][g] : bmul[t] + s2_spread(b.bc[tb][g]);
     }
     uint32_t sfa4[2];
     for (int m = 0; m < 2; ++m) sfa4[m] = b.as[wm * 32 + m * 16 + (lane >> 2) + 8 * (lane & 1)];
@@ -757,10 +809,10 @@ __global__ __launch_bounds__(256, 1) void up_gemm(const uint8_t* __restrict__ xq
 // of 8), 8 warps (2 row halves x 4 groups of 32 columns), I in steps of 128 through shared memory, UG_NS stages in flight.
 // down_mx<4> reads the item's A rows from global memory in every warp and the weights into registers without prefetch;
 // here each block loads both once per step. Same MMA sequence per output as down_mx (bitwise equal).
-template <int RT> struct DgStageT { uint8_t a[RT][UG_AP]; uint32_t as[RT]; uint4 b[16][32]; uint32_t bs[16][8]; };
-template <int RT, int NS>
+template <int RT> struct DgStageT { uint8_t a[RT][UG_AP]; uint32_t as[RT]; uint4 b[16][32]; uint32_t bs[16][8]; uint8_t bc[16][8]; };
+template <int RT, int NS, bool C2>
 __global__ __launch_bounds__(256, 1) void down_gemm(const uint8_t* __restrict__ hq, const uint8_t* __restrict__ hs, const uint8_t* __restrict__ w2,
-    const uint8_t* __restrict__ s2, int I, const int* __restrict__ G, const Item* __restrict__ items, float* __restrict__ out, int c0, int ldo) {
+    const ScaleV s2, int I, const int* __restrict__ G, const Item* __restrict__ items, float* __restrict__ out, int c0, int ldo) {
   constexpr int WMR = RT / 32, WNC = 8 / WMR, TPW = 16 / WNC, AJ = RT * 8 / 256;
   pdl_entry();
   if ((int)blockIdx.y >= *G) return;
@@ -785,18 +837,34 @@ __global__ __launch_bounds__(256, 1) void down_gemm(const uint8_t* __restrict__ 
     const long long tile = ((long long)it.e * H + nb + 8 * t) / 8;
     b_src[j] = w2 + tile * steps * 512 + l * 16;
   }
-  const uint8_t* bs_src = nullptr;
+  const uint8_t* bs_src = nullptr; bool bs_raw = true;   // (as up_gemm)
   if (tid < 32) {
     const int t = tid >> 1;
     const long long tile = ((long long)it.e * H + nb + 8 * t) / 8;
-    bs_src = s2 + tile * steps * 32 + (tid & 1) * 16;
+    if (!C2) bs_src = s2.raw + tile * steps * 32 + (tid & 1) * 16;
+    else {
+      const int ri = (int)__ldg(s2.desc + tile).z;
+      bs_raw = ri >= 0;
+      bs_src = bs_raw ? s2.raw + (long long)ri * steps * 32 + (tid & 1) * 16 : s2.code + tile * steps * 8;
+    }
   }
   auto load = [&](int s, DgStageT<RT>& b) {
     for (int j = 0; j < AJ; ++j) cpa16(&b.a[a_row[j]][((tid + 256 * j) & 7) * 16], a_src[j] + s * 128, a_ok[j]);
     if (tid < RT) cpa4(&b.as[tid], as_src + s * 4, tid < it.n);
     for (int j = 0; j < 2; ++j) { const int i = tid + 256 * j; cpa16(&b.b[i >> 5][i & 31], b_src[j] + s * 512, true); }
-    if (tid < 32) cpa16(reinterpret_cast<uint8_t*>(&b.bs[tid >> 1][0]) + (tid & 1) * 16, bs_src + s * 32, true);
+    if (tid < 32) {
+      if (bs_raw) cpa16(reinterpret_cast<uint8_t*>(&b.bs[tid >> 1][0]) + (tid & 1) * 16, bs_src + s * 32, true);
+      else if (!(tid & 1)) cpa8(&b.bc[tid >> 1][0], bs_src + s * 8);
+    }
   };
+  uint32_t bmul[TPW]; uint32_t rawm = 0;
+  if (C2)
+    for (int t = 0; t < TPW; ++t) {
+      const long long tile = ((long long)it.e * H + nb + 8 * (wn * TPW + t)) / 8;
+      const uint4 d = __ldg(s2.desc + tile);
+      if ((int)d.z >= 0) rawm |= 1u << t;
+      bmul[t] = (((g < 4 ? d.x : d.y) >> (8 * (g & 3))) & 0xFFu) * 0x01010101u;
+    }
   float acc[2][TPW][4];
   for (int m = 0; m < 2; ++m) for (int t = 0; t < TPW; ++t) for (int c = 0; c < 4; ++c) acc[m][t][c] = 0.f;
 #pragma unroll
@@ -809,7 +877,10 @@ __global__ __launch_bounds__(256, 1) void down_gemm(const uint8_t* __restrict__ 
     const DgStageT<RT>& b = st[s % NS];
     uint4 bw[TPW]; uint32_t bsc[TPW];
 #pragma unroll
-    for (int t = 0; t < TPW; ++t) { bw[t] = b.b[wn * TPW + t][lane]; bsc[t] = b.bs[wn * TPW + t][g]; }
+    for (int t = 0; t < TPW; ++t) {
+      bw[t] = b.b[wn * TPW + t][lane];
+      bsc[t] = (!C2 || ((rawm >> t) & 1)) ? b.bs[wn * TPW + t][g] : bmul[t] + s2_spread(b.bc[wn * TPW + t][g]);
+    }
     uint32_t sfa4[2];
     for (int m = 0; m < 2; ++m) sfa4[m] = b.as[wm * 32 + m * 16 + (lane >> 2) + 8 * (lane & 1)];
 #pragma unroll
@@ -1129,6 +1200,47 @@ inline int gmax_of(int R, int topk, int E) { const int P = R * topk; return (P <
 inline size_t al(size_t b) { return (b + 255) & ~(size_t)255; }
 } // namespace
 
+// DS41_MX_S2: the routed-expert scales handed to ds41_moe_mx* are 2-bit coded blobs (set by the loader)
+static int g_s2 = 0;
+// the expert kernels of one ds41_moe_mx_ex call (C2: the scales in the 2-bit coding)
+template <bool C2>
+int moe_launch(const uint8_t* X, const uint8_t* XS, int R, const float* rw, const uint8_t* W1, ScaleV S1, const uint8_t* W3, ScaleV S3,
+               const uint8_t* W2, ScaleV S2, int I, const float* add, float* y, int topk, int GR, int Gm, int np, int hn, const int* G,
+               const Item* items, const int* pairmap, const int* prow, uint8_t* hq, uint8_t* hs, float* out, cudaStream_t st) {
+  // R = 1: 8 warps per block split K (decode 31.8 -> 31.3 ms; DS41_UP_KS=4 the earlier 4)
+  static const int up_ks = std::getenv("DS41_UP_KS") ? std::atoi(std::getenv("DS41_UP_KS")) : 8;
+  if (GR == 16 && up_ks == 8) {
+    pdl_launch((up_mx<1, 8, C2>), dim3(dim3(I / 32, Gm)), dim3(256), 0, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk);
+    pdl_launch((down_mx<1, C2>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out);
+  } else if (GR == 16) {
+    pdl_launch((up_mx<1, 4, C2>), dim3(dim3(I / 32, Gm)), dim3(128), 0, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk);
+    pdl_launch((down_mx<1, C2>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out);
+  } else if (GR == 64 || GR == 128) {
+    // DS41_DOWN_GEMM=0: down_mx<4> (the same MMA sequence per output, bitwise equal; 64-row items only)
+    static const bool dg = !(std::getenv("DS41_DOWN_GEMM") && std::getenv("DS41_DOWN_GEMM")[0] == '0');
+#define MOE_GEMM(RT, UNS, DNS) do { \
+      const int usm = UNS * (int)sizeof(UgStageT<RT>), dsm = DNS * (int)sizeof(DgStageT<RT>); \
+      static const bool attr = cudaFuncSetAttribute(up_gemm<RT, UNS, C2>, cudaFuncAttributeMaxDynamicSharedMemorySize, usm) == cudaSuccess && \
+                               cudaFuncSetAttribute(down_gemm<RT, DNS, C2>, cudaFuncAttributeMaxDynamicSharedMemorySize, dsm) == cudaSuccess; \
+      if (!attr) return 3; \
+      pdl_launch((up_gemm<RT, UNS, C2>), dim3(dim3(I / 128, Gm)), dim3(256), usm, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk); \
+      if (np > 1 || dg || RT != 64) { \
+        for (int pc = 0; pc < np; ++pc) { \
+          pdl_launch((down_gemm<RT, DNS, C2>), dim3(dim3(hn / 128, Gm)), dim3(256), dsm, st, hq, hs, W2, S2, I, G, items, out, pc * hn, hn); \
+          if (np > 1) pdl_launch(combine_kernel, dim3((unsigned)(((long long)R * (hn / 4) + 255) / 256)), dim3(256), 0, st, (const float*)out, (const int*)pairmap, add, y, R, topk, pc * hn, hn); } } \
+      else pdl_launch((down_mx<4, C2>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out); } while (0)
+    if (GR == 128) MOE_GEMM(128, 2, 3); else MOE_GEMM(64, 3, 3);
+#undef MOE_GEMM
+  } else if (GR == 32) {
+    pdl_launch((up_mx<2, 1, C2>), dim3(dim3(I / 128, Gm)), dim3(128), 0, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk);
+    pdl_launch((down_mx<2, C2>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out);
+  } else {
+    pdl_launch((up_mx<4, 1, C2>), dim3(dim3(I / 128, Gm)), dim3(128), 0, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk);
+    pdl_launch((down_mx<4, C2>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out);
+  }
+  return 0;
+}
+
 extern "C" {
 // y [M, N] FP32 = A . W^T: A E4M3 [M, K] + UE8M0 [M, K/32], W E4M3 [N, K] + E8M0 [ceil(N/32), K/32]; K % 64 == 0, N % 8 == 0
 int ds41_fp8_gemm_mx_ex(const void* aq, const void* as_, const void* w, const void* ws, void* y, int M, int N, int K, int bf16out, cudaStream_t st) {
@@ -1242,6 +1354,8 @@ inline int col_passes(int R, int topk, int E) {
   while (4 * P * H / n > cap && n < 4) n *= 2;
   return n;
 }
+void ds41_moe_mx_set_s2(int on) { g_s2 = on; }
+int ds41_moe_mx_get_s2() { return g_s2; }
 size_t ds41_moe_mx_ws_bytes(int R, int I, int topk, int E) {
   const size_t P = (size_t)R * topk;
   return al(16) + al(sizeof(Item) * gmax_of(R, topk, E)) + 2 * al(4 * P) + al(P * I) + al(P * I / 32) + al(4 * P * H / col_passes(R, topk, E));
@@ -1267,39 +1381,11 @@ int ds41_moe_mx_ex(const void* xq, const void* xs, int R, const int64_t* idx, co
   float* out = (float*)p;
   pdl_launch(group_kernel, dim3(1), dim3(1024), 0, st, idx, P, GR, E, G, items, pairmap, prow);
   const uint8_t *X = (const uint8_t*)xq, *XS = (const uint8_t*)xs;
-  const uint8_t *W1 = (const uint8_t*)w1, *S1 = (const uint8_t*)s1, *W3 = (const uint8_t*)w3, *S3 = (const uint8_t*)s3;
-  const uint8_t *W2 = (const uint8_t*)w2, *S2 = (const uint8_t*)s2;
-  // R = 1: 8 warps per block split K (decode 31.8 -> 31.3 ms; DS41_UP_KS=4 the earlier 4)
-  static const int up_ks = std::getenv("DS41_UP_KS") ? std::atoi(std::getenv("DS41_UP_KS")) : 8;
-  if (GR == 16 && up_ks == 8) {
-    pdl_launch((up_mx<1, 8>), dim3(dim3(I / 32, Gm)), dim3(256), 0, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk);
-    pdl_launch((down_mx<1>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out);
-  } else if (GR == 16) {
-    pdl_launch((up_mx<1, 4>), dim3(dim3(I / 32, Gm)), dim3(128), 0, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk);
-    pdl_launch((down_mx<1>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out);
-  } else if (GR == 64 || GR == 128) {
-    // DS41_DOWN_GEMM=0: down_mx<4> (the same MMA sequence per output, bitwise equal; 64-row items only)
-    static const bool dg = !(std::getenv("DS41_DOWN_GEMM") && std::getenv("DS41_DOWN_GEMM")[0] == '0');
-#define MOE_GEMM(RT, UNS, DNS) do { \
-      const int usm = UNS * (int)sizeof(UgStageT<RT>), dsm = DNS * (int)sizeof(DgStageT<RT>); \
-      static const bool attr = cudaFuncSetAttribute(up_gemm<RT, UNS>, cudaFuncAttributeMaxDynamicSharedMemorySize, usm) == cudaSuccess && \
-                               cudaFuncSetAttribute(down_gemm<RT, DNS>, cudaFuncAttributeMaxDynamicSharedMemorySize, dsm) == cudaSuccess; \
-      if (!attr) return 3; \
-      pdl_launch((up_gemm<RT, UNS>), dim3(dim3(I / 128, Gm)), dim3(256), usm, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk); \
-      if (np > 1 || dg || RT != 64) { \
-        for (int pc = 0; pc < np; ++pc) { \
-          pdl_launch((down_gemm<RT, DNS>), dim3(dim3(hn / 128, Gm)), dim3(256), dsm, st, hq, hs, W2, S2, I, G, items, out, pc * hn, hn); \
-          if (np > 1) pdl_launch(combine_kernel, dim3((unsigned)(((long long)R * (hn / 4) + 255) / 256)), dim3(256), 0, st, (const float*)out, (const int*)pairmap, add, y, R, topk, pc * hn, hn); } } \
-      else pdl_launch((down_mx<4>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out); } while (0)
-    if (GR == 128) MOE_GEMM(128, 2, 3); else MOE_GEMM(64, 3, 3);
-#undef MOE_GEMM
-  } else if (GR == 32) {
-    pdl_launch((up_mx<2, 1>), dim3(dim3(I / 128, Gm)), dim3(128), 0, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk);
-    pdl_launch((down_mx<2>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out);
-  } else {
-    pdl_launch((up_mx<4, 1>), dim3(dim3(I / 128, Gm)), dim3(128), 0, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk);
-    pdl_launch((down_mx<4>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out);
-  }
+  const ScaleV S1 = scale_v(s1, g_s2, (long long)E * I / 8, H / 128), S3 = scale_v(s3, g_s2, (long long)E * I / 8, H / 128);
+  const ScaleV S2 = scale_v(s2, g_s2, (long long)E * H / 8, I / 128);
+  const int lrc = (g_s2 ? moe_launch<true> : moe_launch<false>)(X, XS, R, rw, (const uint8_t*)w1, S1, (const uint8_t*)w3, S3, (const uint8_t*)w2, S2, I,
+                                                             add, y, topk, GR, Gm, np, hn, G, items, pairmap, prow, hq, hs, out, st);
+  if (lrc) return lrc;
   if (skip_combine || np > 1) return (int)cudaGetLastError();
   const long long n4 = (long long)R * (H / 4);
   pdl_launch(combine_kernel, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, out, pairmap, add, y, R, topk, 0, H);

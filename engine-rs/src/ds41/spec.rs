@@ -14,6 +14,14 @@
 //!   The emitted tokens are exactly the ones plain decoding with the same keys samples (the drafts only decide how many
 //!   rows are verified at once); drafts sample with the same keys too, which couples them to the target.
 //! - The accepted rows' target hidden states seed the stages' window KV for the next draft.
+//! - DS41_SPEC_RS=1 (default off) for sampled sequences (T > 0): standard speculative sampling (Leviathan et al. 2023,
+//!   Chen et al. 2023) instead of the key coupling. Drafts sample from q = softmax(draft logits / T) with their own
+//!   keys (salted by seed and the round's position); the target accepts draft d at a row with probability
+//!   min(1, p(d) / q(d)) (p = softmax(target logits / T), uniform of key(seed ^ SALT_U, position)), else samples
+//!   max(p - q, 0) (Gumbel keys of seed ^ SALT_R) and stops; all accepted: the next row samples p as plain decoding
+//!   does. Every emitted token is distributed exactly as plain sampling's (exact in exact arithmetic; the q used is the
+//!   very logits the draft sampled from), not the same tokens for a seed. Its acceptance is the optimal 1 - TV(p, q) per
+//!   draft, against the coupling's P(both Gumbel argmaxes agree). Greedy (T = 0) is unchanged.
 use super::cfg::{Cfg, Split};
 use super::load::Checkpoint;
 use super::model::{attn_fused, graph_on, rmsn, rot, Fp8W, Layer, Model, Seq};
@@ -68,7 +76,30 @@ pub struct MtpGraph {
 /// one parameter upload and one read-back instead of a host round trip (allreduce read + confidence read) per draft.
 static DRAFT_CHECK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static DRAFT_CHECK_BAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub struct MarkovGraph { prev: Tensor, temps: Tensor, keys: Tensor, out: Tensor, g: crate::tp::graph::Owned, _keep: Vec<Tensor> }
+pub struct MarkovGraph { prev: Tensor, temps: Tensor, keys: Tensor, out: Tensor, qloc: Option<Tensor>, g: crate::tp::graph::Owned, _keep: Vec<Tensor> }
+
+/// DS41_SPEC_RS=1: rejection-sampling verification for sampled sequences (module doc). Default off: measured 2026-10-28
+/// on the service (open texts and thinking at T = 1, DS41_RS_STATS on the same rows) its expected acceptance 1 - TV is
+/// only 0.615 against the key coupling's 0.603 (DSpark's q is close to p in shape), and the service speed was flat
+/// (45.84 vs 45.78 tok/s, the q gather and verdict eat the +1.2% tokens per round); off keeps T > 0 output a function
+/// of the seed alone (the same as plain decoding), bitwise as before.
+pub fn rs_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_SPEC_RS").is_ok_and(|v| v == "1")) }
+const SALT_D: u64 = 0x6a09_e667_f3bc_c908;
+const SALT_R: u64 = 0xbb67_ae85_84ca_a73b;
+const SALT_U: u64 = 0x3c6e_f372_fe94_f82b;
+/// The seed of a draft's Gumbel keys: the plain one (coupled to the target) unless rejection sampling verifies it, then
+/// salted and fresh for every round (p0: the round's pending position).
+fn draft_seed(seed: u64, temp: f32, p0: i64) -> u64 {
+    if rs_on() && temp > 0.0 { seed ^ SALT_D ^ (p0 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) } else { seed }
+}
+/// A uniform in [0, 1) from a key (splitmix64 finalizer, 53 bits).
+fn unif(k: u64) -> f64 {
+    let mut z = k.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
 
 fn draft_graph_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_DRAFT_GRAPH").map_or(true, |v| v != "0")) }
 
@@ -203,6 +234,7 @@ impl Model {
         let mut prev: Vec<i64> = toks.to_vec();
         let conf_x = mt.conf.narrow(0, 0, c.dim);
         let conf_m = mt.conf.narrow(0, c.dim, c.dspark_markov_rank);
+        let mut qs = Vec::new();
         for j in 0..blk {
             let emb = mt.markov_embed.index_select(0, &Tensor::from_slice(&prev).to_device(dev));     // [B, rank]
             let bias = super::kern::bf16_gemv(&emb, &mt.markov_head);                                 // [B, v1 - v0]
@@ -214,15 +246,102 @@ impl Model {
                 if self.sp.world > 1 { crate::tp::allreduce(&full); }
                 v.push(full);
             }
-            let keys: Vec<u64> = seqs.iter().enumerate().map(|(b, s)| crate::sampling::key(seeds[b], (s.pos + j + 1) as u64)).collect();
+            let keys: Vec<u64> = seqs.iter().enumerate().map(|(b, s)| crate::sampling::key(draft_seed(seeds[b], temps[b], s.pos), (s.pos + j + 1) as u64)).collect();
             let next = self.sample_split(&lg, temps, &keys);
+            qs.push(lg.to_kind(Kind::Float));
             let cf = (xf.index_select(0, &rows).to_kind(Kind::Float).matmul(&conf_x) + emb.to_kind(Kind::Float).matmul(&conf_m)).to_device(Device::Cpu);
             let cf: Vec<f32> = Vec::<f32>::try_from(cf).unwrap();
             for b in 0..bsz { drafts[b].push(next[b]); confs[b].push(cf[b]); }
             prev = next;
         }
+        self.keep_draft_q(&Tensor::stack(&qs, 0), temps);
         (drafts, confs)
     }
+
+    /// With rejection sampling for any sampled sequence: every rank's draft logits [block, B, v1 - v0] into the whole
+    /// vocabulary (draft_q, for rs_tokens); else draft_q is cleared.
+    fn keep_draft_q(&self, qloc: &Tensor, temps: &[f32]) {
+        if !((rs_on() || stats_on()) && temps.iter().any(|&t| t > 0.0)) { *self.draft_q.borrow_mut() = None; return; }
+        let (blk, b) = (qloc.size()[0], qloc.size()[1]);
+        let q = if self.sp.world == 1 { qloc.copy() } else {
+            let full = Tensor::zeros([blk, b, self.c.vocab], (Kind::Float, self.dev));
+            full.narrow(2, self.sp.v0, self.sp.v1 - self.sp.v0).copy_(qloc);
+            crate::tp::allreduce(&full);
+            full
+        };
+        *self.draft_q.borrow_mut() = Some(q);
+    }
+
+    /// The verify rows' tokens of one sequence under rejection sampling: lg [d + 1, vocab] its target logits (rows of
+    /// the pending token and the d drafts), q [d, vocab] the drafts' logits (draft_q), p0 the pending position. Row j < d
+    /// gives drafts[j] if accepted, else a sample of max(p - q, 0); row d the plain sample. The caller accepts drafts
+    /// while they equal these (an accepted draft is returned as itself, a rejected row never returns its draft).
+    pub fn rs_tokens(&self, lg: &Tensor, q: &Tensor, drafts: &[i64], temp: f32, seed: u64, p0: i64) -> Vec<i64> { rs_tokens(lg, q, drafts, temp, seed, p0) }
+}
+/// Model::rs_tokens (any device; ds41-kernel-test DS41_KT_ONLY=rs checks its output distribution)
+pub fn rs_tokens(lg: &Tensor, q: &Tensor, drafts: &[i64], temp: f32, seed: u64, p0: i64) -> Vec<i64> {
+        extern "C" { fn rs_gumbel_noise(out: *mut f32, stride: i64, rows: i32, cols: i32, col_offset: i64, temps: *const f32, keys: *const u64) -> i32; }
+        let d = drafts.len() as i64;
+        let plain_row = |j: i64| super::serve::sample(&lg.narrow(0, j, 1), temp, seed, p0 + j + 1);
+        if d == 0 { return vec![plain_row(0)]; }
+        let t = temp as f64;
+        let lp = (lg.narrow(0, 0, d).to_kind(Kind::Float) / t).log_softmax(-1, Kind::Float);
+        let lq = (q.narrow(0, 0, d).to_kind(Kind::Float) / t).log_softmax(-1, Kind::Float);
+        let di = Tensor::from_slice(drafts).to_device(lg.device()).view([d, 1]);
+        let lr = (lp.gather(1, &di, false) - lq.gather(1, &di, false)).view([d]);   // log p(d) / q(d)
+        let r = (lp.exp() - lq.exp()).clamp_min(0.0);
+        let noise = Tensor::zeros_like(&r);
+        let temps = vec![1f32; d as usize];
+        let keys: Vec<u64> = (0..d).map(|j| crate::sampling::key(seed ^ SALT_R, (p0 + j + 1) as u64)).collect();
+        assert_eq!(unsafe { rs_gumbel_noise(noise.data_ptr().cast(), noise.stride()[0], d as i32, r.size()[1] as i32, 0, temps.as_ptr(), keys.as_ptr()) }, 0);
+        let (_, res) = (r.log() + noise).max_dim(-1, false);
+        let host: Vec<f32> = Vec::<f32>::try_from(Tensor::stack(&[lr, res.to_kind(Kind::Float), r.amax(&[-1i64][..], false)], 0).to_device(Device::Cpu).view(-1)).unwrap();
+        let mut ys = Vec::with_capacity(d as usize + 1);
+        for j in 0..d as usize {
+            let u = unif(crate::sampling::key(seed ^ SALT_U, p0 as u64 + j as u64 + 1));
+            let (lrj, resj, rmax) = (host[j] as f64, host[d as usize + j] as i64, host[2 * d as usize + j]);
+            // (u = 0 accepts; a rejection with max(p - q, 0) all zero -- rounding when p ~ q -- samples p instead)
+            let y = if u.ln() < lrj { drafts[j] } else if rmax > 0.0 { resj } else { plain_row(j as i64) };
+            ys.push(y);
+            if y != drafts[j] { break; }
+        }
+        if ys.len() == d as usize && *ys.last().unwrap() == drafts[d as usize - 1] { ys.push(plain_row(d)); }
+        ys
+}
+fn stats_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_RS_STATS").is_ok()) }
+/// DS41_RS_STATS=<file> (with or without DS41_SPEC_RS; T > 0 rounds): per draft row of a verify, one line
+/// "rs j 1-TV coupling acc check": rs whether rejection sampling verified it; 1-TV = sum min(p, q) the expected acceptance
+/// of rejection sampling, coupling = P(argmax(log p + G) = argmax(log q + G)) = sum_i 1 / sum_j max(p_j / p_i, q_j / q_i)
+/// that of the key coupling (both on this row's target p = softmax(lg / T) and draft q = softmax(draft logits / T); the
+/// coupling over the 512 tokens of the largest p + q); acc 1 / 0 the row's draft accepted / rejected, -1 not reached;
+/// check 1 if the draft token is what the gathered q samples with the draft's own keys (q is the distribution the draft
+/// sampled from), else 0. lg [d + 1, vocab], q [d, vocab], k the accepted count, dseed the draft keys' seed.
+pub fn spec_stats(lg: &Tensor, q: &Tensor, drafts: &[i64], temp: f32, dseed: u64, p0: i64, k: usize) {
+    static F: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let Some(f) = F.get_or_init(|| std::env::var("DS41_RS_STATS").ok().map(|p| std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(p).expect("DS41_RS_STATS")))) else { return };
+    let d = drafts.len() as i64;
+    if d == 0 || temp <= 0.0 { return; }
+    let t = temp as f64;
+    let p = (lg.narrow(0, 0, d).to_kind(Kind::Float) / t).softmax(-1, Kind::Double);
+    let qq = (q.narrow(0, 0, d).to_kind(Kind::Float) / t).softmax(-1, Kind::Double);
+    let ovl = p.minimum(&qq).sum_dim_intlist(&[-1i64][..], false, Kind::Double);
+    let (_, idx) = (&p + &qq).topk(512, -1, true, false);
+    let (pk, qk) = (p.gather(1, &idx, false).clamp_min(1e-300), qq.gather(1, &idx, false).clamp_min(1e-300));
+    // m[r, i, j] = max(p_j / p_i, q_j / q_i)
+    let m = (pk.unsqueeze(1) / pk.unsqueeze(2)).maximum(&(qk.unsqueeze(1) / qk.unsqueeze(2)));
+    let cpl = m.sum_dim_intlist(&[2i64][..], false, Kind::Double).reciprocal().sum_dim_intlist(&[1i64][..], false, Kind::Double);
+    let h: Vec<f64> = Vec::<f64>::try_from(Tensor::stack(&[ovl, cpl], 1).to_device(Device::Cpu).view(-1)).unwrap();
+    let mut f = f.lock().unwrap();
+    use std::io::Write;
+    for j in 0..d as usize {
+        let chk = super::serve::sample(&q.narrow(0, j as i64, 1), temp, dseed, p0 + j as i64 + 1) == drafts[j];
+        let acc = if j < k { 1 } else if j == k { 0 } else { -1 };
+        let _ = writeln!(f, "{} {j} {:.6} {:.6} {acc} {}", rs_on() as i32, h[2 * j], h[2 * j + 1], chk as i32);
+    }
+}
+/// (the draft key seed under rejection sampling, for ds41-kernel-test)
+pub fn rs_draft_seed(seed: u64, temp: f32, p0: i64) -> u64 { draft_seed(seed, temp, p0) }
+impl Model {
 
     /// The drafts through the body graph and the Markov graph (MarkovGraph): same tokens and confidences as the eager
     /// loop of mtp_draft.
@@ -234,7 +353,7 @@ impl Model {
         tv[..bsz].copy_from_slice(temps);
         let mut kv = vec![0i64; blk * 64];
         for j in 0..blk {
-            for (b, s) in seqs.iter().enumerate() { kv[j * 64 + b] = crate::sampling::key(seeds[b], (s.pos + j as i64 + 1) as u64) as i64; }
+            for (b, s) in seqs.iter().enumerate() { kv[j * 64 + b] = crate::sampling::key(draft_seed(seeds[b], temps[b], s.pos), (s.pos + j as i64 + 1) as u64) as i64; }
         }
         let _ = self.mtp_body_graph(seqs, e, pos, false);
         let mut graphs = self.mtp_graphs.borrow_mut();
@@ -245,14 +364,15 @@ impl Model {
             let tbuf = Tensor::zeros([64], (Kind::Float, dev));
             let kbuf = Tensor::zeros([blk as i64 * 64], (Kind::Int64, dev));
             let rows: Vec<Tensor> = (0..blk as i64).map(|j| Tensor::from_slice(&(0..bsz as i64).map(|b| b * blk as i64 + j).collect::<Vec<_>>()).to_device(dev)).collect();
+            let qloc = (rs_on() || stats_on()).then(|| Tensor::zeros([blk as i64, bsz as i64, self.sp.v1 - self.sp.v0], (Kind::Float, dev)));
             tch::Cuda::synchronize(0);
             begin_pool(super::mem::GRAPH_POOL).expect("capture begin");
-            let out = self.markov_steps(&g.xf, &g.logits, &prev, &tbuf, &kbuf, &rows);
+            let out = self.markov_steps(&g.xf, &g.logits, &prev, &tbuf, &kbuf, &rows, qloc.as_ref());
             end().expect("capture end");
             let mut keep = rows;
             keep.push(g.xf.shallow_clone());
             keep.push(g.logits.shallow_clone());
-            g.mk = Some(MarkovGraph { prev, temps: tbuf, keys: kbuf, out, g: Owned::take(), _keep: keep });
+            g.mk = Some(MarkovGraph { prev, temps: tbuf, keys: kbuf, out, qloc, g: Owned::take(), _keep: keep });
             super::mem::occupy();
         }
         let mk = g.mk.as_mut().unwrap();
@@ -260,6 +380,7 @@ impl Model {
         let _ = mk.temps.copy_(&Tensor::from_slice(&tv));
         let _ = mk.keys.copy_(&Tensor::from_slice(&kv));
         mk.g.replay();
+        match &mk.qloc { Some(ql) => self.keep_draft_q(ql, temps), None => *self.draft_q.borrow_mut() = None }
         let host: Vec<f32> = Vec::<f32>::try_from(mk.out.to_device(Device::Cpu).view(-1)).unwrap();   // [blk, B, 2]
         let mut drafts = vec![Vec::with_capacity(blk); bsz];
         let mut confs = vec![Vec::with_capacity(blk); bsz];
@@ -275,7 +396,8 @@ impl Model {
     /// The Markov / sampling / confidence steps of a draft on the device (captured by mtp_draft_graph): prev [B] the
     /// pending tokens, temps [64] and keys [block * 64] the Gumbel rows per draft, rows[j] the block rows of draft j.
     /// -> [block, B, 2] FP32 (token id, confidence); ids below 2^24 are exact.
-    fn markov_steps(&self, xf: &Tensor, logits: &Tensor, prev: &Tensor, temps: &Tensor, keys: &Tensor, rows: &[Tensor]) -> Tensor {
+    /// qloc [block, B, v1 - v0]: also keeps every draft's logits (DS41_SPEC_RS)
+    fn markov_steps(&self, xf: &Tensor, logits: &Tensor, prev: &Tensor, temps: &Tensor, keys: &Tensor, rows: &[Tensor], qloc: Option<&Tensor>) -> Tensor {
         extern "C" { fn rs_gumbel_argmax_packet(values: *const f32, rows: i32, width: i32, start: i64, temps: *const f32, keys: *const u64,
                                                 part_v: *mut f32, part_i: *mut i32, packet: *mut f32, world: i32, rank: i32) -> i32; }
         let mt = self.mtp.as_ref().unwrap();
@@ -291,6 +413,7 @@ impl Model {
             let bias = super::kern::bf16_gemv(&emb, &mt.markov_head);                                 // [B, v1 - v0]
             let lg = (logits.index_select(0, r) + bias).to_kind(Kind::Float).contiguous();
             let width = lg.size()[1];
+            if let Some(ql) = qloc { let _ = ql.get(j as i64).copy_(&lg); }
             let part_v = Tensor::empty([b * 32], (Kind::Float, self.dev));
             let part_i = Tensor::empty([b * 32], (Kind::Int, self.dev));
             let packet = Tensor::empty([world, b, 2], (Kind::Float, self.dev));
@@ -475,9 +598,14 @@ impl Model {
         ids.extend(d);
         let (lg, hid, rb) = prof("spec.verify", || self.spec_verify(seq, &ids));
         let n = ids.len();
-        let ys: Vec<i64> = prof("spec.sample", || (0..n).map(|j| super::serve::sample(&lg.narrow(0, j as i64, 1), temp, seed, p + j as i64 + 1)).collect());
+        let q = self.draft_q.borrow().as_ref().map(|q| q.select(1, 0));
+        let ys: Vec<i64> = prof("spec.sample", || match &q {
+            Some(q) if temp > 0.0 && rs_on() => self.rs_tokens(&lg, q, d, temp, seed, p),
+            _ => (0..n).map(|j| super::serve::sample(&lg.narrow(0, j as i64, 1), temp, seed, p + j as i64 + 1)).collect(),
+        });
         let mut k = 0;
         while k < d.len() && d[k] == ys[k] { k += 1; }
+        if let Some(q) = &q { spec_stats(&lg, q, d, temp, draft_seed(seed, temp, p), p, k); }
         prof("spec.commit", || { self.spec_rollback(seq, rb, k as i64 + 1); self.mtp_seed(seq, &hid.narrow(0, 0, k as i64 + 1), p); });
         let mut out: Vec<i64> = d[..k].to_vec();
         out.push(ys[k]);

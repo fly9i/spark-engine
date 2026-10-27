@@ -150,16 +150,34 @@ fn spec_cost() -> (f64, f64, f64) {
         if v.len() == 3 { (v[0], v[1], v[2]) } else { (22.0, 0.5, 2.5) }
     })
 }
-fn choose_drafts(confs: &[Vec<f32>], maxd: &[usize]) -> Vec<usize> {
+/// The acceptance model of choose_drafts: P(draft accepted | its predecessors accepted) = sigmoid(a conf + b), (a, b)
+/// per temperature class (greedy, sampled), DS41_SPEC_CALIB="a0,b0;a1,b1" (default 1,0;1,0: the confidence head as is;
+/// fit with bench/ds41/spec_calib.py on DS41_SPEC_LOG rounds). Only the number of verified drafts changes.
+fn spec_calib(temp: f32) -> (f64, f64) {
+    static C: std::sync::OnceLock<[(f64, f64); 2]> = std::sync::OnceLock::new();
+    let c = C.get_or_init(|| {
+        let mut c = [(1.0, 0.0); 2];
+        if let Ok(v) = std::env::var("DS41_SPEC_CALIB") {
+            for (i, part) in v.split(';').take(2).enumerate() {
+                let x: Vec<f64> = part.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+                if x.len() == 2 { c[i] = (x[0], x[1]); }
+            }
+        }
+        c
+    });
+    c[(temp > 0.0) as usize]
+}
+fn choose_drafts(confs: &[Vec<f32>], maxd: &[usize], temps: &[f32]) -> Vec<usize> {
     if std::env::var("DS41_SPEC_MIN_P").is_ok() {   // the fixed-threshold rule (comparison)
         return confs.iter().zip(maxd).map(|(c, &m)| super::spec::spec_len(c, m)).collect();
     }
     let (base, seq, row) = spec_cost();
     let b = confs.len();
     // P[s][i]: probability that the first i + 1 drafts of sequence s are all accepted
-    let p: Vec<Vec<f64>> = confs.iter().zip(maxd).map(|(c, &m)| {
+    let p: Vec<Vec<f64>> = confs.iter().zip(maxd).zip(temps).map(|((c, &m), &t)| {
+        let (a, bb) = spec_calib(t);
         let mut acc = 1.0;
-        c.iter().take(m).map(|&x| { acc *= 1.0 / (1.0 + (-(x as f64)).exp()); acc }).collect()
+        c.iter().take(m).map(|&x| { acc *= 1.0 / (1.0 + (-(a * x as f64 + bb)).exp()); acc }).collect()
     }).collect();
     // every sequence its own count: rows are added (the most likely next draft first) while a row's expected gain beats
     // the round's current rate (the verify graphs depend on the total row count only)
@@ -175,6 +193,13 @@ fn choose_drafts(confs: &[Vec<f32>], maxd: &[usize]) -> Vec<usize> {
     d
 }
 
+/// DS41_SPEC_LOG=<file> (rank 0): one JSON line per sequence and round {t, conf (every draft's confidence), d (verified),
+/// k (accepted)}, for fitting the acceptance model of choose_drafts (bench/ds41/spec_calib.py)
+fn spec_log(temp: f32, conf: &[f32], d: usize, k: usize) {
+    static F: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let f = F.get_or_init(|| std::env::var("DS41_SPEC_LOG").ok().map(|p| std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(p).expect("DS41_SPEC_LOG"))));
+    if let Some(f) = f { let _ = writeln!(f.lock().unwrap(), "{}", json!({"t": temp, "conf": conf, "d": d, "k": k})); }
+}
 fn spec_on() -> bool { std::env::var("DS41_SPEC").map_or(true, |v| v != "0") }
 
 struct Conn(std::sync::Arc<std::sync::Mutex<Option<UnixStream>>>);
@@ -821,7 +846,7 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
                 (a.max_new - a.out.len()).saturating_sub(1).min((stores[st].seq.cap - stores[st].seq.pos - 1).max(0) as usize)
             }).collect();
             let maxd: Vec<usize> = (0..dec.len()).map(|b| drafts[b].len().min(rooms[b])).collect();
-            let chosen = choose_drafts(&confs, &maxd);
+            let chosen = choose_drafts(&confs, &maxd, &temps);
             let rows: Vec<Vec<i64>> = (0..dec.len()).map(|b| {
                 let d = chosen[b].min(drafts[b].len());
                 let mut r = vec![toks[b]];
@@ -831,19 +856,30 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
             ctrl.send(&json!({"op": "sverify", "stores": sidx, "rows": rows}));
             let (lg, sp) = spec_verify(&m, &mut stores, &sidx, &rows);
             let mut keep = Vec::new();
+            let dq = m.draft_q.borrow_mut().take();
             for (b, &(_, i)) in dec.iter().enumerate() {
                 let a = &mut active[i];
                 let (off, d) = (sp.offs[b], rows[b].len() - 1);
+                // sampled sequences under DS41_SPEC_RS: the rejection-sampling verdict of every row (spec::rs_tokens)
+                let ys = match &dq {
+                    Some(q) if a.temp > 0.0 && super::spec::rs_on() => Some(m.rs_tokens(&lg.narrow(0, off, d as i64 + 1), &q.select(1, b as i64), &rows[b][1..], a.temp, a.seed, sp.p0[b])),
+                    _ => None,
+                };
                 let mut k = 0;
                 let mut emit = Vec::new();
                 loop {
-                    let y = sample(&lg.narrow(0, off + k as i64, 1), a.temp, a.seed, sp.p0[b] + k as i64 + 1);
+                    let y = match &ys { Some(v) => v[k], None => sample(&lg.narrow(0, off + k as i64, 1), a.temp, a.seed, sp.p0[b] + k as i64 + 1) };
                     emit.push(y);
                     if k < d && rows[b][k + 1] == y && !eos.contains(&y) && !a.stop_ids.contains(&y) { k += 1; } else { break; }
                 }
                 a.rounds += 1;
                 a.drafted += d;
                 a.accepted += k;
+                spec_log(a.temp, &confs[b], d, k);
+                if let Some(q) = &dq {
+                    super::spec::spec_stats(&lg.narrow(0, off, d as i64 + 1), &q.select(1, b as i64), &rows[b][1..], a.temp,
+                                            super::spec::rs_draft_seed(a.seed, a.temp, sp.p0[b]), sp.p0[b], k);
+                }
                 a.out.extend(emit);
                 keep.push(k as i64 + 1);
             }

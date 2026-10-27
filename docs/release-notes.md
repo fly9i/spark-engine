@@ -1,16 +1,21 @@
-spark-engine v0.3.3 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
+spark-engine v0.3.4 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
 
-Changes since v0.3.2: DeepSeek-V4.1-Flash startup (GLM-5.3-Flash and Qwen3.8-Flash-Next outputs were checked identical).
-Outputs stay bitwise identical; decode speed is unchanged (docs/ds41.md §7).
+Changes since v0.3.3: DeepSeek-V4.1-Flash decode and the RDMA proxy (GLM-5.3-Flash and Qwen3.8-Flash-Next outputs were
+checked identical). DeepSeek-V4.1 outputs stay bitwise identical (docs/ds41.md §7).
 
-- **Startup ~31 s → ~16 s** (cold start, launch to serving, three DGX Sparks):
-  - Shard files are read ahead whole on a thread with O_DIRECT into huge-page host memory, and the loader copies its
-    tensors out with a GPU kernel that reads that memory in place (GB10's CPU and GPU share it). The reads run at about
-    the disk's speed (~11.7 GB/s) while the layers are processed: loading 14 s → 8 s (`DS41_LOAD_PREFETCH`).
-  - The original checkpoint (Engram tables) is opened and the vision encoder loaded on a thread during the shard load.
-  - Only the single-sequence decode / verify graphs are captured before serving; the batched ones are captured in the
-    first ~5 s of idle time after, with their memory set aside when the KV pool is sized (`DS41_WARM_DEFER`):
-    warm-up 8 s → 4 s.
-  - `start-ds41.sh` starts the workers together and the front end alongside the engine (it listens once the engine is
-    ready; `openai_server.py --ready-file`).
-- **Fix:** the decode Engram upload no longer logs two `Tensor.pin_memory(device)` deprecation warnings per step.
+- **Routed-expert scales in a lossless 2-bit coding** (`DS41_MX_S2`, default on): the checkpoint's E8M0 expert scales
+  are nearly constant (99.9% take one of two values), so per tile of 8 weight rows the engine keeps a base byte per row
+  and four 2-bit offsets per row and 128-wide K step, instead of 32 bytes; tiles with a row spanning more than 3 keep
+  their raw bytes. The decode, verify and prefill expert kernels rebuild the exact scale bytes for the block-scaled
+  MMA. Expert bytes read −4.4%, about 3.8 GiB less memory per rank (more room for the KV pool); single-stream service
+  decode +1.6% (prose) / +2.8% (structured) / +2.6% (code), batched decode steps of 2 and 4 sequences −1.5%.
+- **RDMA proxy idle back-off:** after 5 ms without traffic the proxy threads poll about every 100 µs instead of
+  spinning, so an idle engine no longer keeps one core busy per proxy (`GLM53_RDMA_ARN_IDLE_US`, default 5000).
+- **Speculative sampling, optional** (`DS41_SPEC_RS=1`, default off): sampled requests can be verified by standard
+  speculative sampling (accept with min(1, p/q), else resample max(p − q, 0)) instead of the default per-position key
+  coupling. Both keep the target distribution exactly (checked with a distribution test of the verdict and end to end
+  on the service); the default coupling also keeps a request's output a function of its seed alone. With the DSpark
+  draft stages the two are within about one point of expected acceptance (0.615 vs 0.603 on open-ended texts at
+  temperature 1) and served at the same speed, so the coupling stays the default. `DS41_RS_STATS=<file>` logs both
+  schemes' expected acceptance per verified draft.
+- `bench/ds41_decode_bench.py`: `--temperature`, `--effort` and open-ended prompts (`zh_prose`, `story`, `qa`).

@@ -33,6 +33,8 @@
 #include <unistd.h>
 #include <atomic>
 #include <thread>
+#include <chrono>
+#include <ctime>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -554,9 +556,23 @@ void proxy_loop(int j){
     for(int i=0;i<got;++i)if(wc[i].status!=IBV_WC_SUCCESS){fprintf(stderr,"[rdma_arn] completion error peer %d link %d: %d\n",j,l,(int)wc[i].status);std::abort();}
     out[l]-=got;
   };
+  // idle back-off (GLM53_RDMA_ARN_IDLE_US, default 5000; 0: always spin): with no call for that long (no request
+  // being served) the loop polls every ~100 us instead of spinning a core; while serving, calls come far more often
+  // and it never sleeps (the first call after an idle spell waits at most one sleep)
+  static const long long idle_us=[]{const char* e=std::getenv("GLM53_RDMA_ARN_IDLE_US");return e?std::atoll(e):5000ll;}();
+  auto last=std::chrono::steady_clock::now();unsigned spins=0;bool idle=false;
   while(!g_stop.load(std::memory_order_relaxed)){
     const int slot=(int)(s%NSLOT);
-    if(g_host->ready_seq[slot]!=s){for(int l=0;l<P.nlink;++l)if(out[l])reap(l,false);asm volatile("yield");continue;}
+    if(g_host->ready_seq[slot]!=s){
+      for(int l=0;l<P.nlink;++l)if(out[l])reap(l,false);
+      if(idle){timespec ts{0,100000};nanosleep(&ts,nullptr);continue;}
+      if(idle_us>0&&++spins>=4096){
+        spins=0;
+        idle=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-last).count()>idle_us;
+      }
+      asm volatile("yield");continue;
+    }
+    if(idle_us>0){last=std::chrono::steady_clock::now();spins=0;idle=false;}
     std::atomic_thread_fence(std::memory_order_acquire);
     const unsigned long long rb=g_host->ready_bytes[slot];
     const size_t all=(size_t)(rb&BYTES_MASK);const unsigned long long mode=rb&(MODE_RS|MODE_AG);const size_t esz=(rb&MODE_BF16)?2:4;

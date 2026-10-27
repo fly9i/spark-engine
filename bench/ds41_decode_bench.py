@@ -6,6 +6,8 @@ the window from the first stream's first token to the last stream's last token. 
 explanation), structured (count 1..200), code.
 
 usage: decode_bench.py [--url http://127.0.0.1:8888] [--types prose,structured,code] [--conc 1,2,4] [--max-tokens 256]
+                       [--temperature 0] [--effort none]   (temperature > 0: sampled, a fresh seed per request;
+                       --types zh_prose,story,qa: open-ended texts, less predictable for the draft than the default three)
 """
 import argparse
 import json
@@ -16,13 +18,20 @@ import urllib.request
 PROMPTS = {
     "prose": "Write a detailed step-by-step explanation of how a hash map works, including collision handling, resizing, and time complexity. Be thorough.",
     "structured": "Count from 1 to 200. Output only the numbers, separated by spaces. No other text.",
+    "zh_prose": "写一篇八百字左右的散文，主题是秋天傍晚的城市，要有具体的场景、人物和细节。",
+    "story": "Write an original short story about a lighthouse keeper who finds a mysterious letter washed ashore. Use vivid detail and dialogue.",
+    "qa": "What were the main causes of the fall of the Western Roman Empire? Discuss the economic, military and political factors and how historians weigh them.",
     "code": "lru_cache\nImplement an LRU cache class in Python with get, put, delete and resize.\nOutput only Python source. No comments, no docstrings, no markdown fences. Then add tests and the helpers this needs. Keep writing code.",
 }
 
 
+TEMP = 0.0
+EFFORT = "none"
+
+
 def stream(url, prompt, n):
-    body = {"model": "x", "messages": [{"role": "user", "content": prompt}], "max_tokens": n, "temperature": 0.0, "top_p": 1,
-            "reasoning_effort": "none", "stream": True}
+    body = {"model": "x", "messages": [{"role": "user", "content": prompt}], "max_tokens": n, "temperature": TEMP, "top_p": 1,
+            "reasoning_effort": EFFORT, "stream": True}
     t0 = time.time()
     first = last = None
     toks = 0
@@ -33,7 +42,8 @@ def stream(url, prompt, n):
                 continue
             d = json.loads(raw[5:])
             ch = d.get("choices") or []
-            if ch and (ch[0].get("delta") or {}).get("content"):
+            dl = (ch[0].get("delta") or {}) if ch else {}
+            if dl.get("content") or dl.get("reasoning_content"):   # (thinking: the reasoning tokens count too)
                 now = time.time()
                 first = first or now
                 last = now
@@ -48,7 +58,11 @@ def main():
     ap.add_argument("--types", default="prose,structured,code")
     ap.add_argument("--conc", default="1,2,4")
     ap.add_argument("--max-tokens", type=int, default=256)
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--effort", default="none", help="reasoning_effort (none: thinking off)")
     a = ap.parse_args()
+    global TEMP, EFFORT
+    TEMP, EFFORT = a.temperature, a.effort
     stream(a.url, PROMPTS["prose"], 32)   # warmup
     for kind in a.types.split(","):
         for c in [int(x) for x in a.conc.split(",")]:
