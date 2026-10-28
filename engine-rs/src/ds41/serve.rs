@@ -93,10 +93,44 @@ fn spec_verify(m: &Model, stores: &mut [Store], sidx: &[usize], rows: &[Vec<i64>
     let rbs: Vec<_> = sidx.iter().zip(rows).map(|(&i, r)| m.spec_checkpoint(&stores[i].seq, r.len() as i64)).collect();
     let p0: Vec<i64> = sidx.iter().map(|&i| stores[i].seq.pos).collect();
     let hlen: Vec<usize> = sidx.iter().map(|&i| stores[i].history.len()).collect();
-    let (lg, hid) = { let mut seqs = seqs_of(stores, sidx); m.forward_rows(&mut seqs, rows) };
+    let (lg, hid) = { let mut seqs = seqs_of(stores, sidx); m.forward_rows_local(&mut seqs, rows) };
     for (&i, r) in sidx.iter().zip(rows) { stores[i].history.extend_from_slice(r); }
     let offs: Vec<i64> = rows.iter().scan(0i64, |a, r| { let o = *a; *a += r.len() as i64; Some(o) }).collect();
     (lg, SpecPending { sidx: sidx.to_vec(), rbs, hid: hid.expect("no target hidden"), offs, p0, hlen })
+}
+/// DS41_VERIFY_SPLIT (default on; 0: rank 0 samples each row from the full logits): every verified row's token from
+/// the vocabulary slices (Model::sample_rows: packets, one host copy; every rank calls it). The full logits are
+/// assembled only for rejection sampling / acceptance statistics (DS41_SPEC_RS / DS41_RS_STATS, same on every rank).
+fn verify_split_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_VERIFY_SPLIT").map_or(true, |v| v != "0")) }
+fn verify_need_full() -> bool { !verify_split_on() || super::spec::rs_on() || super::spec::stats_on() || super::spec::ranks_on() }
+/// The tokens of every verified row (row k of sequence b: temperature temps[b], key of position p0[b] + k + 1).
+fn verify_tokens(m: &Model, local: &Tensor, sp: &SpecPending, nrows: &[usize], temps: &[f32], seeds: &[u64]) -> Vec<i64> {
+    let (mut t, mut k) = (Vec::new(), Vec::new());
+    for b in 0..nrows.len() {
+        for j in 0..nrows[b] { t.push(temps[b]); k.push(crate::sampling::key(seeds[b], (sp.p0[b] + j as i64 + 1) as u64)); }
+    }
+    m.sample_rows(local, &t, &k)
+}
+/// DS41_CTRL_LOCAL (default on; 0: rank 0 sends each round's rows and accepted counts): every rank makes a speculative
+/// round's decisions itself from bitwise-identical inputs (drafts, confidences and sampled rows are the same on every
+/// rank: the all-reduces sum in rank order), so after the round's sdraft (which carries each sequence's draft budget and
+/// stop ids) no rank waits for another message. Needs DS41_VERIFY_SPLIT; not with DS41_SPEC_RS (rank 0's verdicts).
+/// DS41_CTRL_CHECK=1: rank 0 still sends rows and counts, the other ranks assert they made the same decisions.
+fn ctrl_local_on() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("DS41_CTRL_LOCAL").map_or(true, |v| v != "0") && verify_split_on() && !super::spec::rs_on())
+}
+fn ctrl_check_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_CTRL_CHECK").is_ok_and(|v| v == "1")) }
+/// A verify's rows: each sequence's last token, then its first chosen[b] drafts.
+fn verify_rows(toks: &[i64], drafts: &[Vec<i64>], chosen: &[usize]) -> Vec<Vec<i64>> {
+    (0..toks.len()).map(|b| { let mut r = vec![toks[b]]; r.extend(&drafts[b][..chosen[b].min(drafts[b].len())]); r }).collect()
+}
+/// Accepted drafts of one sequence: row tokens ys (ys[k] follows row k) agree with the drafts row[1..] while not a stop.
+fn accept_len(row: &[i64], ys: &[i64], stops: &[i64]) -> usize {
+    let d = row.len() - 1;
+    let mut k = 0;
+    while k < d && row[k + 1] == ys[k] && !stops.contains(&ys[k]) { k += 1; }
+    k
 }
 fn spec_commit(m: &Model, stores: &mut [Store], sp: SpecPending, keep: &[i64]) {
     for (((b, &i), rb), &k) in sp.sidx.iter().enumerate().zip(sp.rbs).zip(keep) {
@@ -181,9 +215,15 @@ fn choose_drafts(confs: &[Vec<f32>], maxd: &[usize], temps: &[f32]) -> Vec<usize
     }).collect();
     // every sequence its own count: rows are added (the most likely next draft first) while a row's expected gain beats
     // the round's current rate (the verify graphs depend on the total row count only)
+    // DS41_SPEC_MAX_ROWS (default: no cap): at most this many rows in all. Above 16 rows a round takes the paths tuned
+    // for prefill (~+40 ms at c4), but a cap of 16 measured worse (10-28, c4 structured 202 -> 181 tok/s: the dropped
+    // drafts were worth more than the time), so it stays off.
+    static MR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let max_rows = *MR.get_or_init(|| std::env::var("DS41_SPEC_MAX_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX));
     let mut d = vec![0usize; b];
     let (mut gain, mut cost) = (b as f64, base + (seq + row) * b as f64);
     loop {
+        if b + d.iter().sum::<usize>() >= max_rows { break; }
         let best = (0..b).filter(|&s| d[s] < p[s].len()).max_by(|&x, &y| p[x][d[x]].partial_cmp(&p[y][d[y]]).unwrap());
         let Some(s) = best else { break };
         let g = p[s][d[s]];
@@ -195,10 +235,13 @@ fn choose_drafts(confs: &[Vec<f32>], maxd: &[usize], temps: &[f32]) -> Vec<usize
 
 /// DS41_SPEC_LOG=<file> (rank 0): one JSON line per sequence and round {t, conf (every draft's confidence), d (verified),
 /// k (accepted)}, for fitting the acceptance model of choose_drafts (bench/ds41/spec_calib.py)
-fn spec_log(temp: f32, conf: &[f32], d: usize, k: usize) {
+/// (also the round's batch b, total verified rows, and ms: the round on rank 0 from its sdraft to the verified tokens on
+/// the host, i.e. draft + verify; and ts, unix ms)
+fn spec_log(temp: f32, conf: &[f32], d: usize, k: usize, b: usize, rows: usize, ms: f64) {
     static F: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let f = F.get_or_init(|| std::env::var("DS41_SPEC_LOG").ok().map(|p| std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(p).expect("DS41_SPEC_LOG"))));
-    if let Some(f) = f { let _ = writeln!(f.lock().unwrap(), "{}", json!({"t": temp, "conf": conf, "d": d, "k": k})); }
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |x| x.as_millis() as u64);
+    if let Some(f) = f { let _ = writeln!(f.lock().unwrap(), "{}", json!({"t": temp, "conf": conf, "d": d, "k": k, "b": b, "rows": rows, "ms": ms, "ts": ts})); }
 }
 fn spec_on() -> bool { std::env::var("DS41_SPEC").map_or(true, |v| v != "0") }
 
@@ -531,9 +574,18 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
     super::mem::watch(tp.rank);
     if tp.rank != 0 {
         let mut pending: Option<SpecPending> = None;
+        let mut round_ts: (Vec<f32>, Vec<u64>) = (Vec::new(), Vec::new());   // this round's temperatures / seeds (sdraft)
         let mut wstores: Vec<Store> = Vec::new();
+        // DS41_CTRL_STATS=1: per op, host time blocked in ctrl.recv and spent handling it; printed every 300 speculative
+        // rounds (only waits right after an sdraft/sverify/scommit count, i.e. inside a decode loop)
+        let cstats = std::env::var("DS41_CTRL_STATS").is_ok_and(|v| v == "1");
+        let mut cs: std::collections::BTreeMap<String, (usize, f64, f64)> = Default::default();
+        let mut prev_op = String::new();
         loop {
+            let t_wait = Instant::now();
             let v = ctrl.recv();
+            let (waited, t_op) = (t_wait.elapsed().as_secs_f64() * 1e3, Instant::now());
+            let op = v["op"].as_str().unwrap_or("").to_string();
             match v["op"].as_str() {
                 Some("warm") => {
                     let k = v["k"].as_u64().unwrap() as usize;
@@ -563,12 +615,40 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
                     let toks: Vec<i64> = v["toks"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect();
                     let temps: Vec<f32> = v["temps"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
                     let seeds: Vec<u64> = v["seeds"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect();
-                    let _ = spec_draft(&m, &mut stores, &sidx, &toks, &temps, &seeds);
+                    let (drafts, confs) = spec_draft(&m, &mut stores, &sidx, &toks, &temps, &seeds);
+                    if let Some(rooms) = v["rooms"].as_array() {
+                        // DS41_CTRL_LOCAL: the rest of the round here, as rank 0 does it
+                        let rooms: Vec<usize> = rooms.iter().map(|x| x.as_u64().unwrap() as usize).collect();
+                        let stops: Vec<Vec<i64>> = v["stops"].as_array().unwrap().iter().map(|r| r.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect()).collect();
+                        let maxd: Vec<usize> = (0..sidx.len()).map(|b| drafts[b].len().min(rooms[b])).collect();
+                        let rows = verify_rows(&toks, &drafts, &choose_drafts(&confs, &maxd, &temps));
+                        if ctrl_check_on() {
+                            let w = ctrl.recv();
+                            let theirs: Vec<Vec<i64>> = w["rows"].as_array().unwrap().iter().map(|r| r.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect()).collect();
+                            assert_eq!(rows, theirs, "DS41_CTRL_CHECK: rank {} chose other verify rows", tp.rank);
+                        }
+                        let (lg, sp) = spec_verify(&m, &mut stores, &sidx, &rows);
+                        if verify_need_full() { let _ = m.logits_full(&lg); }
+                        let nr: Vec<usize> = rows.iter().map(|r| r.len()).collect();
+                        let ys = verify_tokens(&m, &lg, &sp, &nr, &temps, &seeds);
+                        let keep: Vec<i64> = (0..sidx.len()).map(|b| accept_len(&rows[b], &ys[sp.offs[b] as usize..], &stops[b]) as i64 + 1).collect();
+                        if ctrl_check_on() {
+                            let w = ctrl.recv();
+                            let theirs: Vec<i64> = w["keep"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect();
+                            assert_eq!(keep, theirs, "DS41_CTRL_CHECK: rank {} accepted other counts", tp.rank);
+                        }
+                        spec_commit(&m, &mut stores, sp, &keep);
+                    }
+                    round_ts = (temps, seeds);
                 }
                 Some("sverify") => {
                     let sidx: Vec<usize> = v["stores"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as usize).collect();
                     let rows: Vec<Vec<i64>> = v["rows"].as_array().unwrap().iter().map(|r| r.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect()).collect();
-                    pending = Some(spec_verify(&m, &mut stores, &sidx, &rows).1);
+                    let (lg, sp) = spec_verify(&m, &mut stores, &sidx, &rows);
+                    // the same collectives as rank 0 after its verify
+                    if verify_need_full() { let _ = m.logits_full(&lg); }
+                    if verify_split_on() { let _ = verify_tokens(&m, &lg, &sp, &rows.iter().map(|r| r.len()).collect::<Vec<_>>(), &round_ts.0, &round_ts.1); }
+                    pending = Some(sp);
                 }
                 Some("scommit") => {
                     let keep: Vec<i64> = v["keep"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect();
@@ -584,6 +664,18 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
                 Some("quit") => { if let Some(p) = pc.as_mut() { p.shutdown(10); } return }
                 _ => panic!("ctrl: {v}"),
             }
+            if cstats && matches!(prev_op.as_str(), "sdraft" | "sverify" | "scommit") {
+                let e = cs.entry(op.clone()).or_default();
+                e.0 += 1; e.1 += waited; e.2 += t_op.elapsed().as_secs_f64() * 1e3;
+                let rounds = e.0;
+                if op == "sdraft" && rounds % 300 == 0 {
+                    let n = rounds as f64;
+                    eprintln!("[ds41-ctrl] rank {} per round over {} rounds (ms, blocked in recv / handling): {}", tp.rank, rounds,
+                        cs.iter().map(|(k, x)| format!("{k} {:.3}/{:.3} (x{:.2})", x.1 / n, x.2 / n, x.0 as f64 / n)).collect::<Vec<_>>().join(", "));
+                    cs.clear();
+                }
+            }
+            prev_op = op;
             if let Some(p) = pc.as_mut() { p.poll(); }
         }
     }
@@ -838,23 +930,30 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
             let toks: Vec<i64> = dec.iter().map(|d| *active[d.1].out.last().unwrap()).collect();
             let temps: Vec<f32> = dec.iter().map(|d| active[d.1].temp).collect();
             let seeds: Vec<u64> = dec.iter().map(|d| active[d.1].seed).collect();
-            ctrl.send(&json!({"op": "sdraft", "stores": sidx, "toks": toks, "temps": temps, "seeds": seeds}));
-            let (drafts, confs) = spec_draft(&m, &mut stores, &sidx, &toks, &temps, &seeds);
-            // draft counts: each sequence its own, by the cost model (choose_drafts)
+            // draft budgets: what the request and the sequence's capacity still allow
             let rooms: Vec<usize> = dec.iter().map(|&(st, i)| {
                 let a = &active[i];
                 (a.max_new - a.out.len()).saturating_sub(1).min((stores[st].seq.cap - stores[st].seq.pos - 1).max(0) as usize)
             }).collect();
+            let t_round = Instant::now();
+            let local = ctrl_local_on();
+            if local {
+                let stops: Vec<Vec<i64>> = dec.iter().map(|&(_, i)| eos.iter().chain(&active[i].stop_ids).copied().collect()).collect();
+                ctrl.send(&json!({"op": "sdraft", "stores": sidx, "toks": toks, "temps": temps, "seeds": seeds, "rooms": rooms, "stops": stops}));
+            } else {
+                ctrl.send(&json!({"op": "sdraft", "stores": sidx, "toks": toks, "temps": temps, "seeds": seeds}));
+            }
+            let (drafts, confs) = spec_draft(&m, &mut stores, &sidx, &toks, &temps, &seeds);
+            // draft counts: each sequence its own, by the cost model (choose_drafts)
             let maxd: Vec<usize> = (0..dec.len()).map(|b| drafts[b].len().min(rooms[b])).collect();
-            let chosen = choose_drafts(&confs, &maxd, &temps);
-            let rows: Vec<Vec<i64>> = (0..dec.len()).map(|b| {
-                let d = chosen[b].min(drafts[b].len());
-                let mut r = vec![toks[b]];
-                r.extend(&drafts[b][..d]);
-                r
-            }).collect();
-            ctrl.send(&json!({"op": "sverify", "stores": sidx, "rows": rows}));
-            let (lg, sp) = spec_verify(&m, &mut stores, &sidx, &rows);
+            let rows = verify_rows(&toks, &drafts, &choose_drafts(&confs, &maxd, &temps));
+            if !local || ctrl_check_on() { ctrl.send(&json!({"op": "sverify", "stores": sidx, "rows": rows})); }
+            let (lg_loc, sp) = spec_verify(&m, &mut stores, &sidx, &rows);
+            // (lg: the full logits when needed, else the slice, which only verify_tokens reads)
+            let lg = if verify_need_full() { m.logits_full(&lg_loc) } else { lg_loc.shallow_clone() };
+            let yv = verify_split_on().then(|| verify_tokens(&m, &lg_loc, &sp, &rows.iter().map(|r| r.len()).collect::<Vec<_>>(), &temps, &seeds));
+            let round_ms = t_round.elapsed().as_secs_f64() * 1e3;
+            let nrows: usize = rows.iter().map(|r| r.len()).sum();
             let mut keep = Vec::new();
             let dq = m.draft_q.borrow_mut().take();
             for (b, &(_, i)) in dec.iter().enumerate() {
@@ -867,15 +966,28 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
                 };
                 let mut k = 0;
                 let mut emit = Vec::new();
-                loop {
-                    let y = match &ys { Some(v) => v[k], None => sample(&lg.narrow(0, off + k as i64, 1), a.temp, a.seed, sp.p0[b] + k as i64 + 1) };
-                    emit.push(y);
-                    if k < d && rows[b][k + 1] == y && !eos.contains(&y) && !a.stop_ids.contains(&y) { k += 1; } else { break; }
+                if let (None, Some(v)) = (&ys, &yv) {
+                    // (the rule the other ranks apply under DS41_CTRL_LOCAL)
+                    let stops: Vec<i64> = eos.iter().chain(&a.stop_ids).copied().collect();
+                    k = accept_len(&rows[b], &v[off as usize..], &stops);
+                    emit.extend(&v[off as usize..off as usize + k + 1]);
+                } else {
+                    loop {
+                        let y = match &ys { Some(v) => v[k], None => sample(&lg.narrow(0, off + k as i64, 1), a.temp, a.seed, sp.p0[b] + k as i64 + 1) };
+                        emit.push(y);
+                        if k < d && rows[b][k + 1] == y && !eos.contains(&y) && !a.stop_ids.contains(&y) { k += 1; } else { break; }
+                    }
                 }
                 a.rounds += 1;
                 a.drafted += d;
                 a.accepted += k;
-                spec_log(a.temp, &confs[b], d, k);
+                spec_log(a.temp, &confs[b], d, k, dec.len(), nrows, round_ms);
+                if let (Some(q), Some(v)) = (&dq, &yv) {
+                    if super::spec::ranks_on() {
+                        super::spec::spec_ranks(&lg.narrow(0, off, d as i64 + 1), &q.select(1, b as i64), &rows[b][1..], &v[off as usize..off as usize + d], a.temp,
+                                                super::spec::rs_draft_seed(a.seed, a.temp, sp.p0[b]), sp.p0[b], k);
+                    }
+                }
                 if let Some(q) = &dq {
                     super::spec::spec_stats(&lg.narrow(0, off, d as i64 + 1), &q.select(1, b as i64), &rows[b][1..], a.temp,
                                             super::spec::rs_draft_seed(a.seed, a.temp, sp.p0[b]), sp.p0[b], k);
@@ -883,7 +995,7 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
                 a.out.extend(emit);
                 keep.push(k as i64 + 1);
             }
-            ctrl.send(&json!({"op": "scommit", "keep": keep}));
+            if !local || ctrl_check_on() { ctrl.send(&json!({"op": "scommit", "keep": keep})); }
             spec_commit(&m, &mut stores, sp, &keep);
         } else if !dec.is_empty() {
             dec.sort();

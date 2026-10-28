@@ -445,6 +445,26 @@ pub fn sparse_attn_multi_dev(q: &Tensor, seqs: &[(&Tensor, &Tensor, Option<&Tens
     fused != 0
 }
 /// win_commit of every row into its own sequence's ring: rings = device array of t ring pointers (rewritten per replay).
+extern "C" {
+    fn ds41_ring_save(rings: *const *mut std::ffi::c_void, l: i32, out: *mut std::ffi::c_void, pos0: i64, n: i32, w: i32, row_bytes: i64, st: *mut std::ffi::c_void) -> i32;
+    fn ds41_ring_restore(rings: *const *mut std::ffi::c_void, l: i32, saved: *const std::ffi::c_void, pos0: i64, n: i32, j0: i32, w: i32, row_bytes: i64, st: *mut std::ffi::c_void) -> i32;
+}
+/// The rows of positions pos0 .. pos0 + n of every window ring (each [w, row], contiguous, the same shape and dtype),
+/// slot = position % w, in one launch: [L, n, row].
+pub fn ring_save(rings: &[Tensor], pos0: i64, n: i64) -> Tensor {
+    let (w, row) = (rings[0].size()[0], rings[0].size()[1]);
+    let ptrs: Vec<*mut std::ffi::c_void> = rings.iter().map(|r| { assert!(r.is_contiguous() && r.size() == rings[0].size() && r.kind() == rings[0].kind()); r.data_ptr() }).collect();
+    let out = Tensor::empty([rings.len() as i64, n, row], (rings[0].kind(), rings[0].device()));
+    assert_eq!(unsafe { ds41_ring_save(ptrs.as_ptr(), ptrs.len() as i32, out.data_ptr(), pos0, n as i32, w as i32, row * rings[0].kind().elt_size_in_bytes() as i64, rs_current_stream()) }, 0, "ds41_ring_save");
+    out
+}
+/// ring_save's rows j0 .. n written back to their slots of every ring, in one launch.
+pub fn ring_restore(rings: &[Tensor], saved: &Tensor, pos0: i64, j0: i64) {
+    let (w, row, n) = (rings[0].size()[0], rings[0].size()[1], saved.size()[1]);
+    assert!(saved.is_contiguous() && saved.size() == [rings.len() as i64, n, row]);
+    let ptrs: Vec<*mut std::ffi::c_void> = rings.iter().map(|r| { assert!(r.is_contiguous() && r.size() == rings[0].size()); r.data_ptr() }).collect();
+    assert_eq!(unsafe { ds41_ring_restore(ptrs.as_ptr(), ptrs.len() as i32, saved.data_ptr(), pos0, n as i32, j0 as i32, w as i32, row * rings[0].kind().elt_size_in_bytes() as i64, rs_current_stream()) }, 0, "ds41_ring_restore");
+}
 pub fn win_commit_rows(rings: *const std::ffi::c_void, kv: &Tensor, pos: &Tensor, w: i64) {
     let (t, d) = (kv.size()[0], kv.size()[1]);
     assert!(kv.is_contiguous() && kv.kind() == Kind::BFloat16 && pos.is_contiguous());

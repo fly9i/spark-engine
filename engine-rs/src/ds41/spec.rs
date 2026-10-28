@@ -130,7 +130,10 @@ pub fn spec_len(conf: &[f32], max: usize) -> usize {
 }
 
 /// What a verify changed, to roll back to any accepted length.
-pub struct Rollback { pos0: i64, n: i64, ring: Vec<Tensor> }
+pub struct Rollback { pos0: i64, n: i64, ring: Vec<Tensor>, saved: Option<Tensor> }
+/// DS41_RING_FUSED (default on; 0: an index_select / index_copy per layer): the window rings' checkpoint and rollback of
+/// a speculative round in one launch each (kern::ring_save / ring_restore; the same bytes).
+fn ring_fused_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_RING_FUSED").map_or(true, |v| v != "0")) }
 
 /// FP32 rows [m, n] = x [m, k] . W^T for BF16 W (the BF16 GEMV in chunks of 8 rows).
 fn head_rows(x: &Tensor, w: &Tensor) -> Tensor {
@@ -152,6 +155,15 @@ impl Model {
     /// Samples one token per row from this rank's vocabulary slice of the logits [B, v1 - v0] (the same rule as the
     /// serve loop: temperature 0 = argmax, else argmax of logits + temperature-scaled Gumbel noise of key(seed, pos)),
     /// combined across ranks (largest value, lowest vocabulary id on ties: the global argmax).
+    /// One token per row of `local` (this rank's vocabulary slice [R, v1 - v0], e.g. Model::forward_rows_local), the
+    /// row's temperature and key: the same token as serve::sample on the full row (argmax of logits + T*G(key, column),
+    /// the noise is per global column; ties to the lowest index), from (value, index) packets of every rank instead of
+    /// the full rows. Every rank calls it (a collective); one copy to the host.
+    pub fn sample_rows(&self, local: &Tensor, temps: &[f32], keys: &[u64]) -> Vec<i64> {
+        let r = local.size()[0] as usize;
+        assert!(temps.len() == r && keys.len() == r);
+        (0..r).step_by(64).flat_map(|a| { let n = 64.min(r - a); self.sample_split(&local.narrow(0, a as i64, n as i64), &temps[a..a + n], &keys[a..a + n]) }).collect()
+    }
     fn sample_split(&self, lg: &Tensor, temps: &[f32], keys: &[u64]) -> Vec<i64> {
         extern "C" { fn rs_gumbel_noise(out: *mut f32, stride: i64, rows: i32, cols: i32, col_offset: i64, temps: *const f32, keys: *const u64) -> i32; }
         let b = lg.size()[0];
@@ -274,7 +286,7 @@ impl Model {
     /// With rejection sampling for any sampled sequence: every rank's draft logits [block, B, v1 - v0] into the whole
     /// vocabulary (draft_q, for rs_tokens); else draft_q is cleared.
     fn keep_draft_q(&self, qloc: &Tensor, temps: &[f32]) {
-        if !((rs_on() || stats_on()) && temps.iter().any(|&t| t > 0.0)) { *self.draft_q.borrow_mut() = None; return; }
+        if !(((rs_on() || stats_on()) && temps.iter().any(|&t| t > 0.0)) || ranks_on()) { *self.draft_q.borrow_mut() = None; return; }
         let (blk, b) = (qloc.size()[0], qloc.size()[1]);
         let q = if self.sp.world == 1 { qloc.copy() } else {
             let full = Tensor::zeros([blk, b, self.c.vocab], (Kind::Float, self.dev));
@@ -321,7 +333,43 @@ pub fn rs_tokens(lg: &Tensor, q: &Tensor, drafts: &[i64], temp: f32, seed: u64, 
         if ys.len() == d as usize && *ys.last().unwrap() == drafts[d as usize - 1] { ys.push(plain_row(d)); }
         ys
 }
-fn stats_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_RS_STATS").is_ok()) }
+/// DS41_SPEC_RANKS=<file> (measurement, rank 0): per verified draft position j (1-based), one line
+/// "ts temp j acc rank p_y": ts unix ms, acc 1 / 0 / -1 (accepted / the first rejected / after it), rank the place of the
+/// target's token y_j among the draft's scores at that position under the same keys (draft logits as sampled + T * G;
+/// T = 0: the draft logits; 1 = the draft's own token, capped at 64), p_y the target probability of y_j at temperature
+/// max(T, 1). With it the drafts' logits are kept at every temperature and the full verify logits assembled (slower).
+/// What a position with K draft candidates instead of one would accept: rank <= K.
+pub fn ranks_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_SPEC_RANKS").is_ok()) }
+/// (DS41_SPEC_RANKS) lg [d + 1, vocab] the target logits of one sequence's rows, q [>= d, vocab] its drafts' logits,
+/// ys the target tokens of positions 1..=d (ys[j - 1] from row j - 1), k accepted.
+pub fn spec_ranks(lg: &Tensor, q: &Tensor, drafts: &[i64], ys: &[i64], temp: f32, dseed: u64, p0: i64, k: usize) {
+    static F: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let Some(f) = F.get_or_init(|| std::env::var("DS41_SPEC_RANKS").ok().map(|p| std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(p).expect("DS41_SPEC_RANKS")))) else { return };
+    extern "C" { fn rs_gumbel_noise(out: *mut f32, stride: i64, rows: i32, cols: i32, col_offset: i64, temps: *const f32, keys: *const u64) -> i32; }
+    let d = drafts.len() as i64;
+    if d == 0 { return; }
+    let qd = q.narrow(0, 0, d).to_kind(Kind::Float).contiguous();
+    let noise = Tensor::zeros_like(&qd);
+    if temp > 0.0 {
+        let temps = vec![temp; d as usize];
+        let keys: Vec<u64> = (0..d).map(|j| crate::sampling::key(dseed, (p0 + j + 1) as u64)).collect();
+        assert_eq!(unsafe { rs_gumbel_noise(noise.data_ptr().cast(), noise.stride()[0], d as i32, qd.size()[1] as i32, 0, temps.as_ptr(), keys.as_ptr()) }, 0);
+    }
+    let sc = &qd + &noise;
+    let yt = Tensor::from_slice(&ys[..d as usize]).to_device(qd.device()).view([d, 1]);
+    let sy = sc.gather(1, &yt, false);
+    let rank = (sc.gt_tensor(&sy).sum_dim_intlist(&[1i64][..], false, Kind::Int64) + 1).clamp_max(64);
+    let py = (lg.narrow(0, 0, d).to_kind(Kind::Float) / (temp.max(1.0) as f64)).softmax(-1, Kind::Float).gather(1, &yt, false).view([d]);
+    let h: Vec<f64> = Vec::<f64>::try_from(Tensor::stack(&[rank.to_kind(Kind::Double), py.to_kind(Kind::Double)], 0).to_device(Device::Cpu).view(-1)).unwrap();
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |x| x.as_millis());
+    let mut f = f.lock().unwrap();
+    use std::io::Write;
+    for j in 0..d as usize {
+        let acc = if j < k { 1 } else if j == k { 0 } else { -1 };
+        let _ = writeln!(f, "{ts} {temp} {} {acc} {} {:.6}", j + 1, h[j] as i64, h[d as usize + j]);
+    }
+}
+pub fn stats_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_RS_STATS").is_ok()) }
 /// DS41_RS_STATS=<file> (with or without DS41_SPEC_RS; T > 0 rounds): per draft row of a verify, one line
 /// "rs j 1-TV coupling acc check": rs whether rejection sampling verified it; 1-TV = sum min(p, q) the expected acceptance
 /// of rejection sampling, coupling = P(argmax(log p + G) = argmax(log q + G)) = sum_i 1 / sum_j max(p_j / p_i, q_j / q_i)
@@ -398,7 +446,7 @@ impl Model {
             let tbuf = Tensor::zeros([64], (Kind::Float, dev));
             let kbuf = Tensor::zeros([blk as i64 * 64], (Kind::Int64, dev));
             let rows: Vec<Tensor> = (0..blk as i64).map(|j| Tensor::from_slice(&(0..bsz as i64).map(|b| b * blk as i64 + j).collect::<Vec<_>>()).to_device(dev)).collect();
-            let qloc = (rs_on() || stats_on()).then(|| Tensor::zeros([blk as i64, bsz as i64, self.sp.v1 - self.sp.v0], (Kind::Float, dev)));
+            let qloc = (rs_on() || stats_on() || ranks_on()).then(|| Tensor::zeros([blk as i64, bsz as i64, self.sp.v1 - self.sp.v0], (Kind::Float, dev)));
             tch::Cuda::synchronize(0);
             begin_pool(super::mem::GRAPH_POOL).expect("capture begin");
             let out = self.markov_steps(&g.xf, &g.logits, &prev, &tbuf, &kbuf, &rows, qloc.as_ref());
@@ -469,8 +517,13 @@ impl Model {
 
     /// What a verify of `n` rows from the current position changes (window ring slots), to roll back later.
     pub fn spec_checkpoint(&self, seq: &Seq, n: i64) -> Rollback {
+        let uniform = !seq.win.is_empty() && seq.win.len() <= 64
+            && seq.win.iter().all(|r| r.is_contiguous() && r.size() == seq.win[0].size() && r.kind() == seq.win[0].kind());
+        if ring_fused_on() && n <= self.c.window && uniform {
+            return Rollback { pos0: seq.pos, n, ring: Vec::new(), saved: Some(super::kern::ring_save(&seq.win, seq.pos, n)) };
+        }
         let slots = Tensor::arange_start(seq.pos, seq.pos + n, (Kind::Int64, self.dev)).remainder(self.c.window);
-        Rollback { pos0: seq.pos, n, ring: seq.win.iter().map(|r| r.index_select(0, &slots)).collect() }
+        Rollback { pos0: seq.pos, n, ring: seq.win.iter().map(|r| r.index_select(0, &slots)).collect(), saved: None }
     }
 
     /// The window attention of stage i for every sequence's block rows: o [R, heads, head_dim].
@@ -602,9 +655,13 @@ impl Model {
         let w = self.c.window;
         let new_pos = rb.pos0 + keep;
         // window ring: the rejected positions' slots get their earlier keys back
-        let rej = Tensor::arange_start(new_pos, rb.pos0 + rb.n, (Kind::Int64, self.dev));
-        let rows = &rej - rb.pos0;
-        for (r, saved) in seq.win.iter_mut().zip(&rb.ring) { let _ = r.index_copy_(0, &rej.remainder(w), &saved.index_select(0, &rows)); }
+        if let Some(saved) = &rb.saved {
+            super::kern::ring_restore(&seq.win, saved, rb.pos0, keep);
+        } else {
+            let rej = Tensor::arange_start(new_pos, rb.pos0 + rb.n, (Kind::Int64, self.dev));
+            let rows = &rej - rb.pos0;
+            for (r, saved) in seq.win.iter_mut().zip(&rb.ring) { let _ = r.index_copy_(0, &rej.remainder(w), &saved.index_select(0, &rows)); }
+        }
         // compressor open groups: the rows of the accepted positions of the (now) open group
         for (&src, (ks, ss)) in seq.cstate.iter_mut() {
             let ratio = self.c.compress[src];

@@ -22,7 +22,7 @@ One binary runs every model; `start.sh glm|glm3|ds41|qwen` picks one.
 ## At a glance
 
 GLM and Qwen: measured on 2026-10-08 (v0.1.1 binary; not re-measured since), default settings, greedy, thinking off.
-DeepSeek: decode measured on 2026-10-27 (v0.3.2), prefill on 2026-10-26 (prefill code unchanged since), with the 1017
+DeepSeek: decode measured on 2026-10-28 (v0.3.6), prefill on 2026-10-26 (prefill code unchanged since), with the 1017
 checkpoint as served by the current code (greedy, thinking off, the optional conditional clamp on). Method and more numbers: [docs/benchmarks.md](docs/benchmarks.md),
 [docs/ds41.md](docs/ds41.md#7-performance).
 
@@ -30,8 +30,8 @@ checkpoint as served by the current code (greedy, thinking off, the optional con
 | --- | --- | --- | --- |
 | Hardware | 2× DGX Spark (TP2, RoCE); 3× also supported | 3× DGX Spark (TP3, RoCE mesh) | 1× DGX Spark |
 | Architecture | 45 layers: KDA linear-attn + MLA/DSA sparse-attn, 288-expert MoE | 40 layers (20 encoder + 20 decoder): compressed sparse attention with a hierarchical indexer, 384-expert top-6 MoE, Engram n-gram tables, mHC | 48 layers: gated-DeltaNet + QSA sparse-attn, 512-expert top-10 MoE, per-layer n-gram |
-| **Decode — prose** (1/2/3/4 streams) | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 62.4 / 89.6 / — / 112.6 tok/s | 64.1 / 85.5 / 105.0 / 119.5 tok/s |
-| **Decode — structured** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 115.5 / 158.4 / — / 197.9 tok/s | 149.8 / 192.9 / 232.6 / 226.5 tok/s |
+| **Decode — prose** (1/2/3/4 streams) | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 66.4 / 95.0 / — / 117.7 tok/s | 64.1 / 85.5 / 105.0 / 119.5 tok/s |
+| **Decode — structured** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 120.1 / 167.8 / — / 208.8 tok/s | 149.8 / 192.9 / 232.6 / 226.5 tok/s |
 | **Prefill** | ~1,560 tok/s (10K–55K prompts) | ~5,400 tok/s (8K–64K prompts, new text; 4K ~4,600) | ~1,900 tok/s (13K–77K prompts) |
 | **TTFT** (short prompt) | ~370 ms | ~200 ms; 185 ms for a 7K prompt restored from the NVMe prefix cache | ~150 ms |
 | **Startup** (load → serving) | ~33 s | ~16 s (cold start, shards read from NVMe) | ~54 s |

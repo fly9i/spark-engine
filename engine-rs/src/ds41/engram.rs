@@ -198,10 +198,18 @@ pub fn gather(w: &[u8], s: &[u8], rows: &[i64], head_dim: i64) -> (Vec<u8>, Vec<
     // one, so gather from many threads (DS41_ENGRAM_THREADS, default 256) to keep the device queue deep: 98k new rows
     // (4096 prompt tokens, one layer) 750 ms with 32 threads, 530 ms with 256 (~370k page reads/s)
     let threads = std::env::var("DS41_ENGRAM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(256usize).max(1);
-    // few rows (decode): start every row's read at once (async readahead of the pages), then copy; many rows
-    // (prefill): one syscall per row cost more than the reads (0.8 s per 8k tokens), the copy threads fault in parallel
+    // many rows (prefill): one syscall per row cost more than the reads (0.8 s per 8k tokens), the copy threads fault
+    // in parallel
     let page = 4096usize;
-    for &r in rows.iter().take(if rows.len() <= 1024 { rows.len() } else { 0 }) {
+    // few rows (decode): start every row's read at once (async readahead of the pages), then copy.
+    // DS41_ENGRAM_WILLNEED=0 (test): no hints -- with warm pages the gather halves (0.27 vs 0.4-1.4 ms), but cold rows
+    // then fault one at a time. DS41_ENGRAM_DEC_PER: rows per copy thread for gathers of at most 1024 rows (default
+    // 64: one chunk is copied on the calling thread).
+    static WN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let willneed = *WN.get_or_init(|| std::env::var("DS41_ENGRAM_WILLNEED").map_or(true, |v| v != "0"));
+    static DP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let dec_per = *DP.get_or_init(|| std::env::var("DS41_ENGRAM_DEC_PER").ok().and_then(|v| v.parse().ok()).unwrap_or(64usize).max(1));
+    for &r in rows.iter().take(if rows.len() <= 1024 && willneed { rows.len() } else { 0 }) {
         let r = r as usize;
         for (buf, b) in [(w, wb), (s, sb)] {
             let a = buf.as_ptr() as usize + r * b;
@@ -209,7 +217,17 @@ pub fn gather(w: &[u8], s: &[u8], rows: &[i64], head_dim: i64) -> (Vec<u8>, Vec<
             unsafe { madvise(p0 as *mut std::ffi::c_void, a + b - p0, MADV_WILLNEED); }
         }
     }
-    let per = rows.len().div_ceil(threads).max(64);
+    let per = if rows.len() <= 1024 { dec_per } else { rows.len().div_ceil(threads).max(64) };
+    if rows.len() <= per {
+        // one chunk: copied on this thread (no thread start)
+        for (i, &r) in rows.iter().enumerate() {
+            let r = r as usize;
+            wbuf[i * wb..(i + 1) * wb].copy_from_slice(&w[r * wb..(r + 1) * wb]);
+            sbuf[i * sb..(i + 1) * sb].copy_from_slice(&s[r * sb..(r + 1) * sb]);
+        }
+        stats(rows.len(), t0);
+        return (wbuf, sbuf);
+    }
     std::thread::scope(|sc| {
         for ((rs, wo), so) in rows.chunks(per).zip(wbuf.chunks_mut(per * wb)).zip(sbuf.chunks_mut(per * sb)) {
             sc.spawn(move || {

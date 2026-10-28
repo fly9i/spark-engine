@@ -519,6 +519,27 @@ __global__ void win_commit_kernel(__nv_bfloat16* __restrict__ ring, const __nv_b
   for (int c = threadIdx.x * 8; c < d; c += blockDim.x * 8)
     *reinterpret_cast<uint4*>(ring + slot * d + c) = *reinterpret_cast<const uint4*>(kv + (long long)i * d + c);
 }
+// DS41_RING_FUSED: the speculative checkpoint / rollback of a sequence's window rings (one [w, row] BF16 ring per layer,
+// slot = position % w) in one launch each instead of an index_select / index_copy per layer. save: rows of positions
+// pos0 .. pos0 + n of every ring -> out [L, n, row]; restore: rows j0 .. n of the saved block back to their slots.
+// Plain 16-byte copies (the same bytes as the per-layer ops).
+struct RingPtrs { void* p[64]; };
+__global__ void ring_save_kernel(RingPtrs r, uint4* __restrict__ out, long long pos0, int n, int w, int row16) {
+  const int l = blockIdx.x, j = blockIdx.y;
+  const uint4* src = (const uint4*)r.p[l] + ((pos0 + j) % w) * row16;
+  uint4* dst = out + ((long long)l * n + j) * row16;
+  pdl_wait();
+  for (int i = threadIdx.x; i < row16; i += blockDim.x) dst[i] = src[i];
+  pdl_trigger();
+}
+__global__ void ring_restore_kernel(RingPtrs r, const uint4* __restrict__ saved, long long pos0, int n, int j0, int w, int row16) {
+  const int l = blockIdx.x, j = j0 + blockIdx.y;
+  uint4* dst = (uint4*)r.p[l] + ((pos0 + j) % w) * row16;
+  const uint4* src = saved + ((long long)l * n + j) * row16;
+  pdl_wait();
+  for (int i = threadIdx.x; i < row16; i += blockDim.x) dst[i] = src[i];
+  pdl_trigger();
+}
 // DS41_MID_GRAPH: win_commit_kernel for the rows of several sequences in one launch (row i of kv into its sequence's
 // ring rings[i], slot pos[i] % w; at most 16 rows, all of them kept); rings is a device array rewritten before each replay
 __global__ void win_commit_rows_kernel(const unsigned long long* __restrict__ rings, const __nv_bfloat16* __restrict__ kv,
@@ -570,6 +591,19 @@ int ds41_copy_bytes(void* dst, const void* src, long long n, cudaStream_t st) {
 int ds41_win_commit_rows(const void* rings, const void* kv, const int64_t* pos, int t, int w, int d, cudaStream_t st) {
   if (t < 1 || t > w || d % 8) return 1;
   pdl_launch(win_commit_rows_kernel, dim3(t), dim3(64), 0, st, (const unsigned long long*)rings, (const __nv_bfloat16*)kv, pos, w, d);
+  return (int)cudaGetLastError();
+}
+int ds41_ring_save(void* const* rings, int L, void* out, long long pos0, int n, int w, long long row_bytes, cudaStream_t st) {
+  if (L < 1 || L > 64 || n < 1 || n > w || row_bytes % 16 || ((uintptr_t)out & 15)) return 1;
+  RingPtrs r; for (int l = 0; l < L; ++l) { if ((uintptr_t)rings[l] & 15) return 2; r.p[l] = rings[l]; }
+  pdl_launch(ring_save_kernel, dim3(L, n), dim3(64), 0, st, r, (uint4*)out, pos0, n, w, (int)(row_bytes / 16));
+  return (int)cudaGetLastError();
+}
+int ds41_ring_restore(void* const* rings, int L, const void* saved, long long pos0, int n, int j0, int w, long long row_bytes, cudaStream_t st) {
+  if (L < 1 || L > 64 || n < 1 || n > w || j0 < 0 || row_bytes % 16 || ((uintptr_t)saved & 15)) return 1;
+  if (j0 >= n) return 0;
+  RingPtrs r; for (int l = 0; l < L; ++l) { if ((uintptr_t)rings[l] & 15) return 2; r.p[l] = rings[l]; }
+  pdl_launch(ring_restore_kernel, dim3(L, n - j0), dim3(64), 0, st, r, (const uint4*)saved, pos0, n, j0, w, (int)(row_bytes / 16));
   return (int)cudaGetLastError();
 }
 int ds41_route(const float* logits, const float* bias, int64_t* idx, float* w, int T, int E, int K, float scale, cudaStream_t st) {

@@ -978,15 +978,20 @@ impl Model {
     }
 
     /// Logits [T, vocab] FP32 of the final hidden states x [T, dim] (rank slices assembled by a zero-padded sum).
-    pub fn logits(&self, x: &Tensor) -> Tensor {
+    pub fn logits(&self, x: &Tensor) -> Tensor { self.logits_full(&self.logits_local(x)) }
+    /// This rank's vocabulary slice [T, v1 - v0] of the logits (the head's rows of this rank).
+    pub fn logits_local(&self, x: &Tensor) -> Tensor {
         let m = x.size()[0];
-        let local = if gemv_on() && m <= 64 {
+        if gemv_on() && m <= 64 {
             let parts: Vec<Tensor> = (0..m).step_by(8).map(|r| super::kern::bf16_gemv(&x.narrow(0, r, 8.min(m - r)), &self.head)).collect();
             if parts.len() == 1 { parts.into_iter().next().unwrap() } else { Tensor::cat(&parts, 0) }
-        } else { x.to_kind(Kind::Float).matmul(&self.head.to_kind(Kind::Float).tr()) };
-        if self.sp.world == 1 { return local; }
-        let full = Tensor::zeros([x.size()[0], self.c.vocab], (Kind::Float, self.dev));
-        full.narrow(1, self.sp.v0, self.sp.v1 - self.sp.v0).copy_(&local);
+        } else { x.to_kind(Kind::Float).matmul(&self.head.to_kind(Kind::Float).tr()) }
+    }
+    /// The full logits from every rank's slice (a zero-padded sum: exact; a collective, every rank calls it).
+    pub fn logits_full(&self, local: &Tensor) -> Tensor {
+        if self.sp.world == 1 { return local.shallow_clone(); }
+        let full = Tensor::zeros([local.size()[0], self.c.vocab], (Kind::Float, self.dev));
+        full.narrow(1, self.sp.v0, self.sp.v1 - self.sp.v0).copy_(local);
         crate::tp::allreduce(&full);
         full
     }
@@ -1078,7 +1083,7 @@ impl Model {
 
     fn decode_graph(&self, seqs: &mut [&mut Seq], ids: &[i64]) -> Tensor {
         let per: Vec<Vec<i64>> = ids.iter().map(|&i| vec![i]).collect();
-        self.rows_graph(seqs, &per).0
+        self.logits_full(&self.rows_graph(seqs, &per).0)
     }
 
     /// Several rows for each sequence (ids[b] appended to seqs[b], committed) through CUDA graphs keyed by the rows per
@@ -1086,12 +1091,18 @@ impl Model {
     /// hidden rows [R, 3 dim]. Single-token decode (rows 1 each) and speculative verification (1 + drafts) both use it;
     /// the middle runs per sequence on its rows (a chunk of attn_mid).
     pub fn forward_rows(&self, seqs: &mut [&mut Seq], ids: &[Vec<i64>]) -> (Tensor, Option<Tensor>) {
+        let (lg, hid) = self.forward_rows_local(seqs, ids);
+        (self.logits_full(&lg), hid)
+    }
+    /// forward_rows with this rank's vocabulary slice of the logits [R, v1 - v0] (Model::sample_rows samples from it with
+    /// every rank taking part; logits_full assembles the full rows). The decode / verify graphs end with the slice.
+    pub fn forward_rows_local(&self, seqs: &mut [&mut Seq], ids: &[Vec<i64>]) -> (Tensor, Option<Tensor>) {
         if graph_on() && !parity() && dump_layers().is_empty() { return self.rows_graph(seqs, ids); }
         let mut lg = Vec::new();
         let mut hid = Vec::new();
         for (s, r) in seqs.iter_mut().zip(ids) {
             let x = self.forward(s, r, None);
-            lg.push(self.logits(&x));
+            lg.push(self.logits_local(&x));
             if let Some(h) = self.last_hidden.borrow_mut().take() { hid.push(h); }
         }
         (Tensor::cat(&lg, 0), (!hid.is_empty()).then(|| Tensor::cat(&hid, 0)))
@@ -1113,7 +1124,12 @@ impl Model {
         let engram_layers: Vec<usize> = self.hash.as_ref().map_or(vec![], |h| h.layer_ids.iter().copied().filter(|l| self.layers.iter().any(|x| x.id == *l)).collect());
         // the engram rows of every engram layer gathered (host) on background threads from here on, so the reads overlap
         // this call's set-up and the layers before them (engram_rows takes them; the same bytes)
-        if let (Some(hs), true) = (&self.hash, engram_jit_on() && total <= 16) {
+        // DS41_ENGRAM_ASYNC=0 (test): no background gathers here, each engram layer's rows read on this thread at its
+        // upload. 10-28: with warm table pages about +2% tok/s (with DS41_ENGRAM_WILLNEED=0), but cold rows then fault
+        // one by one on this thread (service ABBA: some runs -15..-25%), so the default stays the background gather.
+        static EA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let eng_async = *EA.get_or_init(|| std::env::var("DS41_ENGRAM_ASYNC").map_or(true, |v| v != "0"));
+        if let (Some(hs), true) = (&self.hash, engram_jit_on() && total <= 16 && eng_async) {
             for (li, &l) in engram_layers.iter().enumerate() {
                 let all: Vec<i64> = hashes.iter().flat_map(|h| h[li].iter().copied()).collect();
                 let hd = engram::rows_async(&self.tables, l, all, hs.head_dim);
@@ -1213,7 +1229,7 @@ impl Model {
                 mg.calls.set(mg.calls.get() + 1);
                 for i in 0..self.layers.len() { rows_dbg(i, &mid[i], &obuf[i], &hs[i]); }
                 prof("graph.fin", || g.fin.replay());
-                if debug_rows() { ROWS_DBG.with(|d| d.borrow_mut().push(("logits".into(), g.logits.narrow(0, 0, 1).to_device(Device::Cpu)))); }
+                if debug_rows() { ROWS_DBG.with(|d| d.borrow_mut().push(("logits".into(), self.logits_full(&g.logits).narrow(0, 0, 1).to_device(Device::Cpu)))); }
                 for (s, &n) in seqs.iter_mut().zip(&key) { s.advance(n as i64); }
                 return (g.logits.copy(), g.hid.as_ref().map(|h| h.copy()));
             }
@@ -1225,7 +1241,7 @@ impl Model {
                 rows_dbg(i, &g.mid[i], &g.obuf[i], &g.hs[i]);
             }
             prof("graph.fin", || g.fin.replay());
-            if debug_rows() { ROWS_DBG.with(|d| d.borrow_mut().push(("logits".into(), g.logits.narrow(0, 0, 1).to_device(Device::Cpu)))); }
+            if debug_rows() { ROWS_DBG.with(|d| d.borrow_mut().push(("logits".into(), self.logits_full(&g.logits).narrow(0, 0, 1).to_device(Device::Cpu)))); }
             for (s, &n) in seqs.iter_mut().zip(&key) { s.advance(n as i64); }
             return (g.logits.copy(), g.hid.as_ref().map(|h| h.copy()));
         }
@@ -1334,12 +1350,12 @@ impl Model {
             for i in 0..mid.len() { rows_dbg(i, &mid[i], &obuf[i], &hs[i]); }
             begin_pool(super::mem::GRAPH_POOL).expect("capture begin");
             let x = crate::ablate::clamp_final(rmsn(&Self::hc_pre(&h, &pre_mix), &self.norm, c.norm_eps));
-            let logits = self.logits(&x);
+            let logits = self.logits_local(&x);
             let hid = (!hid_parts.is_empty()).then(|| Tensor::cat(&hid_parts, 1));
             end().expect("capture end");
             let fin = Owned::take();
             fin.replay();
-            if debug_rows() { ROWS_DBG.with(|d| d.borrow_mut().push(("logits".into(), logits.narrow(0, 0, 1).to_device(Device::Cpu)))); }
+            if debug_rows() { ROWS_DBG.with(|d| d.borrow_mut().push(("logits".into(), self.logits_full(&logits).narrow(0, 0, 1).to_device(Device::Cpu)))); }
             keep.push(x);
             keep.extend(hid_parts);
             for (s, &n) in seqs.iter_mut().zip(&key) { s.advance(n as i64); }
@@ -1395,12 +1411,12 @@ impl Model {
         }
         begin_pool(super::mem::GRAPH_POOL).expect("capture begin");
         let x = crate::ablate::clamp_final(rmsn(&Self::hc_pre(&h, &pre_mix), &self.norm, c.norm_eps));
-        let logits = self.logits(&x);
+        let logits = self.logits_local(&x);
         let hid = (!hid_parts.is_empty()).then(|| Tensor::cat(&hid_parts, 1));
         end().expect("capture end");
         let fin = Owned::take();
         fin.replay();
-        if debug_rows() { ROWS_DBG.with(|d| d.borrow_mut().push(("logits".into(), logits.narrow(0, 0, 1).to_device(Device::Cpu)))); }
+        if debug_rows() { ROWS_DBG.with(|d| d.borrow_mut().push(("logits".into(), self.logits_full(&logits).narrow(0, 0, 1).to_device(Device::Cpu)))); }
         keep.push(x);
         keep.extend(hid_parts);
         for (s, &n) in seqs.iter_mut().zip(&key) { s.advance(n as i64); }
