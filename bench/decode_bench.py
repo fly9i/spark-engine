@@ -7,10 +7,12 @@ Greedy (temperature 0), thinking off, 32-token warm-up, max_tokens 400 by defaul
 Per stream: decode tok/s = (completion_tokens - 1) / (t_last - t_first); aggregate = sum of decode tokens / wall window.
 Each concurrency level runs `repeats` times and the median is reported.
 
-Usage: decode_bench.py [prose|structured] [repeats] [max_tokens]
+Usage: decode_bench.py [prose|structured] [repeats] [max_tokens] [--temperature T] [--thinking] [--streams 1,2,3,4]
+  --temperature / --thinking: sampled runs (e.g. --temperature 0.7 --thinking); concurrent streams then get the prompt
+  after a "Request ID: decode-<i>" line instead of a "(stream i/n)" suffix (C1 is the exact prompt either way).
 Env:   SPARK_URL (default http://127.0.0.1:8888), SPARK_MODEL_NAME (default: the server's first model)
 """
-import json, os, statistics, sys, threading, time, urllib.request
+import argparse, json, os, statistics, sys, threading, time, urllib.request
 
 BASE = os.environ.get("SPARK_URL", "http://127.0.0.1:8888").rstrip("/")
 PROMPTS = {
@@ -27,10 +29,13 @@ def model_name():
         return json.load(r)["data"][0]["id"]
 
 
+TEMP, THINK = 0.0, False
+
+
 def stream(model, prompt, max_tokens):
     body = {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens,
-            "temperature": 0, "top_p": 1, "stream": True, "stream_options": {"include_usage": True},
-            "chat_template_kwargs": {"enable_thinking": False, "thinking": False}}
+            "temperature": TEMP, "top_p": 1, "stream": True, "stream_options": {"include_usage": True},
+            "chat_template_kwargs": {"enable_thinking": THINK, "thinking": THINK}}
     req = urllib.request.Request(BASE + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
     t0 = time.perf_counter(); t_first = t_last = None; usage = None; chunks = 0
     with urllib.request.urlopen(req, timeout=1800) as r:
@@ -52,7 +57,12 @@ def stream(model, prompt, max_tokens):
 
 
 def wave(model, base, n, max_tokens):
-    prompts = [base] if n == 1 else [f"{base} (stream {i + 1}/{n})" for i in range(n)]
+    if n == 1:
+        prompts = [base]
+    elif TEMP > 0 or THINK:
+        prompts = [f"Request ID: decode-{i + 1}\n{base}" for i in range(n)]
+    else:
+        prompts = [f"{base} (stream {i + 1}/{n})" for i in range(n)]
     res = [None] * n
     def go(i): res[i] = stream(model, prompts[i], max_tokens)
     ts = [threading.Thread(target=go, args=(i,)) for i in range(n)]
@@ -63,17 +73,25 @@ def wave(model, base, n, max_tokens):
 
 
 def main():
-    kind = sys.argv[1] if len(sys.argv) > 1 else "prose"
-    reps = int(sys.argv[2]) if len(sys.argv) > 2 else 3
-    mx = int(sys.argv[3]) if len(sys.argv) > 3 else 400
+    global TEMP, THINK
+    ap = argparse.ArgumentParser()
+    ap.add_argument("kind", nargs="?", default="prose", choices=list(PROMPTS))
+    ap.add_argument("repeats", nargs="?", type=int, default=3)
+    ap.add_argument("max_tokens", nargs="?", type=int, default=400)
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--thinking", action="store_true")
+    ap.add_argument("--streams", default="1,2,3,4")
+    a = ap.parse_args()
+    kind, reps, mx, TEMP, THINK = a.kind, a.repeats, a.max_tokens, a.temperature, a.thinking
+    levels = [int(x) for x in a.streams.split(",")]
     model = model_name()
     stream(model, PROMPTS[kind], 32)   # warm-up
-    rows = {n: [] for n in (1, 2, 3, 4)}
+    rows = {n: [] for n in levels}
     for rep in range(reps):
-        for n in (1, 2, 3, 4):
+        for n in levels:
             w = wave(model, PROMPTS[kind], n, mx); rows[n].append(w)
             print(f"rep{rep} {kind} C{n}: agg {w['agg']:.1f}  per {w['per']:.1f}  ttft {w['ttft']:.0f}ms  tokens {w['tokens']}", flush=True)
-    print(f"\n== {model} {kind}, max_tokens {mx}, median of {reps}")
+    print(f"\n== {model} {kind}, temperature {TEMP}, thinking {'on' if THINK else 'off'}, max_tokens {mx}, median of {reps}")
     for n, ws in rows.items():
         print(f"C{n}: agg {statistics.median(w['agg'] for w in ws):.1f} tok/s  per-stream {statistics.median(w['per'] for w in ws):.1f}  "
               f"TTFT {statistics.median(w['ttft'] for w in ws):.0f} ms")

@@ -63,6 +63,21 @@ TTFT 随流数增加而增长，因为新请求是在正在运行的请求的 de
 多轮对话的后续轮次会复用上一轮的状态：在 16K token 的对话中，Qwen 下一轮的 TTFT 约为 0.3 s，而无需完整 prefill
 （提示词检查点）。
 
+### 采样 prose（温度 0.7、开思考），2026-10-28，v0.3.7
+
+`bench/decode_bench.py prose 3 400 --temperature 0.7 --thinking --streams 1,2,3,4,5`（DeepSeek：`--streams 1,2,4`）。每条回复都跑满
+400 token（含思考）。聚合 = 全部解码 token / 从最早一路首 token 到最晚一路末 token 的时间窗；括号内为各路速度之和。
+
+| 流数 | Qwen3.8-Flash-Next（单机） | DeepSeek-V4.1-Flash（三台） |
+| --- | --- | --- |
+| 1 | 51.5 tok/s（TTFT 208 ms） | 53.7 tok/s（TTFT 255 ms） |
+| 2 | 77.1（83.9） | 76.4（78.6） |
+| 3 | 94.0（102.3） | — |
+| 4 | 106.5（117.7） | 98.1（104.2） |
+| 5 | 119.0（131.8） | —（DeepSeek 服务同时解码 4 个请求，`DS41_SERVE_STORES=4`，多出的排队） |
+
+采样会降低草稿接受率，所以低于上面的贪心数据。
+
 ### 复现
 
 ```bash
