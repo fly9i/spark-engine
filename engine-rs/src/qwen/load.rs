@@ -18,6 +18,8 @@ pub struct Checkpoint {
     pub dev: Device,
     cache: std::cell::RefCell<HashMap<String, Tensor>>,
     staging: std::cell::RefCell<Option<Tensor>>,
+    /// read-ahead of the `preload` prefixes (`read_ahead`): the reader and, per prefix, its regions (index, file, start)
+    ahead: std::cell::RefCell<Option<(crate::readahead::Readahead, HashMap<String, Vec<(usize, usize, usize)>>)>>,
 }
 
 fn header(path: &Path) -> (usize, serde_json::Map<String, Value>) {
@@ -49,7 +51,7 @@ impl Checkpoint {
         files.dedup();
         files.extend(extra_files.iter().map(|s| s.to_string()));
         let mut ck = Checkpoint { dir: dir.into(), cfg, maps: vec![], names: vec![], tensors: HashMap::new(), dev,
-                                  cache: Default::default(), staging: Default::default() };
+                                  cache: Default::default(), staging: Default::default(), ahead: Default::default() };
         for (fi, name) in files.iter().enumerate() {
             let path = dir.join(name);
             let (base, h) = header(&path);
@@ -91,18 +93,66 @@ impl Checkpoint {
         self.get_on(k, self.dev)
     }
 
-    /// Bulk-load every tensor whose name starts with `prefix` into one device allocation: parallel copies
-    /// from the mmap into a pinned staging buffer, one H2D copy per 256 MiB, tensors are views of it.
-    pub fn preload(&self, prefix: &str) {
-        use rayon::prelude::*;
-        const STAGE: usize = 256 << 20;
+    fn preload_keys(&self, prefix: &str) -> Vec<&String> {
         let mut keys: Vec<&String> = self.tensors.keys()
             .filter(|k| k.starts_with(prefix) && !k.ends_with("ngram_embedding.trellis")).collect();
         keys.sort();
+        keys
+    }
+
+    /// Start reading the tensors of `prefixes` (each the argument of a later `preload`, in the order they will be
+    /// preloaded) ahead with O_DIRECT (QWEN_LOAD_AHEAD, default on; 0: `preload` copies out of the mmap). A prefix's
+    /// tensors lie together in its shard (a layer, ~1.35 GB): one region per file it spans.
+    pub fn read_ahead(&self, prefixes: &[String]) {
+        if !self.dev.is_cuda() || std::env::var("QWEN_LOAD_AHEAD").as_deref() == Ok("0") { return; }
+        let mut regions = Vec::new();
+        let mut map = HashMap::new();
+        for p in prefixes {
+            let mut per: std::collections::BTreeMap<usize, (usize, usize)> = Default::default();
+            for k in self.preload_keys(p) {
+                let t = &self.tensors[k];
+                let e = per.entry(t.file).or_insert((t.offset, t.offset + t.len));
+                e.0 = e.0.min(t.offset);
+                e.1 = e.1.max(t.offset + t.len);
+            }
+            let v = per.into_iter().map(|(f, (a, b))| {
+                regions.push(crate::readahead::Region { path: self.dir.join(&self.names[f]), a, b });
+                (regions.len() - 1, f, a)
+            }).collect();
+            map.insert(p.clone(), v);
+        }
+        *self.ahead.borrow_mut() = Some((crate::readahead::Readahead::start(regions, 3, "qwen"), map));
+    }
+    /// Ends the read-ahead (its buffers are freed).
+    pub fn finish_ahead(&self) { self.ahead.borrow_mut().take(); }
+
+    /// Bulk-load every tensor whose name starts with `prefix` into one device allocation (tensors at 256-byte aligned
+    /// offsets in name order, views of it): with `read_ahead` one scatter copy per region out of the read-ahead
+    /// buffer, otherwise parallel copies from the mmap into a pinned staging buffer and one H2D copy per 256 MiB.
+    pub fn preload(&self, prefix: &str) {
+        use rayon::prelude::*;
+        const STAGE: usize = 256 << 20;
+        let keys = self.preload_keys(prefix);
         let align = |n: usize| (n + 255) / 256 * 256;
         let total: usize = keys.iter().map(|k| align(self.tensors[*k].len)).sum();
         if total == 0 { return; }
         let gpu = Tensor::empty([total as i64], (Kind::Uint8, self.dev));
+        if self.preload_ahead(prefix, &keys, &gpu) {
+            // QWEN_LOAD_CHECK=1: every tensor's bytes against the mmap (slow: the shards are read twice)
+            let check = std::env::var("QWEN_LOAD_CHECK").as_deref() == Ok("1");
+            let mut o = 0usize;
+            let mut cache = self.cache.borrow_mut();
+            for k in &keys {
+                let t = &self.tensors[*k];
+                if check {
+                    let want = Tensor::from_slice(self.bytes(k)).to_device(self.dev);
+                    assert!(gpu.narrow(0, o as i64, t.len as i64).equal(&want), "read-ahead bytes of {k} differ from the mmap");
+                }
+                cache.insert((*k).clone(), gpu.narrow(0, o as i64, t.len as i64).view_dtype(kind_of(&t.dtype)).view(t.shape.as_slice()));
+                o += align(t.len);
+            }
+            return;
+        }
         let mut stg = self.staging.borrow_mut();
         let staging = stg.get_or_insert_with(|| Tensor::empty([STAGE as i64], (Kind::Uint8, Device::Cpu)).pin_memory(self.dev));
         let sp = staging.data_ptr() as usize;
@@ -147,6 +197,23 @@ impl Checkpoint {
             off += used;
             i = j;
         }
+    }
+    /// The read-ahead half of `preload`: false when `prefix` was not read ahead (or its regions are gone).
+    fn preload_ahead(&self, prefix: &str, keys: &[&String], gpu: &Tensor) -> bool {
+        let mut ah = self.ahead.borrow_mut();
+        let Some((ra, map)) = ah.as_mut() else { return false };
+        let Some(regs) = map.get(prefix) else { return false };
+        let align = |n: usize| (n + 255) / 256 * 256;
+        let mut dst = Vec::with_capacity(keys.len());
+        let mut o = 0usize;
+        for k in keys { dst.push(o); o += align(self.tensors[*k].len); }
+        for &(ri, f, a) in regs {
+            let Some(src) = ra.get(ri) else { return false };
+            let segs: Vec<(usize, usize, usize)> = keys.iter().zip(&dst).filter(|(k, _)| self.tensors[**k].file == f)
+                .map(|(k, &d)| { let t = &self.tensors[*k]; (t.offset - a, d, t.len) }).collect();
+            crate::readahead::copy_segments(gpu.data_ptr() as *mut u8, src, &segs, self.dev);
+        }
+        true
     }
     pub fn clear_cache(&self) { self.cache.borrow_mut().clear(); }
 

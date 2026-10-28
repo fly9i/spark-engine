@@ -170,10 +170,15 @@ pub fn batch(dir: &Path, files: &str, rounds: usize, k: usize) {
 fn batch_arm(m: &Model, prompts: &[Vec<i64>], rounds: usize, arm: &str, mut log: Option<&mut std::fs::File>) {
     use super::graph::{BatchG, Policy};
     use super::model::Seq;
-    let pol = Policy::from_env().for_batch(prompts.len());
+    let mut pol = Policy::from_env().for_batch(prompts.len());
+    // greedy rounds (QWEN_BATCH_COST=sampled: the sampled-round costs)
+    if std::env::var("QWEN_BATCH_COST").as_deref() != Ok("sampled") { pol.greedy_cost(prompts.len()); }
     let cap = prompts.iter().map(|p| p.len()).max().unwrap() as i64 + (rounds as i64 + 2) * (pol.cap() as i64 + 1) + 64;
     let mut seqs: Vec<Seq> = prompts.iter().map(|_| m.new_seq(cap)).collect();
     let mut state = Vec::new();   // (next, drafts, confs)
+    // the rate rule's acceptance calibrations (greedy rounds)
+    let cal0 = super::graph::Cal::new(false);
+    let mut cals = vec![cal0; prompts.len()];
     for (s, p) in seqs.iter_mut().zip(prompts) {
         let t_pf = Instant::now();
         let (next, h) = super::spec::prefill(m, s, p);
@@ -183,7 +188,7 @@ fn batch_arm(m: &Model, prompts: &[Vec<i64>], rounds: usize, arm: &str, mut log:
         let pick = |lg: &Tensor| { let (t, c) = m.draft_pick(lg); (t.int64_value(&[0]), super::graph::Policy::cal(c.double_value(&[0]))) };
         let (t, c) = pick(&lg);
         let (mut d, mut cf) = (vec![t], vec![c]);
-        while pol.first().more(&[cf.clone()]) {
+        while pol.first().more(&[if pol.rate.is_some() { cal0.ests(&cf) } else { cf.clone() }]) {
             let j = d.len();
             let (l2, x2) = m.mtp_run(s, &multi, &[d[j - 1]], s.pos + j as i64 - 1, true);
             let (t, c) = pick(&l2);
@@ -194,6 +199,8 @@ fn batch_arm(m: &Model, prompts: &[Vec<i64>], rounds: usize, arm: &str, mut log:
     }
     let t_cap = Instant::now();
     let mut bg = BatchG::capture(m, &seqs.iter().collect::<Vec<_>>(), pol.cap());
+    // every verify width the policy can pick, captured before the timed rounds (the rate rule uses up to eight)
+    for w in 1..=pol.cap() { if pol.rate.is_none() && w != pol.k.min(pol.cap()) && w != pol.cap() { continue; } bg.prepare(m, &seqs.iter().collect::<Vec<_>>(), w + 1); }
     let mut ms = [0.0f64; 3];
     let mut toks = 0usize;
     let mut rows_v = 0usize;
@@ -207,6 +214,9 @@ fn batch_arm(m: &Model, prompts: &[Vec<i64>], rounds: usize, arm: &str, mut log:
     sync();
     eprintln!("[qwen-batch] arm '{}' {:?}: capture {:.0} ms", arm, pol, t_cap.elapsed().as_secs_f64() * 1e3);
     let t_all = Instant::now();
+    let ng0 = m.ngram_stats().unwrap_or_default();
+    // second-best draft tokens of the chain being verified (QWEN_DRAFT_TOP2), logged with the round
+    let mut round_alts: Option<Vec<Vec<i64>>> = None;
     let mut done_rounds = 0;
     let lapping = std::env::var("QWEN_BATCH_NOLAP").is_err();   // QWEN_BATCH_NOLAP=1: no phase syncs (nsys)
     for _ in 0..rounds {
@@ -214,7 +224,9 @@ fn batch_arm(m: &Model, prompts: &[Vec<i64>], rounds: usize, arm: &str, mut log:
         done_rounds += 1;
         let mut t = Instant::now();
         let mut lap = |i: usize, t: &mut Instant| { if lapping { sync(); ms[i] += t.elapsed().as_secs_f64() * 1e3; *t = Instant::now(); } };
-        let kv = pol.width(&state.iter().map(|(_, _, c)| pol.verify_len(c)).collect::<Vec<_>>()).min(state.iter().map(|s| s.1.len()).min().unwrap());
+        let ests: Vec<Vec<f64>> = state.iter().zip(&cals).map(|((_, _, c), k)| k.ests(c)).collect();
+        let kv = if pol.rate.is_some() { pol.rate_width(&ests.iter().map(|e| e.as_slice()).collect::<Vec<_>>()) }
+                 else { pol.width(&state.iter().map(|(_, _, c)| pol.verify_len(c)).collect::<Vec<_>>()) }.min(state.iter().map(|s| s.1.len()).min().unwrap());
         let r1 = kv + 1;
         hist[kv] += 1;
         let rows: Vec<Vec<i64>> = state.iter().map(|(n, d, _)| { let mut r = vec![*n]; r.extend_from_slice(&d[..kv]); r }).collect();
@@ -230,7 +242,7 @@ fn batch_arm(m: &Model, prompts: &[Vec<i64>], rounds: usize, arm: &str, mut log:
         for g in 0..seqs.len() {
             let mut a = 0;
             while a < kv && gt[g][a] == rows[g][a + 1] { a += 1; }
-            if look_used[g] { look_rounds += 1; }
+            if look_used[g] { look_rounds += 1; } else { cals[g].observe(&state[g].2, kv, a); }
             looks[g].record(look_used[g], a + 1);
             if let Some((p, _)) = &props[g] {
                 let truth: Vec<i64> = rows[g][1..=a].iter().copied().chain([gt[g][a]]).collect();
@@ -239,7 +251,8 @@ fn batch_arm(m: &Model, prompts: &[Vec<i64>], rounds: usize, arm: &str, mut log:
             ns.push(a + 1);
             rows_v += r1;
             if let (Some(f), false) = (log.as_mut(), ended[g]) {
-                let _ = writeln!(f, "{}", serde_json::json!({"conf": state[g].2, "acc": a, "w": kv}));
+                let _ = writeln!(f, "{}", serde_json::json!({"conf": state[g].2, "acc": a, "w": kv, "y": gt[g][a],
+                                                             "alt": round_alts.as_ref().map(|v| v[g].clone())}));
             }
             ended[g] |= rows[g][1..=a].iter().chain([&gt[g][a]]).any(|t| super::spec::EOS.contains(t));
             cids.push((0..r1).map(|i| if i < a { rows[g][i + 1] } else if i == a { gt[g][a] } else { rows[g][(i + 1).min(kv)] }).collect::<Vec<_>>());
@@ -256,7 +269,8 @@ fn batch_arm(m: &Model, prompts: &[Vec<i64>], rounds: usize, arm: &str, mut log:
             looks[g].propose(&seqs[g].ids, cids[g][ns[g] - 1], pol.cap())
         }).collect();
         let usable: Vec<Option<(Vec<i64>, f64)>> = (0..seqs.len()).map(|g| props[g].clone().filter(|_| looks[g].usable())).collect();
-        let (next, used) = bg.drafts(&pol, &usable);
+        let (next, used) = bg.drafts(&pol, &usable, &cals);
+        round_alts = bg.alts(next.iter().map(|d| d.0.len()).max().unwrap_or(0));
         look_used = used;
         for g in 0..seqs.len() { state[g] = (cids[g][ns[g] - 1], next[g].0.clone(), next[g].1.clone()); }
         lap(2, &mut t);
@@ -265,6 +279,11 @@ fn batch_arm(m: &Model, prompts: &[Vec<i64>], rounds: usize, arm: &str, mut log:
     let r = done_rounds as f64;
     eprintln!("[qwen-batch] arm '{}': {} seqs, {} rounds: {:.2} tok/round, {:.1} tok/s aggregate, {:.2} verify rows/seq/round, widths {:?}",
               arm, seqs.len(), done_rounds, toks as f64 / r, toks as f64 / dt, rows_v as f64 / r / seqs.len() as f64, &hist[1..]);
+    if let Some(ng) = m.ngram_stats() {
+        let rows = (ng[0] + ng[1] + ng[2]) - (ng0[0] + ng0[1] + ng0[2]);
+        eprintln!("[qwen-batch] arm '{}' n-gram pack: {:.3} ms per round, {:.0} rows per round ({:.0}% from the table)", arm,
+                  (ng[3] - ng0[3]) as f64 / 1e6 / r, rows as f64 / r, 100.0 * (ng[2] - ng0[2]) as f64 / rows.max(1) as f64);
+    }
     eprintln!("[qwen-batch] arm '{}' per round ms: verify + accept + commit + catch-up {:.2} host {:.2} draft steps {:.2}; lookup drafts in {} sequence-rounds",
               arm, ms[0] / r, ms[1] / r, ms[2] / r, look_rounds);
     let outs: Vec<&[i64]> = seqs.iter().zip(prompts).map(|(s, p)| &s.ids[p.len()..]).collect();

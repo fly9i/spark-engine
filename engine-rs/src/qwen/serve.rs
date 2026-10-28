@@ -121,6 +121,8 @@ struct Active {
     hit: usize, rounds: usize, drafted: usize, accepted: usize, cancelled: bool,
     look: super::lookup::Lookup, look_used: bool, look_prop: Option<Vec<i64>>,
     mm: Option<super::vision::MmState>,
+    /// the rate rule's online acceptance calibration (graph::Cal)
+    cal: super::graph::Cal,
 }
 
 /// The front end's connection. A new connection replaces it (a front-end restart keeps the engine, its stores and graphs);
@@ -128,6 +130,17 @@ struct Active {
 struct Conn(std::sync::Arc<std::sync::Mutex<Option<UnixStream>>>);
 fn write_line(conn: &mut Conn, v: &Value) {
     if let Some(s) = conn.0.lock().unwrap().as_mut() { let _ = s.write_all(format!("{v}\n").as_bytes()); }
+}
+
+/// QWEN_DRAFT_COUPLED (default on; 0: off): drafts of a sampled request (temperature T > 0) take the argmax of their
+/// logits plus the Gumbel noise the verify adds at the same position, scaled by QWEN_DRAFT_TEMP x T (default 1.0), instead
+/// of the plain argmax (eager rounds, and the batch graphs: a second draft-step / catch-up graph replayed in rounds with
+/// a sampled sequence, greedy rounds replay the plain ones). The verify and its samples are unchanged (output identical
+/// per seed); only which drafts are proposed changes. 2026-10-28, fixed-seed service ABBA: T=1 c1 accepted drafts per
+/// round 0.839 -> 0.900, tok/s +0.9..+5.6% (c4 +0.6..+4.7%), T=0 unchanged; QWEN_DRAFT_TEMP=0.7 accepted fewer (0.882).
+fn coupled_draft_temp(temp: f32) -> Option<f32> {
+    if temp <= 0.0 || std::env::var("QWEN_DRAFT_COUPLED").as_deref() == Ok("0") { return None; }
+    Some(temp * std::env::var("QWEN_DRAFT_TEMP").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0))
 }
 
 fn sample_rows(lg: &Tensor, temp: f32, seed: u64, pos0: i64) -> Vec<i64> {
@@ -382,7 +395,8 @@ pub fn serve(dir: &Path, socket: &Path) {
             let mm = (!items.is_empty()).then(|| super::vision::MmState::new(items));
             active.push(Active { id, store: si, prompt, max_new, stop_ids, temp, seed, phase: Phase::Prefill { done: hit, mtp_pend, last: None },
                                  out: vec![], sent: 0, t_queue: tq, t_start: Instant::now(), prefill_ms: 0.0, queue_ms: tq.elapsed().as_secs_f64() * 1e3,
-                                 hit, rounds: 0, drafted: 0, accepted: 0, cancelled: false, look: Default::default(), look_used: false, look_prop: None, mm });
+                                 hit, rounds: 0, drafted: 0, accepted: 0, cancelled: false, look: Default::default(), look_used: false, look_prop: None, mm,
+                                 cal: super::graph::Cal::new(temp > 0.0) });
         }
         if active.is_empty() { continue; }
         // ---- one prefill chunk (prefilling sequences in turn)
@@ -437,6 +451,7 @@ pub fn serve(dir: &Path, socket: &Path) {
             let a = active.remove(i);
             let st = &mut stores[a.store];
             st.busy = false;
+            m.gdn_flush(st.seq());   // a fused commit's last rows into the GDN states (the store's history may be reused)
             // committed history = prompt + generated tokens except the last (not yet run through the target)
             let committed = st.seq().pos as usize;
             let mut hist = a.prompt.clone();
@@ -488,7 +503,7 @@ fn prefill_step(m: &Model, pol: &Policy, a: &mut Active, st: &mut Store) {
         let next = sample_rows(last.as_ref().unwrap(), a.temp, a.seed, st.seq().pos)[0];
         let (h, pos) = mtp_pend.take().unwrap();
         let (lg_d, mul) = m.mtp_run(st.seq_mut(), &h, &[next], pos, true);
-        let (drafts, confs) = draft_chain(m, st.seq_mut(), &lg_d, &mul, &pol.first());
+        let (drafts, confs) = draft_chain(m, st.seq_mut(), &lg_d, &mul, &pol.first(), a.temp, a.seed);
         a.prefill_ms = a.t_start.elapsed().as_secs_f64() * 1e3;
         a.out.push(next);
         a.phase = Phase::Decode { next, drafts, confs };
@@ -497,16 +512,22 @@ fn prefill_step(m: &Model, pol: &Policy, a: &mut Active, st: &mut Store) {
 
 /// Eager drafts d1..: d1 from the catch-up logits `lg`, then MTP steps from its last stack at seq.pos.. while the
 /// policy asks for more; returns (drafts, confidences).
-fn draft_chain(m: &Model, seq: &mut Seq, lg: &Tensor, mul: &Tensor, pol: &Policy) -> (Vec<i64>, Vec<f64>) {
+fn draft_chain(m: &Model, seq: &mut Seq, lg: &Tensor, mul: &Tensor, pol: &Policy, temp: f32, seed: u64) -> (Vec<i64>, Vec<f64>) {
     let p = seq.pos;
-    let pick = |lg: &Tensor| { let (t, c) = m.draft_pick(lg); (t.int64_value(&[0]), super::graph::Policy::cal(c.double_value(&[0]))) };
+    // draft j guesses the token the verify samples with key (seed, p + 1 + j)
+    let pick_at = |lg: &Tensor, j: usize| {
+        let (t, c) = m.draft_pick(lg);
+        let t = match coupled_draft_temp(temp) { Some(td) => m.draft_pick_coupled(lg, td, crate::sampling::key(seed, (p + 1 + j as i64) as u64)), None => t };
+        (t.int64_value(&[0]), super::graph::Policy::cal(c.double_value(&[0])))
+    };
+    let pick = |lg: &Tensor| pick_at(lg, 0);
     let (t, c) = pick(lg);
     let (mut d, mut cf) = (vec![t], vec![c]);
     let mut multi = mul.narrow(0, mul.size()[0] - 1, 1).contiguous();
     while pol.more(&[cf.clone()]) {
         let j = d.len();
         let (l2, m2) = m.mtp_run(seq, &multi, &[d[j - 1]], p + j as i64 - 1, true);
-        let (t, c) = pick(&l2);
+        let (t, c) = pick_at(&l2, j);
         d.push(t); cf.push(c);
         multi = m2;
     }
@@ -539,12 +560,14 @@ fn decode_one(m: &Model, pol: &Policy, a: &mut Active, st: &mut Store) {
     rows.extend_from_slice(&d);
     let (lg, x) = m.run(st.seq_mut(), &rows, false, false);
     let g = sample_rows(&lg, a.temp, a.seed, p + 1);
+    let cf = confs.clone();
     let acc = accept(a, &d, kk, &g);
+    if !a.look_used { a.cal.observe(&cf, kk, acc); }
     m.commit(st.seq_mut(), acc as i64 + 1);
     let mut ids = d[..acc].to_vec();
     ids.push(g[acc]);
     let (l3, m3) = m.mtp_run(st.seq_mut(), &x.narrow(0, 0, acc as i64 + 1).contiguous(), &ids, p, true);
-    let (nd, nc) = draft_chain(m, st.seq_mut(), &l3, &m3, pol);
+    let (nd, nc) = draft_chain(m, st.seq_mut(), &l3, &m3, pol, a.temp, a.seed);
     if let Phase::Decode { drafts, confs, .. } = &mut a.phase { *drafts = nd; *confs = nc; }
     st.pend_h = Some(x.narrow(0, acc as i64, 1).copy());
 }
@@ -554,13 +577,19 @@ fn decode_one(m: &Model, pol: &Policy, a: &mut Active, st: &mut Store) {
 /// device and synchronize once before the draft steps; rounds with a sampling sequence accept on the host.
 fn decode_batch(m: &Model, pol: &Policy, active: &mut [Active], dec: &[usize], stores: &mut [Store], graphs: &mut HashMap<Vec<usize>, BatchG>) {
     let mut clk = Clock::new();
-    let pol = &pol.for_batch(dec.len());
+    let mut pol = pol.for_batch(dec.len());
+    if dec.iter().all(|&i| active[i].temp <= 0.0) { if Policy::rate_sampled_only() { pol.rate = None; } else { pol.greedy_cost(dec.len()); } }
+    let pol = &pol;
     let mut order = dec.to_vec();
     order.sort_by_key(|&i| active[i].store);
     let key: Vec<usize> = order.iter().map(|&i| active[i].store).collect();
     // (sequences that just joined bring chains of other lengths: the width stays within the shortest)
     let dr = |i: usize| { let Phase::Decode { drafts, confs, .. } = &active[i].phase else { unreachable!() }; (drafts.len(), confs) };
-    let kv = pol.width(&order.iter().map(|&i| kk_of(pol.verify_len(dr(i).1), &active[i])).collect::<Vec<_>>())
+    let kv = if pol.rate.is_some() {
+                 let ests: Vec<Vec<f64>> = order.iter().map(|&i| active[i].cal.ests(dr(i).1)).collect();
+                 pol.rate_width(&ests.iter().map(|e| e.as_slice()).collect::<Vec<_>>())
+             }
+             else { pol.width(&order.iter().map(|&i| kk_of(pol.verify_len(dr(i).1), &active[i])).collect::<Vec<_>>()) }
         .min(order.iter().map(|&i| dr(i).0).min().unwrap());
     let r1 = kv + 1;
     let rows: Vec<Vec<i64>> = order.iter().map(|&i| {
@@ -579,6 +608,8 @@ fn decode_batch(m: &Model, pol: &Policy, active: &mut [Active], dec: &[usize], s
     }
     let bg = graphs.get_mut(&key).unwrap();
     let greedy = order.iter().all(|&i| active[i].temp <= 0.0);
+    // coupled draft steps: a greedy round drafts by plain argmax (zero temperatures); a sampled one gets its keys below
+    if greedy && bg.coupled() { bg.set_draft_keys(&vec![0.0; order.len()], &[]); }
     let (gs, x) = {
         let seqs: Vec<&Seq> = key.iter().map(|&s| stores[s].seq()).collect();
         if greedy { bg.round_greedy(m, &seqs, &rows, &kks) } else {
@@ -595,7 +626,10 @@ fn decode_batch(m: &Model, pol: &Policy, active: &mut [Active], dec: &[usize], s
     let mut ns = Vec::new();
     let mut cids = Vec::new();
     for (g, &i) in order.iter().enumerate() {
+        let Phase::Decode { confs: cf, .. } = &active[i].phase else { unreachable!() };
+        let cf = cf.clone();
         let acc = accept(&mut active[i], &rows[g][1..], kks[g], &gs[g]);
+        if !active[i].look_used { active[i].cal.observe(&cf, kks[g], acc); }
         let lu = active[i].look_used;
         active[i].look.record(lu, acc + 1);
         if let Some(p) = active[i].look_prop.take() {
@@ -607,7 +641,16 @@ fn decode_batch(m: &Model, pol: &Policy, active: &mut [Active], dec: &[usize], s
         cids.push((0..r1).map(|i| if i < acc { rows[g][i + 1] } else if i == acc { gs[g][acc] } else { rows[g][(i + 1).min(kv)] }).collect::<Vec<_>>());
     }
     clk.lap(1, dec.len());
-    if !greedy { bg.commit_host(r1, &cids, &ps, &ns); }
+    if !greedy {
+        if bg.coupled() {
+            // draft j of sequence g guesses the token sampled with key (seed, p' + 1 + j), p' its position after the commit
+            let temps: Vec<f32> = order.iter().map(|&i| coupled_draft_temp(active[i].temp).unwrap_or(0.0)).collect();
+            let keys: Vec<Vec<u64>> = order.iter().enumerate().map(|(g, &i)| (0..pol.cap())
+                .map(|j| crate::sampling::key(active[i].seed, (ps[g] + ns[g] as i64 + 1 + j as i64) as u64)).collect()).collect();
+            bg.set_draft_keys(&temps, &keys);
+        }
+        bg.commit_host(r1, &cids, &ps, &ns);
+    }
     clk.lap(2, dec.len());
     for (g, &s) in key.iter().enumerate() {
         let st = &mut stores[s];
@@ -625,7 +668,8 @@ fn decode_batch(m: &Model, pol: &Policy, active: &mut [Active], dec: &[usize], s
         a.look_prop = p.as_ref().map(|(v, _)| v.clone());
         p.filter(|_| a.look.usable())
     }).collect();
-    let (next, used) = bg.drafts(pol, &looks);
+    let cals: Vec<super::graph::Cal> = order.iter().map(|&i| active[i].cal).collect();
+    let (next, used) = bg.drafts(pol, &looks, &cals);
     for (g, &i) in order.iter().enumerate() {
         if let Phase::Decode { drafts, confs, .. } = &mut active[i].phase { (*drafts, *confs) = next[g].clone(); }
         active[i].look_used = used[g];

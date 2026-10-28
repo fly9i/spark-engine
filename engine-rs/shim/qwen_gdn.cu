@@ -20,7 +20,10 @@ namespace qgdn {
 
 constexpr int C = 10240, NV = 48, D = 128, MAXSEG = 8;
 
-struct Segs { int n; int r0[MAXSEG]; int T[MAXSEG]; float* S[MAXSEG]; };
+// PN[g] (null: none): rows of segment g's last chain accepted but not yet applied to S (QWEN_GDN_FUSED_COMMIT: the
+// commit only copied their inputs to PY[g] [rows, C] / PAB[g] [rows, 96]); the recurrence kernels apply them to S first,
+// with the commit's arithmetic, and write S back, then run the segment's rows.
+struct Segs { int n; int r0[MAXSEG]; int T[MAXSEG]; float* S[MAXSEG]; const float* PY[MAXSEG]; const float* PAB[MAXSEG]; const int* PN[MAXSEG]; };
 
 // Segment fields by a runtime index through a select chain: indexing the by-value parameter array directly puts it
 // in local memory (stack frame + spills in the recurrence kernels).
@@ -33,6 +36,7 @@ __device__ __forceinline__ int seg_rows(const Segs& sg, const int* nd, int g)
     const int T = pick(sg.T, g);
     return nd ? min(max(nd[g], 0), T) : T;
 }
+
 
 // y[t, c] = silu(sum_j w[c, j] * x[t - 3 + j, c]); rows before 0 come from state[c][0..3) (oldest first).
 // grid (C / 256, segments, row blocks of CONV_RT): no recurrence (outputs only read inputs), so rows run in parallel;
@@ -86,6 +90,32 @@ __device__ __forceinline__ float block_sum128(float v, float* red)
 
 __device__ __forceinline__ float softplus(float x) { return x > 20.0f ? x : log1pf(__expf(x)); }
 
+// One row of the recurrence without the output (a commit's row): s = thread i's row of S[j], updated in place. The same
+// operations in the same order as the recurrence kernels' loop body.
+__device__ __forceinline__ void commit_row(float (&s)[D], const float* yt, const float* abt, int j, int kh, int i, float alog, float dtb,
+                                           float* qs, float* ks, float* red)
+{
+    float q = yt[kh * D + i], k = yt[2048 + kh * D + i], v = yt[4096 + j * D + i];
+    float qn = block_sum128(q * q, red);
+    float kn = block_sum128(k * k, red);
+    __syncthreads();
+    qs[i] = q * rsqrtf(qn + 1e-6f) * 0.08838834764831845f;
+    ks[i] = k * rsqrtf(kn + 1e-6f);
+    __syncthreads();
+    float g = -__expf(alog) * softplus(abt[j] + dtb);
+    float beta = 1.0f / (1.0f + __expf(-abt[NV + j]));
+    float decay = __expf(g);
+    float kv = 0.0f;
+    #pragma unroll
+    for (int kk = 0; kk < D; ++kk) { s[kk] *= decay; kv += s[kk] * ks[kk]; }
+    float vp = beta * (v - kv);
+    float o = 0.0f;
+    #pragma unroll
+    for (int kk = 0; kk < D; ++kk) { s[kk] += vp * ks[kk]; o += s[kk] * qs[kk]; }
+    (void) o;
+}
+__device__ __forceinline__ int pend_rows(const Segs& sg, int g) { const int* pn = pick(sg.PN, g); return pn ? *pn : 0; }
+
 // grid (NV, segments) x 128 threads. y [T, 10240] conv output (q 0..2047 | k 2048..4095 | v 4096..),
 // ab [T, 96] (a 0..47 | b 48..95), z [T, 6144]; out [T, 6144] (fp32, may be null when only committing).
 __global__ __launch_bounds__(128) void recur_kernel(
@@ -94,8 +124,8 @@ __global__ __launch_bounds__(128) void recur_kernel(
     const __nv_bfloat16* __restrict__ norm_w, const Segs sg, const int* __restrict__ nd, float* __restrict__ out, int write_state)
 {
     const int j = blockIdx.x, i = threadIdx.x, kh = j / 3, g = blockIdx.y;
-    const int T = seg_rows(sg, nd, g);
-    if (T <= 0) return;
+    const int T = seg_rows(sg, nd, g), P = pend_rows(sg, g);
+    if (T <= 0 && P <= 0) return;
     const int64_t r0 = pick(sg.r0, g);
     y += r0 * C; ab += r0 * ldab; z += r0 * ldz;
     if (out) out += r0 * (NV * D);
@@ -111,6 +141,14 @@ __global__ __launch_bounds__(128) void recur_kernel(
     }
     const float alog = __bfloat162float(A_log[j]), dtb = __bfloat162float(dt_bias[j]);
     const float nw = __bfloat162float(norm_w[i]);
+    if (P > 0)
+    {
+        const float* py = pick(sg.PY, g);
+        const float* pab = pick(sg.PAB, g);
+        for (int t = 0; t < P; ++t) commit_row(s, py + (int64_t) t * C, pab + t * 2 * NV, j, kh, i, alog, dtb, qs, ks, red);
+        #pragma unroll
+        for (int k = 0; k < D; k += 4) *(float4*) (Sj + k) = make_float4(s[k], s[k + 1], s[k + 2], s[k + 3]);
+    }
     for (int t = 0; t < T; ++t)
     {
         const float* yt = y + (int64_t) t * C;
@@ -156,8 +194,8 @@ __global__ __launch_bounds__(128) void recur2_kernel(
 {
     extern __shared__ __align__(16) float st_sm[];   // [128][SLD]
     const int j = blockIdx.x, i = threadIdx.x, kh = j / 3, g = blockIdx.y;
-    const int T = seg_rows(sg, nd, g);
-    if (T <= 0) return;
+    const int T = seg_rows(sg, nd, g), P = pend_rows(sg, g);
+    if (T <= 0 && P <= 0) return;
     const int64_t r0 = pick(sg.r0, g);
     y += r0 * C; ab += r0 * ldab; z += r0 * ldz;
     if (out) out += r0 * (NV * D);
@@ -179,6 +217,18 @@ __global__ __launch_bounds__(128) void recur2_kernel(
     }
     const float alog = __bfloat162float(A_log[j]), dtb = __bfloat162float(dt_bias[j]);
     const float nw = __bfloat162float(norm_w[i]);
+    if (P > 0)
+    {
+        const float* py = pick(sg.PY, g);
+        const float* pab = pick(sg.PAB, g);
+        for (int t = 0; t < P; ++t) commit_row(s, py + (int64_t) t * C, pab + t * 2 * NV, j, kh, i, alog, dtb, qs, ks, red);
+        __syncthreads();   // st_sm rows are read by other threads at load: everyone past it before it is overwritten
+        #pragma unroll
+        for (int k = 0; k < D; k += 4) *(float4*) (st_sm + i * SLD + k) = make_float4(s[k], s[k + 1], s[k + 2], s[k + 3]);
+        __syncthreads();
+        #pragma unroll 8
+        for (int q = i; q < D * D / 4; q += 128) *(float4*) (S + 4 * q) = *(const float4*) (st_sm + (q >> 5) * SLD + (q & 31) * 4);
+    }
     for (int t = 0; t < T; ++t)
     {
         const float* yt = y + (int64_t) t * C;
@@ -543,12 +593,40 @@ __global__ __launch_bounds__(128) void onorm_kernel(float* __restrict__ out, con
 }  // namespace qgdn
 
 static qgdn::Segs one(void* S, int T) { qgdn::Segs sg{}; sg.n = 1; sg.r0[0] = 0; sg.T[0] = T; sg.S[0] = (float*) S; return sg; }
+// Pending rows for the next recurrence launch (qwen_gdn_recur_segs_p), consumed by it.
+static struct { int n; const void* py[qgdn::MAXSEG]; const void* pab[qgdn::MAXSEG]; const int* pn[qgdn::MAXSEG]; } g_pend = {};
 static int segs(qgdn::Segs& sg, int n, const int* r0, const int* T, void* const* S)
 {
     if (n < 1 || n > qgdn::MAXSEG) return -1;
     sg = qgdn::Segs{}; sg.n = n;
     for (int g = 0; g < n; ++g) { sg.r0[g] = r0[g]; sg.T[g] = T[g]; sg.S[g] = (float*) S[g]; }
+    if (g_pend.n)
+    {
+        if (g_pend.n != n) { g_pend.n = 0; return -1; }
+        for (int g = 0; g < n; ++g) { sg.PY[g] = (const float*) g_pend.py[g]; sg.PAB[g] = (const float*) g_pend.pab[g]; sg.PN[g] = g_pend.pn[g]; }
+        g_pend.n = 0;
+    }
     return 0;
+}
+
+namespace qgdn {
+// Fused commit (QWEN_GDN_FUSED_COMMIT): copy the first nd[g] rows of segment g's recurrence inputs (y [.., C] from row r0,
+// ab [.., 96] at row stride ldab) to its pending buffers and set its pending row count. grid (rows, segments) x 256.
+struct PendPtrs { float* py[MAXSEG]; float* pab[MAXSEG]; int* pn[MAXSEG]; };
+__global__ void pend_copy_kernel(const float* __restrict__ y, const float* __restrict__ ab, int64_t ldab, const Segs sg,
+                                 const int* __restrict__ nd, const PendPtrs pp)
+{
+    float* const* py = pp.py; float* const* pab = pp.pab; int* const* pn = pp.pn;
+    const int t = blockIdx.x, g = blockIdx.y;
+    const int n = seg_rows(sg, nd, g);
+    if (t == 0 && threadIdx.x == 0) *pn[g] = n;
+    if (t >= n) return;
+    const int64_t r = pick(sg.r0, g) + t;
+    const float4* src = (const float4*) (y + r * C);
+    float4* dst = (float4*) (py[g] + (int64_t) t * C);
+    for (int c = threadIdx.x; c < C / 4; c += blockDim.x) dst[c] = src[c];
+    if (threadIdx.x < 2 * NV) pab[g][t * 2 * NV + threadIdx.x] = ab[r * ldab + threadIdx.x];
+}
 }
 
 extern "C" {
@@ -640,6 +718,35 @@ size_t qwen_gdn_ws_bytes(int R) { return (size_t) R * (16 * 2 * qgdn::D + qgdn::
 int qwen_gdn_recur_segs_z(const void* y, const void* ab, int64_t ldab, const void* z, int64_t ldz, const void* z_svh, const void* A_log,
                           const void* dt_bias, const void* norm_w, int nseg, const int* r0, const int* T, void* const* S, const int* nd,
                           void* out, int write_state, void* ws, cudaStream_t st);
+// qwen_gdn_recur_segs whose segments first apply their pending rows (py / pab [rows, C] / [rows, 96], count *pn[g]) to S
+// and write S back (QWEN_GDN_FUSED_COMMIT; T may be 0 for a flush).
+int qwen_gdn_recur_segs(const void* y, const void* ab, int64_t ldab, const void* z, int64_t ldz, const void* A_log,
+                        const void* dt_bias, const void* norm_w, int nseg, const int* r0, const int* T, void* const* S, const int* nd,
+                        void* out, int write_state, void* ws, cudaStream_t st);
+int qwen_gdn_recur_segs_p(const void* y, const void* ab, int64_t ldab, const void* z, int64_t ldz, const void* A_log,
+                          const void* dt_bias, const void* norm_w, int nseg, const int* r0, const int* T, void* const* S, const int* nd,
+                          void* out, int write_state, void* ws, const void* const* py, const void* const* pab, const int* const* pn, cudaStream_t st)
+{
+    if (nseg < 1 || nseg > qgdn::MAXSEG) return -1;
+    g_pend.n = nseg;
+    for (int g = 0; g < nseg; ++g) { g_pend.py[g] = py[g]; g_pend.pab[g] = pab[g]; g_pend.pn[g] = pn[g]; }
+    const int r = qwen_gdn_recur_segs(y, ab, ldab, z, ldz, A_log, dt_bias, norm_w, nseg, r0, T, S, nd, out, write_state, ws, st);
+    g_pend.n = 0;
+    return r;
+}
+// The fused commit's copy: rows [0, nd[g]) of segment g's y / ab to its pending buffers, *pn[g] = nd[g] (py, pab, pn: host
+// arrays of device pointers, one per segment; rows: the most rows a segment has).
+int qwen_gdn_pend_copy(const void* y, const void* ab, int64_t ldab, int nseg, const int* r0, const int* T, const int* nd,
+                       void* const* py, void* const* pab, int* const* pn, int rows, cudaStream_t st)
+{
+    qgdn::Segs sg;
+    void* dummy[qgdn::MAXSEG] = {};
+    if (segs(sg, nseg, r0, T, dummy)) return -1;
+    qgdn::PendPtrs pp{};
+    for (int g = 0; g < nseg; ++g) { pp.py[g] = (float*) py[g]; pp.pab[g] = (float*) pab[g]; pp.pn[g] = pn[g]; }
+    qgdn::pend_copy_kernel<<<dim3(rows, nseg), 256, 0, st>>>((const float*) y, (const float*) ab, ldab, sg, nd, pp);
+    return (int) cudaGetLastError();
+}
 int qwen_gdn_recur_segs(const void* y, const void* ab, int64_t ldab, const void* z, int64_t ldz, const void* A_log,
                         const void* dt_bias, const void* norm_w, int nseg, const int* r0, const int* T, void* const* S, const int* nd,
                         void* out, int write_state, void* ws, cudaStream_t st)

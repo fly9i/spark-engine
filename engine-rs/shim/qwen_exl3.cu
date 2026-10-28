@@ -1,19 +1,31 @@
 // extern "C" launchers for the EXL3 kernels (qwen_exl3.cuh)
 #include "qwen_exl3.cuh"
 
+template <int BITS, int TPW, int WARPS>
+static void gemv_mt_tw(const half* x, const uint32_t* t, float* p, int M, int K, int N, int kts, dim3 grid, cudaStream_t st)
+{
+    switch ((M + 15) / 16)
+    {
+        case 1: qexl3::gemv_kernel<BITS, TPW, 4, WARPS, 1><<<grid, WARPS * 32, 0, st>>>(x, t, p, M, K, N, kts); break;
+        case 2: qexl3::gemv_kernel<BITS, TPW, 4, WARPS, 2><<<grid, WARPS * 32, 0, st>>>(x, t, p, M, K, N, kts); break;
+        case 3: qexl3::gemv_kernel<BITS, TPW, 4, WARPS, 3><<<grid, WARPS * 32, 0, st>>>(x, t, p, M, K, N, kts); break;
+        default: qexl3::gemv_kernel<BITS, TPW, 4, WARPS, 4><<<grid, WARPS * 32, 0, st>>>(x, t, p, M, K, N, kts); break;
+    }
+}
+// grid (N / 128, S). Narrow (fewer than 128 blocks of 128 columns: N = 512 / 640, or K = 640): blocks of 2 warps with one
+// 16-column tile each, 4x the blocks (QWEN_EXL3_NARROW=0, read per call: always 128 columns). Each output's k-tile and
+// mma sequence is the same (bitwise equal); 2026-10-28 cold rotating microbench:
+// 2560 -> 640 12.2 -> 10.9 us, 2560 -> 512 9.6 -> 8.3 us, 640 -> 2560 10.7 -> 10.3 us at one row (more at 11..44 rows);
+// the wide shapes are at 207..227 GB/s with 128 columns per block and slower narrow.
 template <int BITS>
 static void gemv_mt(const void* xh, const void* trellis, void* part, int M, int K, int N, int kts, dim3 grid, cudaStream_t st)
 {
     const half* x = (const half*) xh;
     const uint32_t* t = (const uint32_t*) trellis;
     float* p = (float*) part;
-    switch ((M + 15) / 16)
-    {
-        case 1: qexl3::gemv_kernel<BITS, 2, 4, 4, 1><<<grid, 128, 0, st>>>(x, t, p, M, K, N, kts); break;
-        case 2: qexl3::gemv_kernel<BITS, 2, 4, 4, 2><<<grid, 128, 0, st>>>(x, t, p, M, K, N, kts); break;
-        case 3: qexl3::gemv_kernel<BITS, 2, 4, 4, 3><<<grid, 128, 0, st>>>(x, t, p, M, K, N, kts); break;
-        default: qexl3::gemv_kernel<BITS, 2, 4, 4, 4><<<grid, 128, 0, st>>>(x, t, p, M, K, N, kts); break;
-    }
+    const char* e = getenv("QWEN_EXL3_NARROW");
+    if (!(e && e[0] == '0') && grid.x * grid.y < 128) gemv_mt_tw<BITS, 1, 2>(x, t, p, M, K, N, kts, dim3(grid.x * 4, grid.y), st);
+    else gemv_mt_tw<BITS, 2, 4>(x, t, p, M, K, N, kts, grid, st);
 }
 
 template <int BITS>

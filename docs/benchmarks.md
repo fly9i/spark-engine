@@ -45,10 +45,14 @@ prefill). Aggregate decode throughput over all streams; per-stream speed in pare
 
 | Streams | Prose | Structured | TTFT (prose) |
 | --- | --- | --- | --- |
-| 1 | 64.1 tok/s | 149.8 tok/s | 153 ms |
-| 2 | 85.5 (44.1 each) | 192.9 (110.2 each) | 266 ms |
-| 3 | 105.0 (36.0 each) | 232.6 (85.5 each) | 378 ms |
-| 4 | 119.5 (31.7 each) | 217.4 (68.9 each) | 492 ms |
+| 1 | 65.4 tok/s | 152.3 tok/s | 141 ms |
+| 2 | 88.2 (45.4 each) | 196.6 (112.8 each) | 247 ms |
+| 3 | 107.9 (37.3 each) | 234.5 (85.2 each) | 358 ms |
+| 4 | 123.3 (32.8 each) | 227.9 (71.6 each) | 476 ms |
+
+Qwen decode re-measured on 2026-10-28 with v0.3.7 (2026-10-08 with v0.1.1: prose 64.1 / 85.5 / 105.0 / 119.5, structured
+149.8 / 192.9 / 232.6 / 217.4); the prefill rows below are from 2026-10-08. The v0.3.7 gains are larger on sampled
+requests (temperature 1), which this greedy benchmark does not exercise: see release notes.
 
 | Prompt | Prefill time | Prefill speed |
 | --- | --- | --- |

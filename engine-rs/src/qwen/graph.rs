@@ -124,14 +124,14 @@ impl Decoder {
 /// up to QWEN_SPEC_KMAX (default 10) drafts, and each sequence verifies its drafts up to the last one inside the product
 /// bound. QWEN_SPEC_CUMCONF=0: QWEN_SPEC_K (default 3) drafts every round.
 #[derive(Clone, Copy, Debug)]
-pub struct Policy { pub k: usize, pub kmax: usize, pub theta: Option<f64>, pub all: bool }
+pub struct Policy { pub k: usize, pub kmax: usize, pub theta: Option<f64>, pub all: bool, pub rate: Option<[f64; 3]> }
 impl Policy {
     pub fn from_env() -> Self {
         let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
         let k = num("QWEN_SPEC_K").unwrap_or(3.0) as usize;
         let theta = Some(num("QWEN_SPEC_CUMCONF").unwrap_or(0.7)).filter(|&t| t > 0.0);
         let kmax = num("QWEN_SPEC_KMAX").map_or(if theta.is_some() { 10 } else { k }, |v| v as usize).max(1);
-        Policy { k: k.max(1), kmax, theta, all: false }
+        Policy { k: k.max(1), kmax, theta, all: false, rate: None }
     }
     /// Most drafts a chain produces.
     pub fn cap(&self) -> usize { if self.theta.is_some() { self.kmax } else { self.k } }
@@ -168,7 +168,61 @@ impl Policy {
             p.all = std::env::var("QWEN_SPEC_BATCH_RULE").as_deref() != Ok("max");
         }
         if p.theta.is_some() { p.kmax = p.kmax.min((super::model::DEC_ROWS as usize / b).saturating_sub(1)).max(1); }
+        // QWEN_SPEC_RATE (several sequences; read per batch policy): the verify width that maximizes the expected tokens per
+        // round time, instead of the two-width `all` rule. Default "t": only in rounds with a sampled sequence (the caller
+        // clears `rate` in all-greedy rounds); 1: every round; 0: off. 2026-10-28 fixed-seed service ABBA (outputs 30/30
+        // identical): every round: c4 zh_prose T=1 +10.5%, story +4.9%, but the hash-map prose benchmark (T=0) C3 / C4 -2.0 / -2.7% (the
+        // calibration overrates those drafts; one-step lookahead on drafting did not fix it); sampled rounds only: c4
+        // zh_prose T=1 +11.9%, story +6.3%, qa -1.5%, T=0 rounds unchanged by construction.
+        // QWEN_SPEC_RATE=t: only in rounds with a sampled sequence (the caller clears `rate` in all-greedy rounds)
+        if b > 1 && p.theta.is_some() && std::env::var("QWEN_SPEC_RATE").as_deref() != Ok("0") {
+            let c: Vec<f64> = std::env::var("QWEN_SPEC_COST").unwrap_or_else(|_| "37.3,10.6,2.55,2.25,1.08,0.15".into())
+                .split(',').filter_map(|v| v.trim().parse().ok()).collect();
+            assert_eq!(c.len(), 6, "QWEN_SPEC_COST: six numbers");
+            let x = (b - 1) as f64;
+            p.rate = Some([c[0] + c[1] * x, c[2] + c[3] * x, c[4] + c[5] * x]);
+        }
         p
+    }
+    /// The rate rule's costs for an all-greedy round of b sequences (QWEN_SPEC_COST_GREEDY, same form as QWEN_SPEC_COST):
+    /// greedy rounds accept on the device (no host sync before the draft steps), so their fixed part is smaller.
+    /// 2026-10-28 fixed-width greedy rounds (qwen-batch, b = 2 / 3 / 4, widths 1..8): intercept 40.8 / 48.0 / 51.6 ms,
+    /// 6.75 / 8.75 / 10.74 ms per width (the sampled-round fit puts the intercept at 46.7 / 57.1 / 67.6). Used with
+    /// QWEN_SPEC_RATE=1 only: greedy qwen-batch A/B vs the `all` rule (with online calibration) mixed prompts c4 / c2
+    /// +2.4 / +2.6%, but the hash-map prose prompt x4 / x3 -2.2 / -1.0% (a floor of 2 / 3 drafts did not fix it), so greedy
+    /// rounds keep the `all` rule.
+    pub fn greedy_cost(&mut self, b: usize) {
+        if self.rate.is_none() { return; }
+        let c: Vec<f64> = std::env::var("QWEN_SPEC_COST_GREEDY").unwrap_or_else(|_| "37.1,5.55,3.68,1.85,1.08,0.15".into())
+            .split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        assert_eq!(c.len(), 6, "QWEN_SPEC_COST_GREEDY: six numbers");
+        let x = (b - 1) as f64;
+        self.rate = Some([c[0] + c[1] * x, c[2] + c[3] * x, c[4] + c[5] * x]);
+    }
+    /// QWEN_SPEC_RATE=t: the rate rule is for rounds with a sampled sequence only.
+    pub fn rate_sampled_only() -> bool { !matches!(std::env::var("QWEN_SPEC_RATE").as_deref(), Ok("1")) }
+    /// Verify widths the rate rule picks from (each width is a captured graph set of its own).
+    const RATE_WIDTHS: [usize; 8] = [1, 2, 3, 4, 5, 6, 8, 10];
+    /// Rate rule: over the widths w <= min(drafted, kmax) in RATE_WIDTHS, the one maximizing
+    /// (sequences + sum over sequences and drafts j <= w of prod_{i <= j} a(conf_i)) / (base + w * verify + (w - 1) * draft),
+    /// a = the measured acceptance of a draft by its confidence (CALIB). Offline on 840 rounds of 10 verified drafts
+    /// (7 prompts, every 2..4-prompt combination): +11 / +8 / +6% tok/s at 2 / 3 / 4 sequences over the `all` rule.
+    /// `accs`: the drafts' acceptance estimates (Cal::est of their confidences).
+    pub fn rate_width(&self, accs: &[&[f64]]) -> usize { self.rate_best(accs).0 }
+    /// (best width, its expected tokens per ms) of the rate rule.
+    fn rate_best(&self, confs: &[&[f64]]) -> (usize, f64) {
+        let [base, cv, cd] = self.rate.expect("rate policy");
+        let n = confs.iter().map(|c| c.len()).min().unwrap_or(1).min(self.kmax).max(1);
+        let mut p = vec![1.0; confs.len()];
+        let mut e = confs.len() as f64;
+        let (mut best, mut bw) = (-1.0, 1);
+        for w in 1..=n {
+            for (pi, c) in p.iter_mut().zip(confs) { *pi *= c[w - 1]; e += *pi; }
+            if !Self::RATE_WIDTHS.contains(&w) { continue; }
+            let v = e / (base + cv * w as f64 + cd * (w - 1) as f64);
+            if v > best { best = v; bw = w; }
+        }
+        (bw, best)
     }
     /// The first chain of a sequence (eager, right after its prefill): at most k drafts.
     pub fn first(&self) -> Policy { Policy { kmax: self.kmax.min(self.k), ..*self } }
@@ -180,9 +234,27 @@ impl Policy {
         d.max(1)
     }
     /// Draft one more step: below the cap and (fixed k, or some sequence still inside the bound on all its drafts;
-    /// `all`: at least k, then every sequence inside the bound).
+    /// `all`: at least k, then every sequence inside the bound). With the rate rule `confs` are acceptance estimates
+    /// (Cal::est), otherwise the confidences.
     pub fn more(&self, confs: &[Vec<f64>]) -> bool {
         let n = confs[0].len();
+        if self.rate.is_some() {
+            // rate rule: draft one more step only when verifying it too would beat the best width so far, its acceptance
+            // guessed as the last draft's (one-step lookahead; a deeper chain that is then cut short costs its draft
+            // steps: 2026-10-28 the plain "best width is the deepest" rule drafted ~2 steps too many at 4 sequences)
+            if n >= self.cap() { return false; }
+            let cs: Vec<&[f64]> = confs.iter().map(|c| c.as_slice()).collect();
+            let (_, now) = self.rate_best(&cs);
+            let [base, cv, cd] = self.rate.unwrap();
+            let mut e = confs.len() as f64;
+            for c in confs {
+                let mut p = 1.0;
+                for &x in c { p *= x; e += p; }
+                e += p * *c.last().unwrap_or(&0.0);
+            }
+            let w = (n + 1) as f64;
+            return e / (base + cv * w + cd * (w - 1.0)) > now;
+        }
         let inside = |c: &Vec<f64>| c.iter().product::<f64>() >= self.theta.unwrap_or(0.0);
         n < self.cap() && (self.theta.is_none() || if self.all { n < self.k || confs.iter().all(inside) } else { confs.iter().any(inside) })
     }
@@ -193,6 +265,76 @@ impl Policy {
             let m = *lens.iter().min().unwrap();
             if self.kmax > self.k && 2 * m >= self.k + self.kmax { self.kmax } else { self.k.min(self.kmax) }
         } else { *lens.iter().max().unwrap() }
+    }
+}
+
+/// A draft's acceptance by its confidence, from the CALIB table (whatever QWEN_SPEC_CALIB says): the rate rule's estimate.
+fn calib(c: f64) -> f64 {
+    static T: std::sync::OnceLock<Vec<(f64, f64)>> = std::sync::OnceLock::new();
+    let t = T.get_or_init(|| CALIB.split(',').map(|kv| { let (a, b) = kv.split_once(':').unwrap(); (a.parse().unwrap(), b.parse().unwrap()) }).collect());
+    if c <= t[0].0 { return t[0].1 * c / t[0].0; }
+    for w in t.windows(2) { if c <= w[1].0 { return w[0].1 + (w[1].1 - w[0].1) * (c - w[0].0) / (w[1].0 - w[0].0); } }
+    t[t.len() - 1].1
+}
+
+/// Online acceptance calibration for the rate rule (QWEN_SPEC_ONLINE, read once; "0": off, the static CALIB table).
+/// Per confidence bucket (between CALIB knots) decayed counts of verified drafts whose earlier drafts were accepted and of
+/// the accepted ones, kept per sequence and process-wide per kind (greedy / sampled requests); a sequence's estimate is
+/// its counts blended with the process-wide estimate, which is blended with CALIB:
+/// est = (a + W p) / (n + W), W = QWEN_SPEC_ONLINE_W (sequence, process; default 8,32), each new count decaying the
+/// bucket's older ones by QWEN_SPEC_ONLINE_DECAY (default 0.98). Only the verify width changes (outputs unchanged).
+/// 2026-10-28 fixed-seed service ABBA (T=1, outputs 20/20 identical per request), online vs CALIB: c4 zh_prose +3.2%,
+/// story +0.3%, qa -0.4%; c2 +1.6 / +4.4 / -0.6%. With the rate rule on greedy rounds too (QWEN_SPEC_RATE=1) the
+/// hash-map prose benchmark C4 still lost 4% (122.8 -> 117.7 tok/s): see greedy_cost.
+const NB: usize = 12;
+#[derive(Clone, Copy)]
+pub struct Cal { sampled: bool, n: [f32; NB], a: [f32; NB] }
+struct CalCfg { on: bool, ws: f32, wg: f32, decay: f32 }
+fn cal_cfg() -> &'static CalCfg {
+    static C: std::sync::OnceLock<CalCfg> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let w: Vec<f32> = std::env::var("QWEN_SPEC_ONLINE_W").unwrap_or_else(|_| "8,32".into()).split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        CalCfg { on: std::env::var("QWEN_SPEC_ONLINE").as_deref() != Ok("0"), ws: w.first().copied().unwrap_or(8.0),
+                 wg: w.get(1).copied().unwrap_or(32.0),
+                 decay: std::env::var("QWEN_SPEC_ONLINE_DECAY").ok().and_then(|v| v.parse().ok()).unwrap_or(0.98) }
+    })
+}
+static CAL_ALL: std::sync::Mutex<[Cal; 2]> = std::sync::Mutex::new([Cal::empty(false), Cal::empty(true)]);
+fn bucket(c: f64) -> usize {
+    static K: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    let k = K.get_or_init(|| CALIB.split(',').map(|kv| kv.split_once(':').unwrap().0.parse().unwrap()).collect());
+    k.iter().position(|&x| c <= x).unwrap_or(NB - 1)
+}
+impl Cal {
+    const fn empty(sampled: bool) -> Cal { Cal { sampled, n: [0.0; NB], a: [0.0; NB] } }
+    pub fn new(sampled: bool) -> Cal { Cal::empty(sampled) }
+    fn add(&mut self, b: usize, x: bool, decay: f32) {
+        self.n[b] = self.n[b] * decay + 1.0;
+        self.a[b] = self.a[b] * decay + if x { 1.0 } else { 0.0 };
+    }
+    /// Acceptance estimate of a draft of confidence c.
+    pub fn est(&self, c: f64) -> f64 {
+        let cfg = cal_cfg();
+        let p = calib(c);
+        if !cfg.on { return p; }
+        let b = bucket(c);
+        let g = CAL_ALL.lock().unwrap()[self.sampled as usize];
+        let pg = (g.a[b] as f64 + cfg.wg as f64 * p) / (g.n[b] as f64 + cfg.wg as f64);
+        (self.a[b] as f64 + cfg.ws as f64 * pg) / (self.n[b] as f64 + cfg.ws as f64)
+    }
+    pub fn ests(&self, confs: &[f64]) -> Vec<f64> { confs.iter().map(|&c| self.est(c)).collect() }
+    /// A verify of `verified` drafts of confidences `confs` accepted `acc`: drafts 0..=acc (within the verified ones)
+    /// were judged with every earlier draft accepted.
+    pub fn observe(&mut self, confs: &[f64], verified: usize, acc: usize) {
+        let cfg = cal_cfg();
+        if !cfg.on { return; }
+        let mut g = CAL_ALL.lock().unwrap();
+        let g = &mut g[self.sampled as usize];
+        for (j, &c) in confs.iter().enumerate().take(verified.min(acc + 1)) {
+            let b = bucket(c);
+            self.add(b, j < acc, cfg.decay);
+            g.add(b, j < acc, cfg.decay);
+        }
     }
 }
 
@@ -249,15 +391,26 @@ impl Lay { fn take(&mut self, bytes: usize) -> usize { let o = self.0; self.0 +=
 /// verify, accept, commit and catch-up back to back and synchronizes once (plus once per further draft step).
 pub struct BatchG { nseg: i64, parts: Vec<Option<Part>>, step: Option<StepG> }
 struct Part { r1: i64, io: Mapped, o: PartOff, g: graph::Owned, logits: Tensor, x: Tensor, accept: graph::Owned,
-              commit: graph::Owned, catch: Option<graph::Owned>, nd_dev: Tensor, nd_map: Tensor, _keep: (Pending, Vec<Tensor>) }
+              commit: graph::Owned, catch: Option<graph::Owned>, catch_cpl: Option<graph::Owned>, nd_dev: Tensor, nd_map: Tensor, _keep: (Pending, Vec<Tensor>) }
 /// Offsets in Part::io: inputs ids [b*r1] i64, pos [b] i32, kk [b] i32, packed rings; accept outputs / host-path inputs
 /// nd [b] i32, cids [b*r1] i64, sel [b] i64; output greedy [b*r1] i64.
 struct PartOff { ids: usize, pos: usize, kk: usize, packed: usize, nd: usize, cids: usize, sel: usize, greedy: usize }
 /// Draft step: hidden [b, 4, 2560] and tokens [b] in, (token, confidence) appended to out[cnt] (mapped: spos, out).
-struct StepG { g: graph::Owned, io: Mapped, kc: usize, hid: Tensor, d: Tensor, spos: Tensor, out: Tensor, cnt: Tensor }
+/// With coupled drafting (`coupled_on` at capture) also the draft temperatures [b] f32 and keys [kc, b] u64 (mapped, after
+/// out), written by `set_draft_keys`, and a second step graph picking coupled tokens (`Cpl::g`; the catch-up likewise,
+/// `Part::catch_cpl`), replayed in rounds with a sampled sequence: greedy rounds replay the plain graphs, unchanged.
+/// QWEN_DRAFT_TOP2=1 (measurement, read at capture): also each draft's second-best token, alt[cnt] (mapped, `alts`).
+struct StepG { g: graph::Owned, io: Mapped, kc: usize, hid: Tensor, d: Tensor, spos: Tensor, out: Tensor, cnt: Tensor, cpl: Option<Cpl>,
+               alt: Option<(Mapped, Tensor)> }
+struct Cpl { o_temps: usize, o_keys: usize, temps: Tensor, keys: Tensor, g: Option<graph::Owned>, on: std::cell::Cell<bool> }
 
-fn pick_pair(m: &Model, lg: &Tensor) -> (Tensor, Tensor) {
-    let (d, c) = m.draft_pick(lg);
+/// QWEN_DRAFT_COUPLED (default on; 0: off; read when the graphs are captured): the draft steps of rounds with a sampled
+/// sequence pick coupled tokens (serve.rs `coupled_draft_temp`).
+pub fn coupled_on() -> bool { std::env::var("QWEN_DRAFT_COUPLED").as_deref() != Ok("0") }
+
+/// Draft tokens and the (token, confidence) pairs of MTP logits; coupled with `cpl` (key row *cnt, or 0 without cnt).
+fn pick_pair(m: &Model, lg: &Tensor, cpl: Option<(&Cpl, Option<&Tensor>)>) -> (Tensor, Tensor) {
+    let (d, c) = match cpl { Some((k, cnt)) => m.draft_pick_coupled_dev(lg, &k.temps, &k.keys, cnt), None => m.draft_pick(lg) };
     let pair = Tensor::stack(&[d.to_kind(Kind::Double), c.to_kind(Kind::Double)], 1);
     (d, pair)
 }
@@ -290,23 +443,34 @@ impl BatchG {
         let step = m.mtp.is_some().then(|| {
             let mut l = Lay(0);
             let (o_spos, o_out) = (l.take(4 * b as usize), l.take(16 * kc * b as usize));
+            let ocpl = coupled_on().then(|| (l.take(4 * b as usize), l.take(8 * kc * b as usize)));
             let io = Mapped::new(l.0);
+            let mut cpl = ocpl.map(|(o_temps, o_keys)| Cpl { o_temps, o_keys, temps: io.tensor(o_temps, &[b], Kind::Float),
+                                                              keys: io.tensor(o_keys, &[kc as i64, b], Kind::Int64), g: None, on: Default::default() });
             let spos = io.tensor(o_spos, &[b], Kind::Int);
             let out = io.tensor(o_out, &[kc as i64, b, 2], Kind::Double);
             let hid = Tensor::zeros([b, H, D], (Kind::Float, dev()));
             let d = Tensor::zeros([b], (Kind::Int64, dev()));
             let cnt = Tensor::zeros([1], (Kind::Int64, dev()));
             let ones: Vec<(i64, i64)> = (0..b).map(|g| (g, 1)).collect();
-            let (g, ()) = capture_shared(|| {
+            let alt = (std::env::var("QWEN_DRAFT_TOP2").as_deref() == Ok("1")).then(|| {
+                let io = Mapped::new(8 * kc * b as usize);
+                let t = io.tensor(0, &[kc as i64, b], Kind::Int64);
+                (io, t)
+            });
+            let step = |k: Option<&Cpl>| capture_shared(|| {
                 let (lg, xs) = m.mtp_batch_dev(seqs, &hid, &d, &spos, &ones, Pick::All);
-                let (d2, pair) = pick_pair(m, &lg);
+                let (d2, pair) = pick_pair(m, &lg, k.map(|k| (k, Some(&cnt))));
+                if let Some((_, a)) = &alt { let _ = a.shallow_clone().index_copy_(0, &cnt, &m.draft_second(&lg).unsqueeze(0)); }
                 let _ = out.shallow_clone().index_copy_(0, &cnt, &pair.unsqueeze(0));
                 put(&d, &d2);
                 put(&hid, &xs);
                 let _ = spos.shallow_clone().g_add_scalar_(1);
                 let _ = cnt.shallow_clone().g_add_scalar_(1);
-            });
-            StepG { g, io, kc, hid, d, spos, out, cnt }
+            }).0;
+            let g = step(None);
+            if let Some(k) = cpl.as_mut() { let gc = step(Some(&*k)); k.g = Some(gc); }
+            StepG { g, io, kc, hid, d, spos, out, cnt, cpl, alt }
         });
         let mut bg = BatchG { nseg: b, parts: (0..=kc + 1).map(|_| None).collect(), step };
         bg.ensure(m, seqs, kc as i64 + 1);
@@ -339,7 +503,13 @@ impl BatchG {
         let sel = io.tensor(o.sel, &[b], Kind::Int64);
         let greedy = io.tensor(o.greedy, &[b * r1], Kind::Int64);
         let rows: Vec<(i64, i64)> = (0..b).map(|g| (g * r1, r1)).collect();
-        let (g, (logits, x, pend)) = capture_shared(|| m.run_batch_dev(seqs, &ids, &pos, packed.as_ref(), &rows, false, false));
+        // QWEN_GDN_FUSED_COMMIT: the verify applies the last commit's pending rows first (their buffers exist before capture)
+        let fused = super::model::fused_commit_on();
+        if fused { for q in seqs { q.gpend(); } }
+        let (g, (logits, x, pend)) = capture_shared(|| {
+            let run = || m.run_batch_dev(seqs, &ids, &pos, packed.as_ref(), &rows, false, false);
+            if fused { super::model::with_fused_commit(run) } else { run() }
+        });
         // greedy accept on the device (the host repeats the same rule on the copied-out tokens)
         let spos = self.step.as_ref().map(|s| s.spos.shallow_clone());
         let (accept, ()) = capture_shared(|| {
@@ -359,10 +529,11 @@ impl BatchG {
         });
         // own pool: the commit replays on the side stream, concurrently with graphs of the shared pool
         let (commit, ()) = capture(|| m.commit_segs(seqs, &pend, &rows, Some(&nd)));
-        let catch = self.step.as_ref().map(|st| {
+        let catch_g = |coupled: bool| self.step.as_ref().map(|st| {
             let (g, ()) = capture_shared(|| {
                 let (lg, xc) = m.mtp_batch_dev(seqs, &x, &cids, &pos, &rows, Pick::Rows(&sel));
-                let (d, pair) = pick_pair(m, &lg);
+                let (d, pair) = pick_pair(m, &lg, st.cpl.as_ref().filter(|_| coupled).map(|k| (k, None)));
+                if let Some((_, a)) = &st.alt { let _ = a.get(0).shallow_clone().copy_(&m.draft_second(&lg)); }
                 let _ = st.out.get(0).shallow_clone().copy_(&pair);
                 put(&st.d, &d);
                 put(&st.hid, &xc.index_select(0, &sel));
@@ -370,8 +541,10 @@ impl BatchG {
             });
             g
         });
+        let catch = catch_g(false);
+        let catch_cpl = if self.coupled() { catch_g(true) } else { None };
         let keep = vec![ids, pos, kk, cids, sel, greedy].into_iter().chain(packed).collect();
-        self.parts[r1 as usize] = Some(Part { r1, io, o, g, logits, x, accept, commit, catch, nd_dev: nd, nd_map, _keep: (pend, keep) });
+        self.parts[r1 as usize] = Some(Part { r1, io, o, g, logits, x, accept, commit, catch, catch_cpl, nd_dev: nd, nd_map, _keep: (pend, keep) });
     }
 
     fn part(&self, r1: usize) -> &Part { self.parts[r1].as_ref().expect("verify width not captured") }
@@ -427,7 +600,8 @@ impl BatchG {
         p.io.put(p.o.nd, &n.iter().map(|&v| v as i32).collect::<Vec<_>>());
         put(&p.nd_dev, &p.nd_map);
         side(|| p.commit.replay());
-        if let (Some(c), Some(st)) = (&p.catch, &self.step) {
+        let catch = if self.cpl_on() { p.catch_cpl.as_ref() } else { p.catch.as_ref() };
+        if let (Some(c), Some(st)) = (catch, &self.step) {
             let flat: Vec<i64> = ids.iter().flat_map(|r| { assert_eq!(r.len(), r1); r.iter().copied() }).collect();
             p.io.put(p.o.cids, &flat);
             p.io.put(p.o.sel, &(0..b).map(|g| (g * r1 + n[g] - 1) as i64).collect::<Vec<_>>());
@@ -436,10 +610,41 @@ impl BatchG {
         }
     }
 
+    /// Coupled drafting: per sequence the draft temperature (0: plain argmax) and keys of drafts 0..kc
+    /// (keys[g][j] for the draft at index j). No-op unless captured with `coupled_on`. Before the catch-up replay.
+    pub fn set_draft_keys(&self, temps: &[f32], keys: &[Vec<u64>]) {
+        let Some(st) = &self.step else { return };
+        let Some(k) = &st.cpl else { return };
+        let b = self.nseg as usize;
+        assert_eq!(temps.len(), b);
+        k.on.set(temps.iter().any(|&t| t > 0.0));
+        st.io.put(k.o_temps, temps);
+        let flat: Vec<u64> = (0..st.kc).flat_map(|j| keys.iter().map(move |r| r.get(j).copied().unwrap_or(0))).collect();
+        st.io.put(k.o_keys, &flat);
+    }
+    /// QWEN_DRAFT_TOP2: per sequence the second-best tokens of its first n drafts (after `drafts`; None when not captured).
+    pub fn alts(&self, n: usize) -> Option<Vec<Vec<i64>>> {
+        let st = self.step.as_ref()?;
+        let (io, _) = st.alt.as_ref()?;
+        let b = self.nseg as usize;
+        let v: Vec<i64> = io.get(0, st.kc * b);
+        Some((0..b).map(|g| (0..n.min(st.kc)).map(|j| v[j * b + g]).collect()).collect())
+    }
+    /// Whether the draft steps were captured coupled.
+    pub fn coupled(&self) -> bool { self.step.as_ref().is_some_and(|s| s.cpl.is_some()) }
+    /// Whether this round replays the coupled graphs (the last `set_draft_keys` had a positive temperature).
+    fn cpl_on(&self) -> bool { self.step.as_ref().and_then(|s| s.cpl.as_ref()).is_some_and(|k| k.on.get()) }
+    /// The draft step graph of this round.
+    fn step_g(&self) -> &graph::Owned {
+        let st = self.step.as_ref().expect("no MTP head");
+        match (&st.cpl, self.cpl_on()) { (Some(Cpl { g: Some(g), .. }), true) => g, _ => &st.g }
+    }
+
     /// After the catch-up: draft steps while the policy asks for more; returns per sequence (drafts, confidences).
     /// look[g]: a prompt-lookup proposal (tokens, per-token confidence) for sequence g; when it starts with the first MTP
     /// draft it replaces that sequence's chain (which then needs no further steps). Returns which sequences use theirs.
-    pub fn drafts(&self, pol: &Policy, look: &[Option<(Vec<i64>, f64)>]) -> (Drafts, Vec<bool>) {
+    /// `cals`: the sequences' acceptance calibrations (the rate rule's draft-step decisions).
+    pub fn drafts(&self, pol: &Policy, look: &[Option<(Vec<i64>, f64)>], cals: &[Cal]) -> (Drafts, Vec<bool>) {
         let st = self.step.as_ref().expect("no MTP head");
         let b = self.nseg as usize;
         let out_off = (4 * b + 15) / 16 * 16;   // StepG layout: spos, then out
@@ -457,7 +662,7 @@ impl BatchG {
         };
         let agree = |res: &Drafts| -> Vec<bool> { (0..b).map(|g| matches!(look.get(g), Some(Some((v, _))) if v.first() == res[g].0.first())).collect() };
         if pol.theta.is_none() {   // fixed length: all steps, one synchronization
-            for _ in 1..pol.cap() { st.g.replay(); }
+            for _ in 1..pol.cap() { self.step_g().replay(); }
             sync();
             for j in 0..pol.cap() { push(read(j), &mut res); }
             used = agree(&res);
@@ -469,9 +674,10 @@ impl BatchG {
         used = agree(&res);
         let mut j = 1;
         loop {
-            let open: Vec<Vec<f64>> = (0..b).filter(|&g| !used[g]).map(|g| res[g].1.clone()).collect();
+            let open: Vec<Vec<f64>> = (0..b).filter(|&g| !used[g])
+                .map(|g| if pol.rate.is_some() { cals[g].ests(&res[g].1) } else { res[g].1.clone() }).collect();
             if open.is_empty() || !pol.more(&open) { break; }
-            st.g.replay();
+            self.step_g().replay();
             sync();
             push(read(j), &mut res);
             j += 1;

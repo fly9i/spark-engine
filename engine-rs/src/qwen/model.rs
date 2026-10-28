@@ -781,7 +781,10 @@ fn block_attn_in(l: &Layer, sts: &[&LayerState], x: &Tensor, rows: &[(i64, i64)]
             ffi::gdn_conv_segs(&qkv, &cs, &g.conv, &y);
             join_side(side);
             drop(a_in);
-            ffi::gdn_recur_segs(&y, &ab, &z, &g.a_log, &g.dt_bias, &g.norm, &ss, None, Some(&out), commit);
+            match GPTRS.with(|g| g.borrow_mut().take()) {
+                Some(pp) => ffi::gdn_recur_segs_p(&y, &ab, &z, &g.a_log, &g.dt_bias, &g.norm, &ss, None, Some(&out), commit, &pp),
+                None => ffi::gdn_recur_segs(&y, &ab, &z, &g.a_log, &g.dt_bias, &g.norm, &ss, None, Some(&out), commit),
+            }
             if commit { ffi::gdn_conv_commit_segs(&qkv, &cs, None); } else { pending = Some((qkv, y, ab, z)); }
             let o = g.o.fwd(&out);
             if let Some(i) = l.idx { crate::ablate::apply(i, &o); }
@@ -1081,6 +1084,41 @@ pub struct Seq {
     pub cap: i64,
     pub pending: Option<Pending>,
     pub mtp: Option<LayerState>,
+    /// fused commit (QWEN_GDN_FUSED_COMMIT): accepted rows not yet applied to the GDN states (`GPend`)
+    pub gp: std::cell::OnceCell<GPend>,
+}
+/// QWEN_GDN_FUSED_COMMIT (default on, 0 off; read when the batch graphs are captured): a batched round's commit no longer replays the
+/// accepted rows through the GDN recurrence (a read and a write of each 3.1 MB layer state); it copies their recurrence
+/// inputs (y [C], ab [96] per row and layer) here, and the next verify's recurrence applies them to the state first, with
+/// the commit's arithmetic, writes it back and goes on (one state read saved per layer and round; bitwise equal).
+/// Paths outside the batch graphs (retirement, eager rounds, resets) flush or discard them. 2026-10-28 fixed-seed service
+/// ABBA (outputs 30/30 identical): c4 prose / zh_prose / story / qa / structured +4.9 / +3.9 / +3.5 / +1.3 / +1.8%, c1 ~+0.3%.
+pub struct GPend { y: Tensor, ab: Tensor, pn: Tensor }
+/// Most rows a fused commit holds per sequence (a verify chain: at most kmax + 1 = 11).
+pub const GP_ROWS: i64 = 16;
+pub fn fused_commit_on() -> bool { std::env::var("QWEN_GDN_FUSED_COMMIT").as_deref() != Ok("0") }
+thread_local! {
+    /// set around a batch verify capture that should use the fused commit (graph.rs)
+    static FUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// the per-sequence pending pointers (y, ab, count) of the GDN layer being built, for gdn_recur_segs
+    static GPTRS: std::cell::RefCell<Option<Vec<[usize; 3]>>> = const { std::cell::RefCell::new(None) };
+}
+/// Run `f` (a verify capture) with the fused commit.
+pub fn with_fused_commit<T>(f: impl FnOnce() -> T) -> T { FUSE.with(|c| c.set(true)); let r = f(); FUSE.with(|c| c.set(false)); r }
+impl Seq {
+    /// The fused-commit buffers (allocated on first use: call before a graph capture).
+    pub fn gpend(&self) -> &GPend {
+        self.gp.get_or_init(|| {
+            let l = self.layers.len() as i64;
+            GPend { y: Tensor::zeros([l, GP_ROWS, 10240], (Kind::Float, Device::Cuda(0))), ab: Tensor::zeros([l, GP_ROWS, 96], (Kind::Float, Device::Cuda(0))),
+                    pn: Tensor::zeros([1], (Kind::Int, Device::Cuda(0))) }
+        })
+    }
+    /// (y, ab, count) device pointers of layer li's pending rows.
+    fn gptr(&self, li: usize) -> [usize; 3] {
+        let g = self.gpend();
+        [g.y.get(li as i64).data_ptr() as usize, g.ab.get(li as i64).data_ptr() as usize, g.pn.data_ptr() as usize]
+    }
 }
 /// A prompt checkpoint (`Model::ckpt_save`): the prompt ids and copies of the state that is not per position.
 pub struct Ckpt { pub ids: Vec<i64>, t: Vec<Tensor> }
@@ -1092,7 +1130,7 @@ impl Ckpt {
     pub fn from_parts(ids: Vec<i64>, t: Vec<Tensor>) -> Self { Ckpt { ids, t } }
 }
 /// Inputs of the last uncommitted chain, replayed by `commit`.
-pub struct Pending { gdn: Vec<Option<(Tensor, Tensor, Tensor, Tensor)>>, ple_nrm: Option<Tensor>, ids: Vec<i64> }
+pub struct Pending { gdn: Vec<Option<(Tensor, Tensor, Tensor, Tensor)>>, ple_nrm: Option<Tensor>, ids: Vec<i64>, fused: bool }
 
 impl Model {
     pub fn load(dir: &Path) -> Self {
@@ -1104,6 +1142,13 @@ impl Model {
         let types: Vec<String> = c["layer_types"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().into()).collect();
         let ple_ids: Vec<i64> = c["ple_layer_ids"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect();
         let eos = c["eos_token_id"].as_i64().unwrap();
+        let mtp_on = std::env::var("QWEN_MTP").map_or(true, |v| v != "0") && ck.has("mtp.fc_hidden.trellis");
+        // the preloads below, in their order
+        let mut ahead: Vec<String> = (0..n).map(|i| format!("{P}layers.{i}.")).collect();
+        ahead.extend([format!("{P}embed_tokens."), format!("{P}hyper_connection_mixer."), "lm_head.".into()]);
+        if mtp_on { ahead.push("mtp.".into()); }
+        if vis { ahead.push("model.visual.".into()); }
+        ck.read_ahead(&ahead);
         let mut layers = Vec::new();
         for i in 0..n {
             let key = format!("{P}layers.{i}");
@@ -1116,18 +1161,28 @@ impl Model {
             ck.clear_cache();
             if i % 8 == 7 { eprintln!("[qwen] loaded {} layers", i + 1); }
         }
+        ck.preload(&format!("{P}embed_tokens."));
         let embed = ck.get(&format!("{P}embed_tokens.weight"));
         let embed = match crate::ablate::get() { Some(a) => a.ortho_rows(0, &embed), None => embed };
         let vocab = embed.size()[0];
+        ck.preload(&format!("{P}hyper_connection_mixer."));
         let mixer = Hc::load(&ck, &format!("{P}hyper_connection_mixer"), false);
+        ck.preload("lm_head.");
         let lm_head = Exl3::load(&ck, "lm_head");
-        let mtp = (std::env::var("QWEN_MTP").map_or(true, |v| v != "0") && ck.has("mtp.fc_hidden.trellis")).then(|| {
+        ck.clear_cache();
+        let mtp = mtp_on.then(|| {
             ck.preload("mtp.");
             let m = Mtp::load(&ck);
             ck.clear_cache();
             m
         });
-        let vision = vis.then(|| super::vision::Vision::load(&ck, &ck.cfg));
+        let vision = vis.then(|| {
+            ck.preload("model.visual.");
+            let v = super::vision::Vision::load(&ck, &ck.cfg);
+            ck.clear_cache();
+            v
+        });
+        ck.finish_ahead();
         // QWEN_KEEP_SHARD_CACHE=1: leave the loaded shards in the page cache
         if std::env::var("QWEN_KEEP_SHARD_CACHE").as_deref() != Ok("1") { ck.release_shards(&["ngram_embedding.safetensors"]); }
         std::mem::forget(ck);   // keep the mmaps (n-gram table rows are read from it)
@@ -1165,7 +1220,7 @@ impl Model {
                                                conv: Tensor::zeros([10240, 3], (Kind::Float, Device::Cuda(0))) },
             Attn::Qsa(_) => pool_view(p.as_ref().unwrap(), base, len, &mtab, &mctl),
         }).collect();
-        Seq { layers, ple_win: Tensor::zeros([9, H * D], (Kind::Float, Device::Cuda(0))), ids: vec![], pos: 0, cap: len - 16, pending: None,
+        Seq { layers, ple_win: Tensor::zeros([9, H * D], (Kind::Float, Device::Cuda(0))), ids: vec![], pos: 0, cap: len - 16, pending: None, gp: Default::default(),
               mtp: pool.mtp.as_ref().map(|p| pool_view(p, base, len, &mtab, &mctl)), mtab, mctl }
     }
 
@@ -1219,6 +1274,7 @@ impl Model {
 
     /// Return `seq` to the checkpoint (position ckpt.ids.len()); returns the MTP head's pending row there.
     pub fn ckpt_restore(&self, seq: &mut Seq, c: &Ckpt) -> Tensor {
+        Self::gdn_discard(seq);
         let mut it = c.t.iter();
         for st in seq.layers.iter_mut().chain(seq.mtp.iter_mut()) {
             match st {
@@ -1242,7 +1298,7 @@ impl Model {
             Attn::Qsa(_) => qsa_state(cap, &mtab, &mctl),
         }).collect();
         let mtp = self.mtp.as_ref().map(|_| { let mut st = qsa_state(cap + 16, &mtab, &mctl); if let LayerState::Qsa { yarn, .. } = &mut st { *yarn = yarn_for(cap); } st });
-        Seq { layers, ple_win: Tensor::zeros([9, H * D], (Kind::Float, Device::Cuda(0))), ids: vec![], pos: 0, cap, pending: None, mtp, mtab, mctl }
+        Seq { layers, ple_win: Tensor::zeros([9, H * D], (Kind::Float, Device::Cuda(0))), ids: vec![], pos: 0, cap, pending: None, mtp, mtab, mctl, gp: Default::default() }
     }
 
     /// The sequence's mRoPE positions: `pos` [n][3] for its first n tokens (a prompt with images / videos) and the delta of
@@ -1259,7 +1315,23 @@ impl Model {
 
     /// Reuse a sequence for a new prompt: zero the recurrent state (attention caches are position-addressed
     /// and every read is preceded by a write at the new positions).
+    /// Apply a fused commit's pending rows to the GDN states (and clear them): before anything else uses the states.
+    pub fn gdn_flush(&self, seq: &Seq) {
+        let Some(gp) = seq.gp.get() else { return };
+        for (li, l) in self.layers.iter().enumerate() {
+            if let (Attn::Gdn(g), LayerState::Gdn { s, .. }) = (&l.attn, &seq.layers[li]) {
+                let y = gp.y.get(li as i64);
+                ffi::gdn_recur_segs_p(&y, &gp.ab.get(li as i64), &y, &g.a_log, &g.dt_bias, &g.norm, &ffi::Segs::new(&[(0, 0)], &[s]), None, None,
+                                      false, &[seq.gptr(li)]);
+            }
+        }
+        let _ = gp.pn.shallow_clone().zero_();
+    }
+    /// Drop a fused commit's pending rows (the states are being replaced).
+    fn gdn_discard(seq: &Seq) { if let Some(gp) = seq.gp.get() { let _ = gp.pn.shallow_clone().zero_(); } }
+
     pub fn reset(&self, seq: &mut Seq) {
+        Self::gdn_discard(seq);
         for st in seq.layers.iter_mut() {
             if let LayerState::Gdn { s, conv } = st { let _ = s.zero_(); let _ = conv.zero_(); }
         }
@@ -1461,7 +1533,8 @@ impl Model {
                          last_only: bool) -> (Tensor, Tensor, Pending) {
         let r = idt.size()[0];
         let x = f32(&self.embed.index_select(0, idt)).unsqueeze(1).repeat([1, H, 1]).contiguous();
-        let mut pend = Pending { gdn: vec![], ple_nrm: None, ids: vec![] };
+        let mut pend = Pending { gdn: vec![], ple_nrm: None, ids: vec![], fused: false };
+        pend.fused = !commit && FUSE.with(|c| c.get());
         // each layer's MoE update is added inside the next layer's attn HC norm (QWEN_DEC_APPLY_SPLIT=1, read per call:
         // added right away; bitwise equal)
         let split = std::env::var("QWEN_DEC_APPLY_SPLIT").as_deref() == Ok("1");
@@ -1477,7 +1550,10 @@ impl Model {
             }
             let sts: Vec<&LayerState> = seqs.iter().map(|s| &s.layers[li]).collect();
             let prev = upd.take();
+            if pend.fused && matches!(l.attn, Attn::Gdn(_)) { GPTRS.with(|g| *g.borrow_mut() = Some(seqs.iter().map(|s| s.gptr(li)).collect())); }
             let (p, u) = block_pend(l, &sts, &x, rows, pos, commit, prev.as_ref().map(|(a, b)| (a, b)));
+            // the recurrence must have applied the pending rows (the commit will only copy this round's)
+            assert!(GPTRS.with(|g| g.borrow_mut().take()).is_none(), "fused commit: layer {li}'s recurrence did not take the pending rows");
             pend.gdn.push(p);
             upd = u;
             if split { flush_apply(&x, upd.take()); }
@@ -1532,6 +1608,45 @@ impl Model {
         (tok, conf)
     }
 
+    /// Coupled draft token of one MTP logits row (int64 [1]): the argmax of the logits plus the verify's Gumbel noise
+    /// (`key`, full-vocabulary columns, scaled by `temp`) at the draft vocabulary's columns.
+    pub fn draft_pick_coupled(&self, lg: &Tensor, temp: f32, key: u64) -> Tensor {
+        extern "C" { fn rs_gumbel_noise(out: *mut f32, stride: i64, rows: i32, cols: i32, col_offset: i64, temps: *const f32, keys: *const u64) -> i32; }
+        let l = lg.to_kind(Kind::Float).contiguous().view([1, -1]);
+        let v = self.vocab;   // the noise of a column depends on (key, column) only, not on the row width
+        let noise = Tensor::empty([1, v], (Kind::Float, l.device()));
+        assert_eq!(unsafe { rs_gumbel_noise(noise.data_ptr().cast(), v, 1, v as i32, 0, [temp].as_ptr(), [key].as_ptr()) }, 0, "gumbel noise");
+        match self.head() {
+            Some(h) => h.keep_d.index_select(0, &(l + noise.index_select(1, &h.keep_d)).argmax(-1, false)),
+            None => (l + noise).argmax(-1, false),
+        }
+    }
+
+    /// `draft_pick` with coupled tokens on the device (graph-capturable): temps [b] f32 and keys [kc, b] u64 in device
+    /// memory, the row of keys is *cnt (or 0); confidences as in `draft_pick`.
+    pub fn draft_pick_coupled_dev(&self, lg: &Tensor, temps: &Tensor, keys: &Tensor, cnt: Option<&Tensor>) -> (Tensor, Tensor) {
+        extern "C" { fn spark_coupled_pick_cuda(lg: *const f32, stride: i64, width: i32, keep: *const i64, temps: *const f32, keys: *const u64,
+                                                cnt: *const i64, rows: i32, plain: *const i64, tok: *mut i64, st: *mut std::ffi::c_void) -> i32;
+                     fn rs_current_stream() -> *mut std::ffi::c_void; }
+        let (plain, conf) = self.draft_pick(lg);
+        let plain = plain.contiguous();
+        let l = lg.to_kind(Kind::Float).contiguous();
+        let (b, w) = (l.size()[0], l.size()[1]);
+        let tok = Tensor::empty([b], (Kind::Int64, l.device()));
+        let keep = self.head().map_or(std::ptr::null(), |h| h.keep_d.data_ptr() as *const i64);
+        let cnt = cnt.map_or(std::ptr::null(), |c| c.data_ptr() as *const i64);
+        assert_eq!(unsafe { spark_coupled_pick_cuda(l.data_ptr().cast(), l.stride()[0], w as i32, keep, temps.data_ptr().cast(), keys.data_ptr().cast(),
+                                                   cnt, b as i32, plain.data_ptr().cast(), tok.data_ptr().cast(), rs_current_stream()) }, 0, "coupled pick");
+        (tok, conf)
+    }
+
+    /// Second-best draft token of each MTP logits row (int64 [rows], on the device; the QWEN_DRAFT_TOP2 measurement).
+    pub fn draft_second(&self, lg: &Tensor) -> Tensor {
+        let (_, idx) = lg.topk(2, -1, true, true);
+        let col = idx.select(1, 1).contiguous();
+        match self.head() { Some(h) => h.keep_d.index_select(0, &col), None => col }
+    }
+
     /// Accept the first n rows of the pending chain: replay them into the GDN states / conv windows.
     pub fn commit(&self, seq: &mut Seq, n: i64) {
         self.commit_dev(seq, n);
@@ -1559,7 +1674,13 @@ impl Model {
             if let (Attn::Gdn(g), Some((qkv, y, ab, z))) = (&l.attn, p) {
                 let (ss, cs): (Vec<&Tensor>, Vec<&Tensor>) = seqs.iter().map(|q| match &q.layers[li] {
                     LayerState::Gdn { s, conv } => (s, conv), _ => unreachable!() }).unzip();
-                ffi::gdn_recur_segs(y, ab, z, &g.a_log, &g.dt_bias, &g.norm, &ffi::Segs::new(rows, &ss), nd, None, true);
+                if pend.fused {
+                    let pp: Vec<[usize; 3]> = seqs.iter().map(|q| q.gptr(li)).collect();
+                    assert!(rows.iter().all(|r| r.1 <= GP_ROWS), "fused commit: chain longer than GP_ROWS");
+                    ffi::gdn_pend_copy(y, ab, &ffi::Segs::new(rows, &ss), nd, &pp, rows.iter().map(|r| r.1).max().unwrap());
+                } else {
+                    ffi::gdn_recur_segs(y, ab, z, &g.a_log, &g.dt_bias, &g.norm, &ffi::Segs::new(rows, &ss), nd, None, true);
+                }
                 ffi::gdn_conv_commit_segs(qkv, &ffi::Segs::new(rows, &cs), nd);
             }
         }

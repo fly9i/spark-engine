@@ -73,6 +73,7 @@ mod spx_dhess;
 mod spx;
 mod nibmap;
 mod safetensors;
+mod readahead;
 mod tp;
 mod weights;
 mod vision;

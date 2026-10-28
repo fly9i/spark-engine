@@ -219,27 +219,9 @@ struct Prefetch {
     waited: std::time::Duration, t0: std::time::Instant,
 }
 extern "C" { fn ds41_copy_bytes(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, n: i64, st: *mut std::ffi::c_void) -> i32; }
-/// Anonymous memory on transparent huge pages (the read-ahead buffers: the GPU reads it in place, GB10's pageable
-/// memory access at ~95 GB/s; pinning 2.8 GB with cudaHostAlloc took 1.5 s and freeing it 0.7 s, faulting it in by 4 KiB
-/// pages ~0.7 s, by 2 MiB pages ~0.04 s).
-struct PageBuf { p: *mut u8, n: usize }
-unsafe impl Send for PageBuf {}
-extern "C" {
-    fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
-    fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
-    fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
-}
-impl PageBuf {
-    fn new(n: usize) -> PageBuf {
-        const PROT_RW: i32 = 3; const MAP_PRIVATE_ANON: i32 = 0x22; const MADV_HUGEPAGE: i32 = 14;
-        let p = unsafe { mmap(std::ptr::null_mut(), n, PROT_RW, MAP_PRIVATE_ANON, -1, 0) };
-        assert!(!p.is_null() && p as isize != -1, "mmap {n} B");
-        unsafe { madvise(p, n, MADV_HUGEPAGE); }
-        PageBuf { p: p as *mut u8, n }
-    }
-    fn as_mut(&mut self) -> &mut [u8] { unsafe { std::slice::from_raw_parts_mut(self.p, self.n) } }
-}
-impl Drop for PageBuf { fn drop(&mut self) { unsafe { munmap(self.p.cast(), self.n); } } }
+/// The read-ahead buffers: anonymous memory on transparent huge pages the GPU reads in place (shared with the other
+/// loaders, src/readahead.rs; this reader keeps whole files, the loader takes a file's tensors in no particular order).
+use crate::readahead::PageBuf;
 impl Prefetch {
     fn start(files: &[PathBuf], dev: Device) -> Prefetch {
         let lens: Vec<usize> = files.iter().map(|p| std::fs::metadata(p).map_or(0, |m| m.len() as usize)).collect();

@@ -818,3 +818,45 @@ extern "C" int glm53_dsa_key_ln_cuda(const float* y,int ldy,int dim,int gcols,co
     if(rows<1||dim<1||gcols<0)return int(cudaErrorInvalidValue);
     dsa_key_ln<<<(rows+7)/8,256,0,s>>>(y,ldy,dim,gcols,w,b,k,g,rows);return int(cudaGetLastError());
 }
+
+// Scatter copy of n byte segments (seg[4*i..]: source offset, destination offset, bytes, first 16-byte destination
+// chunk of the segment in a running count; seg[4*n+3] = total chunks) from src to dst, one launch for all. The checkpoint
+// loaders copy a layer's tensors out of host read-ahead buffers (GB10: the GPU reads host memory in place) to their
+// 256-aligned places in one device allocation. Destination offsets are 16-aligned; sources are at any byte offset
+// (safetensors tensors are 2-byte aligned at best), so each thread loads the two aligned 16-byte words around its
+// source and funnel-shifts them. The source buffer must be readable 16 bytes past each segment's end.
+__global__ void spark_copy_segments_kernel(char* __restrict__ dst, const char* __restrict__ src, const long long* __restrict__ seg, int n) {
+  const long long total = seg[4 * n + 3];
+  for (long long c = blockIdx.x * (long long)blockDim.x + threadIdx.x; c < total; c += (long long)gridDim.x * blockDim.x) {
+    int lo = 0, hi = n - 1;
+    while (lo < hi) { const int mid = (lo + hi + 1) >> 1; if (seg[4 * mid + 3] <= c) lo = mid; else hi = mid - 1; }
+    const long long k = c - seg[4 * lo + 3], len = seg[4 * lo + 2], off = k * 16;
+    const char* s = src + seg[4 * lo] + off;
+    char* d = dst + seg[4 * lo + 1] + off;
+    if (off + 16 <= len) {
+      const uintptr_t a = (uintptr_t)s & ~(uintptr_t)15;
+      const unsigned sh = (unsigned)((uintptr_t)s - a);
+      const uint4 w0 = *reinterpret_cast<const uint4*>(a);
+      uint4 o;
+      if (sh == 0) o = w0;
+      else {
+        const uint4 w1 = *reinterpret_cast<const uint4*>(a + 16);
+        const unsigned w[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+        const unsigned q = sh >> 2, b = (sh & 3) * 8;
+        unsigned r[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) r[j] = __funnelshift_r(w[q + j], w[q + j + 1], b);
+        o = make_uint4(r[0], r[1], r[2], r[3]);
+      }
+      *reinterpret_cast<uint4*>(d) = o;
+    } else {
+      for (long long j = off; j < len; ++j) d[j - off] = s[j - off];
+    }
+  }
+}
+extern "C" int spark_copy_segments(void* dst, const void* src, const long long* seg, int n, long long chunks, cudaStream_t st) {
+  if (n <= 0 || chunks <= 0) return 0;
+  const long long b = (chunks + 255) / 256;
+  spark_copy_segments_kernel<<<(int)(b < 8192 ? b : 8192), 256, 0, st>>>((char*)dst, (const char*)src, seg, n);
+  return (int)cudaGetLastError();
+}

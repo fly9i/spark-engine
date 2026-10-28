@@ -176,6 +176,30 @@ pub fn gdn_conv_commit_segs(x: &Tensor, sg: &Segs, nd: Option<&Tensor>) {
        "gdn_conv_commit_segs");
 }
 #[allow(clippy::too_many_arguments)]
+/// gdn_recur_segs whose segments first apply their fused-commit pending rows (pp[g] = (y, ab, count) device pointers).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recur_segs_p(y: &Tensor, ab: &Tensor, z: &Tensor, a_log: &Tensor, dt_bias: &Tensor, norm: &Tensor, sg: &Segs,
+                        nd: Option<&Tensor>, out: Option<&Tensor>, write: bool, pp: &[[usize; 3]]) {
+    extern "C" { fn qwen_gdn_recur_segs_p(y: *const c_void, ab: *const c_void, ldab: i64, z: *const c_void, ldz: i64, a_log: *const c_void,
+                                          dt_bias: *const c_void, norm_w: *const c_void, nseg: i32, r0: *const i32, t: *const i32,
+                                          s: *const *mut c_void, nd: *const c_void, out: *mut c_void, write: i32, ws: *mut c_void,
+                                          py: *const usize, pab: *const usize, pn: *const usize, st: St) -> i32; }
+    assert_eq!(pp.len() as i32, sg.n());
+    let (py, pab, pn): (Vec<usize>, Vec<usize>, Vec<usize>) = (pp.iter().map(|p| p[0]).collect(), pp.iter().map(|p| p[1]).collect(), pp.iter().map(|p| p[2]).collect());
+    let rows = sg.r0.iter().zip(&sg.t).map(|(a, b)| a + b).max().unwrap_or(0);
+    let ws = Tensor::empty([unsafe { qwen_gdn_ws_bytes(rows) } as i64], (tch::Kind::Uint8, y.device()));
+    ok(unsafe { qwen_gdn_recur_segs_p(p(y), p(ab), ab.stride()[0], p(z), z.stride()[0], p(a_log), p(dt_bias), p(norm), sg.n(),
+                                      sg.r0.as_ptr(), sg.t.as_ptr(), sg.s.as_ptr(), opt(nd), opt(out), write as i32, p(&ws),
+                                      py.as_ptr(), pab.as_ptr(), pn.as_ptr(), st()) }, "gdn_recur_segs_p");
+}
+/// The fused commit's copy of the first nd[g] rows of y / ab to each sequence's pending buffers (pp[g]) and their count.
+pub fn gdn_pend_copy(y: &Tensor, ab: &Tensor, sg: &Segs, nd: Option<&Tensor>, pp: &[[usize; 3]], rows: i64) {
+    extern "C" { fn qwen_gdn_pend_copy(y: *const c_void, ab: *const c_void, ldab: i64, nseg: i32, r0: *const i32, t: *const i32, nd: *const c_void,
+                                       py: *const usize, pab: *const usize, pn: *const usize, rows: i32, st: St) -> i32; }
+    let (py, pab, pn): (Vec<usize>, Vec<usize>, Vec<usize>) = (pp.iter().map(|p| p[0]).collect(), pp.iter().map(|p| p[1]).collect(), pp.iter().map(|p| p[2]).collect());
+    ok(unsafe { qwen_gdn_pend_copy(p(y), p(ab), ab.stride()[0], sg.n(), sg.r0.as_ptr(), sg.t.as_ptr(), opt(nd), py.as_ptr(), pab.as_ptr(), pn.as_ptr(),
+                                   rows as i32, st()) }, "gdn_pend_copy");
+}
 pub fn gdn_recur_segs(y: &Tensor, ab: &Tensor, z: &Tensor, a_log: &Tensor, dt_bias: &Tensor, norm: &Tensor, sg: &Segs,
                       nd: Option<&Tensor>, out: Option<&Tensor>, write: bool) {
     let rows = sg.r0.iter().zip(&sg.t).map(|(a, b)| a + b).max().unwrap_or(0);

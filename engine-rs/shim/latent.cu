@@ -1090,3 +1090,33 @@ extern "C" int glm53_latent_attention_fp8_tc_cuda(const float* q,const void* lat
     if(splits>1)merge_latent_nz<<<heads*queries,128,0,stream>>>(scratch,out,heads,queries,splits);
     return int(cudaGetLastError());
 }
+
+// Coupled draft pick for graph-replayed draft steps (Qwen QWEN_DRAFT_COUPLED=1): per row g the argmax over the draft
+// columns c of lg[g, c] + T_g * G(key, id_c), id_c = keep[c] (or c), key = keys[j * rows + g] with j = *cnt (or 0):
+// the noise the verify adds for the token this draft guesses. Temperature and keys are read from device memory (written
+// by the host before the replay). The FP32 noise estimate is enough: a draft only changes which tokens are verified,
+// never the sampled output, so near-ties need not be resolved like the verify does. T_g <= 0: `plain` (the argmax).
+__global__ void coupled_pick(const float* __restrict__ lg,long long stride,int width,const long long* __restrict__ keep,
+                             const float* __restrict__ temps,const unsigned long long* __restrict__ keys,const long long* __restrict__ cnt,
+                             int rows,const long long* __restrict__ plain,long long* __restrict__ tok){
+  const int g=blockIdx.x;const float t=temps[g];
+  if(!(t>0.f)){if(threadIdx.x==0)tok[g]=plain[g];return;}   // greedy rows: the plain argmax already computed
+  const unsigned long long key=keys[(cnt?*cnt:0)*rows+g];
+  float bv=-CUDART_INF_F;int bi=0x7fffffff;
+  for(int c=threadIdx.x;c<width;c+=blockDim.x){
+    const float v=lg[g*stride+c]+gumbel_estimate(key,keep?keep[c]:c,t);
+    if(gumbel_better(v,c,bv,bi)){bv=v;bi=c;}
+  }
+  __shared__ float sv[1024];__shared__ int si[1024];
+  sv[threadIdx.x]=bv;si[threadIdx.x]=bi;__syncthreads();
+  for(int s=blockDim.x/2;s>0;s>>=1){
+    if(threadIdx.x<s&&gumbel_better(sv[threadIdx.x+s],si[threadIdx.x+s],sv[threadIdx.x],si[threadIdx.x])){sv[threadIdx.x]=sv[threadIdx.x+s];si[threadIdx.x]=si[threadIdx.x+s];}
+    __syncthreads();
+  }
+  if(threadIdx.x==0)tok[g]=keep?keep[si[0]]:si[0];
+}
+extern "C" int spark_coupled_pick_cuda(const float* lg,long long stride,int width,const long long* keep,const float* temps,
+                                       const unsigned long long* keys,const long long* cnt,int rows,const long long* plain,long long* tok,cudaStream_t s){
+  if(rows<=0)return 0;
+  coupled_pick<<<rows,1024,0,s>>>(lg,stride,width,keep,temps,keys,cnt,rows,plain,tok);return int(cudaGetLastError());
+}

@@ -34,12 +34,22 @@ Qwen 路径没有 profile 文件：所有默认值都编译在代码里，并且
 | `QWEN_PREFILL_MACRO` | `16384` | 每次层优先 prefill 处理的 token 数（这一段的激活全部常驻）；也是服务时每轮在 decode 之间为一个序列 prefill 的 prompt token 数。 | L1（改变分块边界） |
 | `QWEN_YARN` | 自动 | 每个序列的 RoPE 模式：序列容量超过原生 262144 时用 YaRN（factor 4），否则用普通 RoPE。`1` / `0` 强制总是 / 从不。静态 YaRN 对短文本有一定质量损失。 | 强制时改变输出 |
 | `QWEN_MTP` | 开（`=0` 关） | 加载 MTP 头（推测解码草稿）。`0`：没有草稿，也没有服务端 CUDA 图。 | L2 |
+| `QWEN_LOAD_AHEAD` | 开（`=0` 关） | 加载：一个线程按使用顺序以 O_DIRECT 把每层在分片里的字节区段预读进大页主机缓冲，一个 kernel 把一层约 6200 个张量拷到 GPU 上原来的位置（布局不变）。冷启动到可服务约 55 s → 约 20 s。`0`：旧的 mmap + 逐张量拷贝。 | — |
+| `QWEN_LOAD_CHECK` | 关（`=1`） | 把预读路径加载的每个张量与旧路径逐一比较（调试用，慢）。 | — |
 | `QWEN_SPEC_CUMCONF` | `0.7` | 草稿长度策略 θ：只要有序列的草稿置信度乘积仍 ≥ θ 就继续出草稿；每个序列验证到界内最后一个草稿为止。`0`：每轮固定 `QWEN_SPEC_K` 个草稿。 | L2 |
 | `QWEN_SPEC_KMAX` | `10`（θ = 0 时为 `QWEN_SPEC_K`） | 每条草稿链最多的草稿数（批量时还受总共 64 个 verify 行的限制）。 | L2 |
 | `QWEN_SPEC_K` | `3` | θ = 0 时每轮的固定草稿数；批量 `all` 规则的最小深度；序列第一条草稿链的上限。 | L2 |
 | `QWEN_SPEC_CUMCONF_BATCH` | 未设置（沿用单序列 θ） | 2 个及以上序列成批时的 θ：(0, 1) 内的数为单独的 θ，`0` 为固定 k。 | L2 |
 | `QWEN_SPEC_BATCH_RULE` | `all` | 批量深度规则。`all`：至少 k，所有序列都在界内才加深。`max`：按最有把握的序列加深（实测 prose 慢 6–25%）。 | L2 |
 | `QWEN_SPEC_CALIB` | 未设置（恒等） | 把草稿头置信度映射为接受率的分段线性表，`"c:p,c:p,..."`（c 递增）；`fit` 为内置拟合表。实测没有稳定收益。 | L2 |
+| `QWEN_SPEC_RATE` | `t` | 批量（2 个以上序列）的验证宽度按速率选：取"期望 token 数（序列数 + 接受率估计之和）/ 估计的每轮时间"最大的宽度，代替 `all` 规则的两档宽度；起草按一步前瞻决定是否继续。`t`：只在有采样序列（T > 0）的轮次用；`1`：所有轮次（greedy 散文上更慢，见下）；`0`：关。实测 4 路 T = 1：中文散文 +11.9%、故事 +6.3%。 | L2 |
+| `QWEN_SPEC_COST` | `37.3,10.6,2.55,2.25,1.08,0.15` | 速率规则对 b 个序列的每轮时间模型（ms）：基础 `a + b·(b−1)`、每个验证草稿 `c + d·(b−1)`、每步起草 `e + f·(b−1)`。在有采样序列的轮次上拟合。 | L2 |
+| `QWEN_SPEC_COST_GREEDY` | `37.1,5.55,3.68,1.85,1.08,0.15` | 全 greedy 轮次的同一模型（只在 `QWEN_SPEC_RATE=1` 时用）：greedy 轮在设备上接受，固定部分更小。即使用它，速率规则在一个 greedy 散文基准的 3–4 路上仍比 `all` 慢 1–2%（混合提示 +2.5%），所以 greedy 轮维持 `all` 规则。 | L2 |
+| `QWEN_SPEC_ONLINE` | 开（`=0` 关） | 速率规则的接受率在线学习：按置信度分桶，每序列和进程级（greedy / 采样分开）各记衰减的验证 / 接受计数，以内置表为先验混合。`0`：只用内置表。实测 T = 1：4 路 −0.4…+3.2%，2 路 −0.6…+4.4%。 | L2 |
+| `QWEN_SPEC_ONLINE_W` | `8,32` | 每序列估计与进程级估计的先验权重（按观测数计）。 | L2 |
+| `QWEN_SPEC_ONLINE_DECAY` | `0.98` | 桶内每来一个新观测，旧计数乘以该系数。 | L2 |
+| `QWEN_DRAFT_COUPLED` | 开（`=0` 关） | 采样请求（T > 0）的草稿取其 logits 加上验证在同一位置所加的 Gumbel 噪声（按 `QWEN_DRAFT_TEMP` × T 缩放）后的 argmax，使草稿猜中验证将采到的 token。验证与采样不变（同种子输出相同）。实测 T = 1：1 路 +0.9–5.6%，4 路 +0.6–4.7%。 | L2 |
+| `QWEN_DRAFT_TEMP` | `1.0` | 耦合草稿的温度系数（0.7 接受更少）。 | L2 |
 | `QWEN_DRAFT_VOCAB` | `65536` | 草稿头子词表：数字 N 加载 `$QWEN_ASSETS/draft_vocab_N.json`，其他值视为文件路径；`0` 或文件不存在时不建草稿头（草稿改用完整 `lm_head`）。 | L2 |
 | `QWEN_DRAFT_Q4` | 开（`=0` 为 Q8） | 草稿头用仿射 4-bit（`0`：int8 + 每 128 一个 FP32 缩放）。Q4 实测单序列 tok/s +3–7%，接受率不变。 | L2 |
 | `QWEN_LOOKUP` | 开（`=0` 关） | prompt lookup 草稿：取最后 n 个 token 在上下文（prompt 和输出）中最近一次出现后的续写；它的第一个 token 与 MTP 头的第一个草稿相同时使用，并替代该序列 MTP 链的其余部分。 | L2 |
@@ -62,6 +72,7 @@ Qwen 路径没有 profile 文件：所有默认值都编译在代码里，并且
 | `QWEN_PREFILL_CM` | 关（`=1`） | 旧的块优先 prefill（每块跑一次完整前向），代替层优先。 | L0 |
 | `QWEN_EXL3_FOLD` | 关（`=1`） | 多行 EXL3 线性层改用折叠后的 fp16 有效权重 + cuBLASLt GEMM，不再变换激活。复测精度不劣化，但在融合后的 prefill 路径下更慢。 | L1 |
 | `QWEN_EXL3_SLICES_TUNED` | 开（`=0` 关） | 按形状调过的 EXL3 GEMV K 切分（K = 6144 用 10 片，N ≥ 6144 用 6 片）；`0`：通用规则。每轮快 1–2%。 | L1 |
+| `QWEN_EXL3_NARROW` | 开（`=0` 关） | decode 的 EXL3 GEMV 不足 128 个 128 列块时（N = 512 / 640 或 K = 640），每块 2 个 warp × 1 个 16 列 tile（块数 ×4）；每个输出的 k-tile 与 MMA 顺序不变。小形状单核快 5–20%（冷权重）；大形状已在 207–227 GB/s，仍为每块 128 列。 | L0 |
 | `QWEN_EXL3_FUSED` | 关（`=1`） | 最多 8 个 decode 行一次启动（输入变换 + GEMV + finish）。每轮慢约 5%。 | L0 |
 | `QWEN_EXL3_FIN_F32` | 关（`=1`） | 多行 EXL3 的 finish 先把 GEMM 输出转成 fp32（旧路径），不直接读 fp16 输出。 | L0 |
 | `QWEN_EXL3_MULTI` | 开（`=0` 关） | 同一输入的 decode 线性层：一次输入变换（融合 HC mix）、一次 GEMV 启动；`0`：逐个线性层。 | L0 |
@@ -85,6 +96,7 @@ Qwen 路径没有 profile 文件：所有默认值都编译在代码里，并且
 | `QWEN_F16_V1` | 关（`=1`） | 在使用标量 F16 GEMV 的地方用 v1 kernel 代替 v2（两者逐位相同）。 | 相对 v2 为 L0 |
 | `QWEN_F16_NJ` | 自动（4、2 或 1） | v2 F16 GEMV 每个 warp 处理的权重行数；默认取仍能得到 ≥ 192 个 block 的最大值。 | L0 |
 | `QWEN_F16_FUSED` | 关（`=1`） | F16 GEMV 的切片求和放在最后到达的 block 里（标量 v1 kernel，不用 tensor core）。没有更快。 | 相对默认为 L1 |
+| `QWEN_GDN_FUSED_COMMIT` | 开（`=0` 关） | decode：接受行的 GDN 更新不再单独 commit，其输入按序列暂存，下一轮验证的递推 kernel 先应用它们（请求结束时冲刷，重置 / 检查点恢复时丢弃）。运算与顺序相同。实测 4 路 +1.3–4.9%。 | L0 |
 | `QWEN_GDN_V1` | 关（`=1`） | GDN prefill 递推：旧的按头 kernel，不用行并行 kernel。 | L0 |
 | `QWEN_GDN_RECUR_V1` | 关（`=1`） | GDN decode 递推：旧 kernel，不用经共享内存暂存的版本（后者在多序列 × 长链时会自动退回旧 kernel）。 | L0 |
 | `QWEN_GDN_ROWS1` | 关（`=1`） | GDN prefill 递推：每个状态行一个 lane，而不是四个。 | L1 |
