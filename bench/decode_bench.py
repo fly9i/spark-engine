@@ -8,8 +8,8 @@ Per stream: decode tok/s = (completion_tokens - 1) / (t_last - t_first); aggrega
 Each concurrency level runs `repeats` times and the median is reported.
 
 Usage: decode_bench.py [prose|structured] [repeats] [max_tokens] [--temperature T] [--thinking] [--streams 1,2,3,4]
-  --temperature / --thinking: sampled runs (e.g. --temperature 0.7 --thinking); concurrent streams then get the prompt
-  after a "Request ID: decode-<i>" line instead of a "(stream i/n)" suffix (C1 is the exact prompt either way).
+  --temperature / --thinking: sampled runs (e.g. --temperature 1 --thinking). Concurrent streams get the prompt after a
+  "Request ID: decode-<i>" line (C1 is the exact prompt).
 Env:   SPARK_URL (default http://127.0.0.1:8888), SPARK_MODEL_NAME (default: the server's first model)
 """
 import argparse, json, os, statistics, sys, threading, time, urllib.request
@@ -57,12 +57,9 @@ def stream(model, prompt, max_tokens):
 
 
 def wave(model, base, n, max_tokens):
-    if n == 1:
-        prompts = [base]
-    elif TEMP > 0 or THINK:
-        prompts = [f"Request ID: decode-{i + 1}\n{base}" for i in range(n)]
-    else:
-        prompts = [f"{base} (stream {i + 1}/{n})" for i in range(n)]
+    # concurrent streams: a "Request ID" line before the prompt (distinct prefixes; a "(stream i/n)" suffix was read by
+    # some models as a share of the task, e.g. counting only 51..100)
+    prompts = [base] if n == 1 else [f"Request ID: decode-{i + 1}\n{base}" for i in range(n)]
     res = [None] * n
     def go(i): res[i] = stream(model, prompts[i], max_tokens)
     ts = [threading.Thread(target=go, args=(i,)) for i in range(n)]

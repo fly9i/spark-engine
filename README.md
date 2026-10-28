@@ -21,25 +21,31 @@ One binary runs every model; `start.sh glm|glm3|ds41|qwen` picks one.
 
 ## At a glance
 
-GLM: measured on 2026-10-08 (v0.1.1 binary; not re-measured since); Qwen: decode and startup on 2026-10-28 (v0.3.7), prefill
-on 2026-10-08; default settings, greedy, thinking off.
-DeepSeek: decode measured on 2026-10-28 (v0.3.6), prefill on 2026-10-26 (prefill code unchanged since), with the 1017
-checkpoint as served by the current code (greedy, thinking off, the optional conditional clamp on). Method and more numbers: [docs/benchmarks.md](docs/benchmarks.md),
-[docs/ds41.md](docs/ds41.md#7-performance).
+**How decode is measured** (DeepSeek and Qwen, 2026-10-29, v0.3.7; the method commonly used for DGX Spark):
+`bench/decode_bench.py` against the running server, two prompts — *prose* (a step-by-step explanation of how a hash map
+works) and *structured* (count from 1 to 200) — 400 output tokens per request, 1 to 4 concurrent requests (each
+concurrent request has a `Request ID: decode-<i>` line before the prompt), median of 5 runs. Every row says its
+sampling: **greedy, thinking off** (temperature 0) or **T 1, thinking on** (temperature 1, reasoning tokens counted).
+Aggregate = all decode tokens / the window from the first token of the earliest request to the last token of the
+latest. GLM's rows are older (2026-10-08, v0.1.1, greedy, thinking off, a `(stream i/n)` suffix instead of the
+`Request ID` line). Prefill, TTFT and startup: DeepSeek prefill 2026-10-26, Qwen prefill 2026-10-08, startup 2026-10-28.
+More: [docs/benchmarks.md](docs/benchmarks.md), [docs/ds41.md](docs/ds41.md#7-performance).
 
 | | **GLM-5.3-Flash** | **DeepSeek-V4.1-Flash** | **Qwen3.8-Flash-Next** |
 | --- | --- | --- | --- |
 | Hardware | 2× DGX Spark (TP2, RoCE); 3× also supported | 3× DGX Spark (TP3, RoCE mesh) | 1× DGX Spark |
 | Architecture | 45 layers: KDA linear-attn + MLA/DSA sparse-attn, 288-expert MoE | 40 layers (20 encoder + 20 decoder): compressed sparse attention with a hierarchical indexer, 384-expert top-6 MoE, Engram n-gram tables, mHC | 48 layers: gated-DeltaNet + QSA sparse-attn, 512-expert top-10 MoE, per-layer n-gram |
-| **Decode — prose** (1/2/3/4 streams) | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 66.4 / 95.0 / — / 117.7 tok/s | 65.4 / 88.2 / 107.9 / 123.3 tok/s |
-| **Decode — structured** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 120.1 / 167.8 / — / 208.8 tok/s | 152.3 / 196.6 / 234.5 / 227.9 tok/s |
+| **Decode — prose, greedy, thinking off** (1/2/3/4 streams) | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 63.9 / 86.6 / 103.9 / 116.3 tok/s | 65.0 / 93.0 / 115.7 / 133.3 tok/s |
+| **Decode — structured, greedy, thinking off** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 120.5 / 168.5 / 182.6 / 213.3 tok/s | 151.4 / 224.1 / 268.7 / 287.9 tok/s |
+| **Decode — prose, T 1, thinking on** (1/2/3/4 streams) | not measured | 55.4 / 77.0 / 90.0 / 97.3 tok/s | 48.5 / 70.6 / 85.2 / 96.8 tok/s |
+| **Decode — structured, T 1, thinking on** (1/2/3/4 streams) | not measured | 100.7 / 142.8 / 150.7 / 166.9 tok/s | 116.5 / 97.2 / 100.6 / 119.0 tok/s |
 | **Prefill** | ~1,560 tok/s (10K–55K prompts) | ~5,400 tok/s (8K–64K prompts, new text; 4K ~4,600) | ~1,900 tok/s (13K–77K prompts) |
 | **TTFT** (short prompt) | ~370 ms | ~200 ms; 185 ms for a 7K prompt restored from the NVMe prefix cache | ~140 ms |
 | **Startup** (load → serving) | ~33 s | ~16 s (cold start, shards read from NVMe) | ~19 s (cold start) |
 | Speculative decoding | DFlash2 drafter, tree/chain verify | DSpark (the checkpoint's draft stages), drafts per sequence from a cost model | native MTP + prompt-lookup |
 
-"Prose" = a long explanation (lower draft acceptance); "structured" = counting 1–200 (high acceptance). Aggregate is the
-sum over streams; decode speed depends on the text because of speculation.
+"Prose" = a long explanation (lower draft acceptance); "structured" = counting 1–200 (high acceptance). Decode speed depends on the text
+because of speculation.
 
 ### Quantization & runtime precision
 

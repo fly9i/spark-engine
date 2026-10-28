@@ -18,22 +18,26 @@ RDMA all-reduce、FP8 KV、NVMe 前缀缓存、服务前端。只链接 PyTorch 
 
 ## 概览
 
-GLM：2026-10-08 实测（v0.1.1 二进制；之后未重测）；Qwen：decode 与启动 2026-10-28（v0.3.7）、prefill 2026-10-08 实测；默认配置、贪心、关思考。DeepSeek：decode 2026-10-28（v0.3.6）、prefill 2026-10-26（之后 prefill 代码未变）实测，用当前代码
-服务的 1017 检查点（贪心、关思考、开启可选的条件钳制）。方法与更多数据见 [docs/benchmarks.zh-CN.md](docs/benchmarks.zh-CN.md)、
-[docs/ds41.zh-CN.md](docs/ds41.zh-CN.md#7-性能)。
+**解码测速方法**（DeepSeek 与 Qwen，2026-10-29，v0.3.7；与 DGX Spark 社区常用的方法一致）：用 `bench/decode_bench.py` 测运行中的服务，两种提示——
+*prose*（逐步讲解哈希表原理）与 *structured*（从 1 数到 200）——每个请求输出 400 token，1~4 路并发（多路时每路提示前加一行 `Request ID: decode-<i>`），
+每档 5 次取中位数。每行注明采样方式：**贪心、关思考**（温度 0）或 **T 1、开思考**（温度 1，思考 token 计入）。聚合 = 全部解码 token ÷ 从最早一路首 token
+到最晚一路末 token 的时间窗。GLM 的数据较旧（2026-10-08，v0.1.1，贪心、关思考，多路用句尾 `(stream i/n)` 而不是 `Request ID` 行）。预填、TTFT 与启动：
+DeepSeek 预填 2026-10-26，Qwen 预填 2026-10-08，启动 2026-10-28。更多见 [docs/benchmarks.zh-CN.md](docs/benchmarks.zh-CN.md)、[docs/ds41.zh-CN.md](docs/ds41.zh-CN.md#7-性能)。
 
 | | **GLM-5.3-Flash** | **DeepSeek-V4.1-Flash** | **Qwen3.8-Flash-Next** |
 | --- | --- | --- | --- |
 | 硬件 | 2× DGX Spark（TP2，RoCE）；也支持 3× | 3× DGX Spark（TP3，RoCE 全互连） | 1× DGX Spark |
 | 架构 | 45 层：KDA 线性注意力 + MLA/DSA 稀疏注意力，288 专家 MoE | 40 层（20 编码器 + 20 解码器）：带分层 indexer 的压缩稀疏注意力，384 专家 top-6 MoE，Engram n-gram 表，mHC | 48 层：门控 DeltaNet + QSA 稀疏注意力，512 专家 top-10 MoE，逐层 n-gram |
-| **解码 — prose**（1/2/3/4 路） | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 66.4 / 95.0 / — / 117.7 tok/s | 65.4 / 88.2 / 107.9 / 123.3 tok/s |
-| **解码 — structured**（1/2/3/4 路） | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 120.1 / 167.8 / — / 208.8 tok/s | 152.3 / 196.6 / 234.5 / 227.9 tok/s |
+| **解码 — prose，贪心、关思考**（1/2/3/4 路） | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 63.9 / 86.6 / 103.9 / 116.3 tok/s | 65.0 / 93.0 / 115.7 / 133.3 tok/s |
+| **解码 — structured，贪心、关思考**（1/2/3/4 路） | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 120.5 / 168.5 / 182.6 / 213.3 tok/s | 151.4 / 224.1 / 268.7 / 287.9 tok/s |
+| **解码 — prose，T 1、开思考**（1/2/3/4 路） | 未测 | 55.4 / 77.0 / 90.0 / 97.3 tok/s | 48.5 / 70.6 / 85.2 / 96.8 tok/s |
+| **解码 — structured，T 1、开思考**（1/2/3/4 路） | 未测 | 100.7 / 142.8 / 150.7 / 166.9 tok/s | 116.5 / 97.2 / 100.6 / 119.0 tok/s |
 | **prefill** | ~1,560 tok/s（10K–55K 提示） | ~5,400 tok/s（8K–64K 提示，新文本；4K 约 4,600） | ~1,900 tok/s（13K–77K 提示） |
 | **TTFT**（短提示） | ~370 ms | ~200 ms；7K 提示从 NVMe 前缀缓存恢复时 185 ms | ~140 ms |
 | **启动**（加载→可服务） | ~33 s | ~16 s（冷启动，分片直接从 NVMe 读） | ~19 s（冷启动） |
 | 投机解码 | DFlash2 草稿器，树/链验证 | DSpark（检查点自带的草稿级），每序列草稿数由代价模型决定 | 原生 MTP + prompt-lookup |
 
-"prose" = 长篇解释（草稿接受率低）；"structured" = 从 1 数到 200（接受率高）。聚合是各路相加；因为有投机，解码速度和文本相关。
+"prose" = 长篇解释（草稿接受率低）；"structured" = 从 1 数到 200（接受率高）。因为有投机，解码速度和文本相关。
 
 ### 量化与运行时精度
 
