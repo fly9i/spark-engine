@@ -65,22 +65,6 @@ TTFT grows with the number of streams because new requests are admitted between 
 Multi-turn follow-ups reuse the previous turn's state: on a 16K-token conversation the next turn's TTFT with Qwen is
 about 0.3 s instead of a full prefill (prompt checkpoints).
 
-### Sampled prose (temperature 0.7, thinking on), 2026-10-28, v0.3.7
-
-`bench/decode_bench.py prose 3 400 --temperature 0.7 --thinking --streams 1,2,3,4,5` (DeepSeek: `--streams 1,2,4`). Every
-reply ran the full 400 tokens (reasoning included). Aggregate = all decode tokens / the window from the first stream's
-first token to the last stream's last token; in parentheses the sum of the per-stream speeds.
-
-| Streams | Qwen3.8-Flash-Next (1 node) | DeepSeek-V4.1-Flash (3 nodes) |
-| --- | --- | --- |
-| 1 | 51.5 tok/s (TTFT 208 ms) | 53.7 tok/s (TTFT 255 ms) |
-| 2 | 77.1 (83.9) | 76.4 (78.6) |
-| 3 | 94.0 (102.3) | — |
-| 4 | 106.5 (117.7) | 98.1 (104.2) |
-| 5 | 119.0 (131.8) | — (the DeepSeek service decodes 4 requests at once, `DS41_SERVE_STORES=4`; more wait in the queue) |
-
-Sampling lowers draft acceptance, so these are below the greedy rows above.
-
 ### Reproducing
 
 ```bash

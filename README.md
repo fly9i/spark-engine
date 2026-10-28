@@ -32,16 +32,13 @@ checkpoint as served by the current code (greedy, thinking off, the optional con
 | Hardware | 2× DGX Spark (TP2, RoCE); 3× also supported | 3× DGX Spark (TP3, RoCE mesh) | 1× DGX Spark |
 | Architecture | 45 layers: KDA linear-attn + MLA/DSA sparse-attn, 288-expert MoE | 40 layers (20 encoder + 20 decoder): compressed sparse attention with a hierarchical indexer, 384-expert top-6 MoE, Engram n-gram tables, mHC | 48 layers: gated-DeltaNet + QSA sparse-attn, 512-expert top-10 MoE, per-layer n-gram |
 | **Decode — prose** (1/2/3/4 streams) | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 66.4 / 95.0 / — / 117.7 tok/s | 65.4 / 88.2 / 107.9 / 123.3 tok/s |
-| **Decode — prose, sampled** (T 0.7, thinking on; 1/2/3/4 streams) | not measured | 53.7 / 76.4 / — / 98.1 tok/s | 51.5 / 77.1 / 94.0 / 106.5 tok/s |
 | **Decode — structured** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 120.1 / 167.8 / — / 208.8 tok/s | 152.3 / 196.6 / 234.5 / 227.9 tok/s |
 | **Prefill** | ~1,560 tok/s (10K–55K prompts) | ~5,400 tok/s (8K–64K prompts, new text; 4K ~4,600) | ~1,900 tok/s (13K–77K prompts) |
 | **TTFT** (short prompt) | ~370 ms | ~200 ms; 185 ms for a 7K prompt restored from the NVMe prefix cache | ~140 ms |
 | **Startup** (load → serving) | ~33 s | ~16 s (cold start, shards read from NVMe) | ~19 s (cold start) |
 | Speculative decoding | DFlash2 drafter, tree/chain verify | DSpark (the checkpoint's draft stages), drafts per sequence from a cost model | native MTP + prompt-lookup |
 
-"Prose" = a long explanation (lower draft acceptance); "structured" = counting 1–200 (high acceptance). The sampled prose
-row (2026-10-28, v0.3.7) is `bench/decode_bench.py prose 3 400 --temperature 0.7 --thinking --streams ...`: every reply
-runs the full 400 tokens, reasoning tokens included. Aggregate is the
+"Prose" = a long explanation (lower draft acceptance); "structured" = counting 1–200 (high acceptance). Aggregate is the
 sum over streams; decode speed depends on the text because of speculation.
 
 ### Quantization & runtime precision
