@@ -22,7 +22,8 @@ RDMA all-reduce、FP8 KV、NVMe 前缀缓存、服务前端。只链接 PyTorch 
 *prose*（逐步讲解哈希表原理）与 *structured*（从 1 数到 200）——每个请求输出 400 token，1~4 路并发（多路时每路提示前加一行 `Request ID: decode-<i>`），
 每档 5 次取中位数。每行注明采样方式：**贪心、关思考**（温度 0）或 **T 1、开思考**（温度 1，思考 token 计入）。聚合 = 全部解码 token ÷ 从最早一路首 token
 到最晚一路末 token 的时间窗。GLM 的数据较旧（2026-10-08，v0.1.1，贪心、关思考，多路用句尾 `(stream i/n)` 而不是 `Request ID` 行）。预填、TTFT 与启动：
-DeepSeek 预填 2026-10-26，Qwen 预填 2026-10-08，启动 2026-10-28。更多见 [docs/benchmarks.zh-CN.md](docs/benchmarks.zh-CN.md)、[docs/ds41.zh-CN.md](docs/ds41.zh-CN.md#7-性能)。
+DeepSeek 预填 2026-10-26，Qwen 预填 2026-10-08，启动 2026-10-28。更多见 [docs/benchmarks.zh-CN.md](docs/benchmarks.zh-CN.md)、[docs/ds41.zh-CN.md](docs/ds41.zh-CN.md#7-性能)。下表是在 DGX OS 7.5.0、
+GPU 时钟锁定 2,200 MHz 时测的；2026-10-29 系统更新后 DeepSeek 在锁频与不锁频下的数据见[测试系统与 GPU 频率](#测试系统与-gpu-频率)。
 
 | | **GLM-5.3-Flash** | **DeepSeek-V4.1-Flash** | **Qwen3.8-Flash-Next** |
 | --- | --- | --- | --- |
@@ -167,6 +168,118 @@ cd engine-rs && cargo build --release                   # -> engine-rs/target/re
 ```
 
 GitHub Actions 在 arm64 runner 上为版本 tag（以及手动触发）构建，并发布归档包。
+
+## 测试系统与 GPU 频率
+
+本仓库数据所用的三台 DGX Spark（GB10），2026-10-29 系统与固件更新后的版本（三台完全一致）：
+
+| 组件 | 版本 |
+| --- | --- |
+| DGX OS（`dgx-release`） | 7.6.0 |
+| 内核 | 7.0.0-1019-nvidia |
+| NVIDIA 驱动 | 580.178.04 |
+| CUDA toolkit | 13.0.3 |
+| EC 嵌入式控制器固件 | 0x03000d07 |
+| UEFI 固件 | 0x02009e0f / 0x00000519 |
+| BIOS | 5.36_0ACUM028 |
+| GPU VBIOS | 9A.0B.34.00.00 |
+| ConnectX-7 固件 | 28.50.1002 |
+| NVMe（Samsung MZALC4T0HBL1，自带 4 TB）固件 | NXHB202Q |
+
+主机设置：`vm.compaction_proactiveness = 0`、`vm.watermark_boost_factor = 0`、关闭 swap、关闭 CPU 深度空闲（保留 WFI）。
+2026-10-29 之前节点运行 DGX OS 7.5.0（内核 6.17、驱动 580.173.02、较旧的 EC / UEFI / ConnectX-7 固件），且一个遗留服务把
+GPU 时钟锁在 2,200 MHz；本仓库此前的数据都是在这种状态下测的。
+
+更新后的系统上 DeepSeek-V4.1-Flash-1017（TP3）在默认时钟与锁定 2,200 MHz（`nvidia-smi -lgc 2200`）下的对比。两组使用同一
+版本与设置（默认设置加可选的条件钳制 `DS41_ABLATE_CLAMP`），脚本与 [docs/ds41.zh-CN.md](docs/ds41.zh-CN.md#7-性能) 相同：
+`bench/ds41_decode_bench.py`（贪心、关思考、每流 256 token、各流合计 tok/s、3 次中位）和 `bench/ds41_prefill_bench.py`
+（每个长度同一文本 5 次，取中位）。
+
+| Decode，tok/s | Prose | Structured | Code |
+| --- | --- | --- | --- |
+| 1 路，默认时钟 | **72.3** | **132.1** | **117.6** |
+| 1 路，2,200 MHz | 70.7 | 129.1 | 112.4 |
+| 2 路，默认时钟 | **102.2** | **179.5** | **152.3** |
+| 2 路，2,200 MHz | 102.0 | 175.5 | 150.3 |
+| 4 路，默认时钟 | **130.0** | **220.0** | **175.4** |
+| 4 路，2,200 MHz | 122.4 | 214.5 | 171.7 |
+
+| Prefill | 4K | 8K | 16K | 32K | 64K |
+| --- | --- | --- | --- | --- | --- |
+| 默认时钟，tok/s | **4,749** | **5,467** | **5,565** | **5,622** | **5,623** |
+| 2,200 MHz，tok/s | 4,602 | 5,258 | 5,385 | 5,425 | 5,425 |
+| TTFT，默认时钟 | 0.94 s | 1.58 s | 3.02 s | 5.91 s | 11.73 s |
+
+负载下默认时钟的 GPU 频率为 2,430–2,530 MHz（各节点中位），最高 84–89 °C；锁频时为 2,184–2,190 MHz，最高 75–84 °C。频率
+高约 12%，decode 只快 2–4%（decode 受内存带宽限制），prefill 快约 3.5%。系统更新本身的影响更大：同样锁 2,200 MHz，单路
+decode 从旧系统的 66.4 / 119.3 / 105.2 tok/s（旧系统那组未开钳制，钳制对 decode 速度的影响小于 1%）提高到 70.7 / 129.1 / 112.4。若长时间满载温度过高，可用
+`nvidia-smi -lgc 300,2400` 之类的上限以少量速度换温度；`nvidia-smi -rgc` 恢复默认。
+
+## 其他用户实测
+
+一套独立部署的 DeepSeek-V4.1-Flash-1017（3 台 DGX Spark，TP3），由部署者本人于 2026-10-29 用公开发布版、默认引擎设置测得，
+脚本与 [docs/ds41.zh-CN.md](docs/ds41.zh-CN.md#7-性能) 相同（`bench/ds41_decode_bench.py`：贪心、关思考、每流 256 token、
+3 次中位；`bench/ds41_prefill_bench.py`）。括号内为我们 2026-10-29 系统更新后的数据（[测试系统与 GPU 频率](#测试系统与-gpu-频率)，默认时钟）。
+
+| 流数 | Prose | Structured | Code |
+| --- | --- | --- | --- |
+| 1 | 70.6（72.3） | 127.9（132.1） | 113.7（117.6） |
+| 2 | 97.5（102.2） | 176.0（179.5） | 142.0（152.3） |
+| 4 | 129.8（130.0） | 222.3（220.0） | 173.8（175.4） |
+
+| 提示长度 | 4K | 8K | 16K | 32K | 64K |
+| --- | --- | --- | --- | --- | --- |
+| Prefill，tok/s | 4,659（4,749） | 5,445（5,467） | 5,583（5,565） | 5,666（5,622） | 5,681（5,623） |
+
+64K TTFT 11.6 s（我们 11.7 s）。同一套机器第一次测得的数要低得多（prefill 2,648–3,810 tok/s，上下文 687,872），按下面的
+[常见问题](#常见问题)逐项排查后达到上表。在我们自己更新系统之前，他们的数比我们高 4–8%，原因是我们节点的系统较旧且 GPU 时钟被锁定
+（见上一节）。欢迎以 issue 提交你自己部署的实测结果。
+
+## 常见问题
+
+**最大上下文不到 1,048,576 token，而且每次重启都不一样。**
+KV 池取的是加载完那一刻**最紧的那台**还剩下的内存，所以它反映的是某台机器当时有多少空闲，不是引擎的上限。从 rank 日志找出
+是哪台：`grep -hE 'ds41-mem\].*margin|KV pool' /tmp/spark-ds41-rank*.log`，`ranks [a, b, c] granules` 中最小的就是瓶颈
+rank，它的 `MemAvailable` 一行是当时的可用内存（我们 rank 0 约 16 GiB，仍能放下 220 万 token）。停掉引擎后每台的
+`MemAvailable` 应在 100 GiB 以上；检查其他推理栈或容器、dashboard 与监控 exporter、`/dev/shm` 里的文件、大页和卡住的
+（D 状态）进程。清掉之后三台都 `echo 3 > /proc/sys/vm/drop_caches` 再启动。不需要调低 `DS41_MEM_MARGIN_GB`、关闭草稿模型或
+改变启动顺序。
+
+**要不要等引擎就绪后再启动前端，免得它占用 KV 池的内存？**
+不需要。视觉编码器由 rank 0 引擎在确定 KV 池大小之前加载，已经计入；前端（`ds41_server.py`）不加载 torch、不使用 GPU，
+主机内存约 0.7 GB。按 `start.sh` 的方式两者同时启动，能省约 4 s。
+
+**Prefill（或多路 decode）远低于参考值。**
+DeepSeek 的张量并行通信走引擎自己的 RDMA 链路；prefill 传输的数据最多，缺一条链路时最先在这里显现。按顺序检查：
+1. 链路：`grep '\[rdma_arn\]' /tmp/spark-ds41-rank*.log` 中每对节点都应列出**两条**链路（每根线缆的两个 PCIe function）；
+   `no RoCE subnet shared` 表示缺地址。再看 `ibv_devinfo`（端口 `PORT_ACTIVE`）、每对节点的 `ib_write_bw`，以及 prefill
+   期间每个设备的计数（`/sys/class/infiniband/*/ports/1/counters/port_xmit_data`）是否都在增长。
+2. 版本与启动方式：三台二进制相同（`sha256sum`）、使用最新发布版、经 `start.sh ds41` 启动（它会设置 `DS41_MOE_OUT_MB`、
+   `GLM53_RDMA_ARN_ROWS_PIPE` 和 `GLM53_COMM_STREAM_PRIO`）。
+3. 每台的主机设置（[docs/deploy.zh-CN.md](docs/deploy.zh-CN.md) §1）：`vm.compaction_proactiveness = 0`、
+   `vm.watermark_boost_factor = 0`、关闭 swap。我们有一台漏设时 prefill 会随机多出 0.4–1.5 s；各 rank 同步运行，
+   一台卡住会拖慢全部。
+4. 检查点与分片放在本地 NVMe 上（prefill 期间从中读取 Engram 行）。
+
+**启动比约 16 s 慢。**
+约 16 s 指引擎加载（约 10 s）加预热（约 4 s），用的是 DGX Spark 自带的 4 TB NVMe（我们用的就是这块盘，O_DIRECT 读分片约
+11.7 GB/s）；停掉旧模型、`drop_caches` 和外层脚本不在其中。`grep -hE 'loaded in|waited .* for reads|warm-up in'
+/tmp/spark-ds41-rank*.log` 能看出时间花在哪。如果读盘等待占大头，检查盘的 `current_link_speed`
+（`/sys/class/nvme/nvme0/device/`，应为 32 GT/s）、温度（`nvme smart-log`）和直接读速
+（`dd if=<分片> of=/dev/null bs=64M iflag=direct`）；`DS41_LOAD_PREFETCH`、`DS41_DIRECT_LOAD`、`DS41_WARM_DEFER` 保持默认。
+如果加载很快但启动仍慢，多半是脚本在等每台 `MemAvailable` 回到 100 GiB（上一个模型还在释放内存），或在等某台慢节点。
+
+**我测的 decode 与 README 差几个百分点。**
+先看测法：README 主表用 `bench/decode_bench.py`（400 token、5 次中位），DeepSeek 页用 `bench/ds41_decode_bench.py`
+（256 token、3 次中位）；两者都报时间窗内的总吞吐，而把每路速度相加在 2–4 路时会多 3–10%。投机解码与文本相关，2–4 路的数
+每次运行会差约 5%。机器方面：GPU 时钟没有被锁定（`nvidia-smi -q -d CLOCK`；`nvidia-smi -rgc` 可恢复）、没有服务把 CUDA
+线程钉到 A725 小核、三台的 OS / 内核 / 固件一致，散热（我们的 GB10 负载下约 2.4–2.5 GHz），以及 DGX OS / 固件版本（见[测试系统与 GPU 频率](#测试系统与-gpu-频率)）。
+
+**节点卡死或自动重启。**
+GB10 的 CPU 与 GPU 共用一块内存，默认没有 swap，内存耗尽的节点可能失去响应，节点上不要运行其他负载。内核 oops / panic
+（例如没有 OOM、没有 Xid 的 paging request 错误）来自内核或固件，而不是用户态进程：让各节点的 DGX OS 与固件一致，并开启
+kdump 以便下次留下调用栈。卡在 ConnectX-7 上的 D 状态进程（例如插拔线缆或模块后的 `mstflint`）只能靠重启清除，重启后
+请重新检查链路。
 
 ## 文档
 

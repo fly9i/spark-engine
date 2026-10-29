@@ -29,7 +29,9 @@ sampling: **greedy, thinking off** (temperature 0) or **T 1, thinking on** (temp
 Aggregate = all decode tokens / the window from the first token of the earliest request to the last token of the
 latest. GLM's rows are older (2026-10-08, v0.1.1, greedy, thinking off, a `(stream i/n)` suffix instead of the
 `Request ID` line). Prefill, TTFT and startup: DeepSeek prefill 2026-10-26, Qwen prefill 2026-10-08, startup 2026-10-28.
-More: [docs/benchmarks.md](docs/benchmarks.md), [docs/ds41.md](docs/ds41.md#7-performance).
+More: [docs/benchmarks.md](docs/benchmarks.md), [docs/ds41.md](docs/ds41.md#7-performance). The table below was measured on
+DGX OS 7.5.0 with the GPU clock locked at 2,200 MHz; DeepSeek numbers after the 2026-10-29 system update, with and
+without that lock, are in [Test system and GPU clock](#test-system-and-gpu-clock).
 
 | | **GLM-5.3-Flash** | **DeepSeek-V4.1-Flash** | **Qwen3.8-Flash-Next** |
 | --- | --- | --- | --- |
@@ -187,6 +189,134 @@ cd engine-rs && cargo build --release                   # -> engine-rs/target/re
 ```
 
 GitHub Actions builds on an arm64 runner for version tags (and manual runs) and publishes the release archives.
+
+## Test system and GPU clock
+
+The three DGX Sparks (GB10) used for the numbers in this repository, after the system and firmware update of
+2026-10-29 (all three identical):
+
+| Component | Version |
+| --- | --- |
+| DGX OS (`dgx-release`) | 7.6.0 |
+| Kernel | 7.0.0-1019-nvidia |
+| NVIDIA driver | 580.178.04 |
+| CUDA toolkit | 13.0.3 |
+| Embedded controller firmware | 0x03000d07 |
+| UEFI firmware | 0x02009e0f / 0x00000519 |
+| BIOS | 5.36_0ACUM028 |
+| GPU VBIOS | 9A.0B.34.00.00 |
+| ConnectX-7 firmware | 28.50.1002 |
+| NVMe (Samsung MZALC4T0HBL1, stock 4 TB) firmware | NXHB202Q |
+
+Host settings: `vm.compaction_proactiveness = 0`, `vm.watermark_boost_factor = 0`, no swap, deep CPU idle states
+disabled (WFI kept). Until 2026-10-29 the nodes ran DGX OS 7.5.0 (kernel 6.17, driver 580.173.02, older EC / UEFI /
+ConnectX-7 firmware) and a leftover service locked the GPU clock at 2,200 MHz; the earlier numbers in this repository
+were measured that way.
+
+DeepSeek-V4.1-Flash-1017 (TP3) on the updated system, default clocks and with the clock locked at 2,200 MHz
+(`nvidia-smi -lgc 2200`). Same build and settings for both (default settings plus the optional conditional clamp,
+`DS41_ABLATE_CLAMP`), same scripts as [docs/ds41.md](docs/ds41.md#7-performance): `bench/ds41_decode_bench.py`
+(greedy, thinking off, 256 tokens per stream, aggregate tok/s, median of 3) and `bench/ds41_prefill_bench.py`
+(5 samples per size of the same text, median).
+
+| Decode, tok/s | Prose | Structured | Code |
+| --- | --- | --- | --- |
+| 1 stream, default clocks | **72.3** | **132.1** | **117.6** |
+| 1 stream, 2,200 MHz | 70.7 | 129.1 | 112.4 |
+| 2 streams, default clocks | **102.2** | **179.5** | **152.3** |
+| 2 streams, 2,200 MHz | 102.0 | 175.5 | 150.3 |
+| 4 streams, default clocks | **130.0** | **220.0** | **175.4** |
+| 4 streams, 2,200 MHz | 122.4 | 214.5 | 171.7 |
+
+| Prefill | 4K | 8K | 16K | 32K | 64K |
+| --- | --- | --- | --- | --- | --- |
+| Default clocks, tok/s | **4,749** | **5,467** | **5,565** | **5,622** | **5,623** |
+| 2,200 MHz, tok/s | 4,602 | 5,258 | 5,385 | 5,425 | 5,425 |
+| TTFT, default clocks | 0.94 s | 1.58 s | 3.02 s | 5.91 s | 11.73 s |
+
+Under load the GPUs ran at 2,430–2,530 MHz (median per node) with default clocks, up to 84–89 °C; locked, at
+2,184–2,190 MHz, up to 75–84 °C. The 12% higher clock gives 2–4% more decode (decode is bound by memory bandwidth) and
+about 3.5% more prefill. The update itself mattered more: at 2,200 MHz, single-stream decode went from 66.4 / 119.3 /
+105.2 tok/s on the old system (measured without the clamp, which changes decode speed by less than 1%) to
+70.7 / 129.1 / 112.4. If the nodes run hot under sustained load, a cap such as
+`nvidia-smi -lgc 300,2400` trades a little speed for temperature; `nvidia-smi -rgc` restores the default.
+
+## Measured by other users
+
+An independent deployment of DeepSeek-V4.1-Flash-1017 on 3× DGX Spark (TP3), measured by its operator on 2026-10-29
+with the public release and default engine settings, using the same scripts as [docs/ds41.md](docs/ds41.md#7-performance)
+(`bench/ds41_decode_bench.py`: greedy, thinking off, 256 tokens per stream, median of 3; `bench/ds41_prefill_bench.py`).
+Our numbers after the 2026-10-29 system update ([Test system and GPU clock](#test-system-and-gpu-clock), default clocks) are in parentheses.
+
+| Streams | Prose | Structured | Code |
+| --- | --- | --- | --- |
+| 1 | 70.6 (72.3) | 127.9 (132.1) | 113.7 (117.6) |
+| 2 | 97.5 (102.2) | 176.0 (179.5) | 142.0 (152.3) |
+| 4 | 129.8 (130.0) | 222.3 (220.0) | 173.8 (175.4) |
+
+| Prompt | 4K | 8K | 16K | 32K | 64K |
+| --- | --- | --- | --- | --- | --- |
+| Prefill, tok/s | 4,659 (4,749) | 5,445 (5,467) | 5,583 (5,565) | 5,666 (5,622) | 5,681 (5,623) |
+
+64K TTFT 11.6 s (ours 11.7 s). Their first measurement on the same machines was much lower (prefill 2,648–3,810
+tok/s, context 687,872); it reached these numbers after working through the [FAQ](#faq) below. Before our own update
+their numbers were 4–8% above ours, which came from our nodes' older system and locked GPU clock (see the section
+above). Results from your own deployment are welcome as an issue.
+
+## FAQ
+
+**The maximum context is below 1,048,576 tokens and changes from restart to restart.**
+The KV pool takes what the *tightest* node has left right after loading, so it shows how much memory one node had free
+at that moment, not a limit of the engine. Find the node in the rank logs:
+`grep -hE 'ds41-mem\].*margin|KV pool' /tmp/spark-ds41-rank*.log` — the smallest number in `ranks [a, b, c] granules`
+is the limiting rank, and its `MemAvailable` line shows what it had (about 16 GiB on our rank 0, which still fits
+2.2 M tokens). With the engine stopped every node should show more than 100 GiB `MemAvailable`; look for other inference
+stacks or containers, dashboards and exporters, files in `/dev/shm`, huge pages and stuck (D-state) processes. Free
+them, `echo 3 > /proc/sys/vm/drop_caches` on all nodes and start again. Lowering `DS41_MEM_MARGIN_GB`, turning off the
+draft model or changing the start order is not needed.
+
+**Should the front end be started after the engine is ready, so that it does not take memory from the KV pool?**
+No. The vision encoder is loaded by the rank 0 engine before the KV pool is sized and is already counted; the front end
+(`ds41_server.py`) does not load torch or touch the GPU and uses about 0.7 GB of host memory. Starting both together, as
+`start.sh` does, saves about 4 s.
+
+**Prefill (or multi-stream decode) is far below the reference numbers.**
+DeepSeek runs its tensor-parallel traffic over the engine's own RDMA links; prefill moves the most data, so a missing
+link shows there first. Check, in this order:
+1. Links: `grep '\[rdma_arn\]' /tmp/spark-ds41-rank*.log` must list **two** links for every pair of nodes (both PCIe
+   functions of each cable); `no RoCE subnet shared` means an address is missing. Then `ibv_devinfo` (ports
+   `PORT_ACTIVE`), `ib_write_bw` per pair, and the per-device counters
+   (`/sys/class/infiniband/*/ports/1/counters/port_xmit_data`) rising on every device during a prefill.
+2. Version and start path: the same binary on all nodes (`sha256sum`), the latest release, started with
+   `start.sh ds41` (it sets `DS41_MOE_OUT_MB`, `GLM53_RDMA_ARN_ROWS_PIPE` and `GLM53_COMM_STREAM_PRIO`).
+3. Host settings on every node ([docs/deploy.md](docs/deploy.md) §1): `vm.compaction_proactiveness = 0`,
+   `vm.watermark_boost_factor = 0`, no swap. One node without them caused random +0.4–1.5 s prefill spikes for us,
+   and since all ranks run in lockstep one stalled node slows all of them.
+4. Checkpoint and shards on the local NVMe (the Engram rows are read from it during prefill).
+
+**Startup takes longer than about 16 s.**
+The ~16 s is engine load (~10 s) plus warm-up (~4 s), on the stock 4 TB NVMe of the DGX Spark (we use the same drive,
+reading the shards at about 11.7 GB/s with O_DIRECT); stopping the old model, `drop_caches` and wrappers are not
+included. `grep -hE 'loaded in|waited .* for reads|warm-up in' /tmp/spark-ds41-rank*.log` shows where the time goes. If
+the read wait dominates, check `current_link_speed` of the drive (`/sys/class/nvme/nvme0/device/`, 32 GT/s expected),
+its temperature (`nvme smart-log`) and a direct read (`dd if=<shard> of=/dev/null bs=64M iflag=direct`). Keep
+`DS41_LOAD_PREFETCH`, `DS41_DIRECT_LOAD` and `DS41_WARM_DEFER` at their defaults. If loading is fast but the start is
+slow, the script was waiting for every node to reach 100 GiB `MemAvailable` after the previous model, or for a slow node.
+
+**My decode numbers differ from the README by a few percent.**
+Check the method first: the README table uses `bench/decode_bench.py` (400 tokens, median of 5), the DeepSeek page uses
+`bench/ds41_decode_bench.py` (256 tokens, median of 3); both report the aggregate over the wall window, while summing
+per-stream rates gives 3–10% more at 2–4 streams. Speculative decoding depends on the text, so 2–4 stream numbers move
+by about 5% between runs. On the machine side: no locked GPU clocks (`nvidia-smi -q -d CLOCK`; `nvidia-smi -rgc`
+resets them), no services pinning CUDA threads to the A725 cores, same OS / kernel / firmware on all nodes, and cooling
+(our GB10s run at 2.4–2.5 GHz under load), and the DGX OS / firmware version (see [Test system and GPU clock](#test-system-and-gpu-clock)).
+
+**A node hangs or reboots.**
+GB10 shares one memory between CPU and GPU and has no swap by default; a node that runs out of memory can stop
+responding. Keep other workloads off the nodes. A kernel oops / panic (for example a paging-request fault with no
+out-of-memory or Xid message) comes from the kernel or firmware, not from a user-space process: align DGX OS and
+firmware across the nodes and enable kdump to capture a trace. Processes stuck in D state on the ConnectX-7 (for
+example `mstflint` after a cable or module was re-plugged) only clear with a reboot; check the links afterwards.
 
 ## Documentation
 
