@@ -10,12 +10,16 @@ need_nodes 3
 wait_memory 3
 # ranks 1 and 2 start together, then rank 0, then the front end, which loads while the engine does and listens once the
 # ready file holds the context limit
+# (wait only for the two ssh launches: rank 0 is a job of this shell too and runs until stopped, so a bare `wait`
+# never returned and the front end was never started)
+launches=()
 for r in 2 1; do
   ssh "${ssho[@]}" "${WORKERS[$r]}" "SPARK_ENV=$SPARK_ENV nohup bash $here/ds41-rank.sh $r /tmp/spark-ds41-unused.sock ${MASTERS[$r]} > /tmp/spark-ds41-rank$r.log 2>&1 < /dev/null &" &
+  launches+=($!)
 done
 rm -f /tmp/spark-ds41-rank0.log
 nohup bash "$here/ds41-rank.sh" 0 "$socket" "${MASTERS[0]}" > /tmp/spark-ds41-rank0.log 2>&1 < /dev/null &
-wait
+wait "${launches[@]}"
 ready=/tmp/spark-ds41-ready.$SPARK_PORT; rm -f "$ready"
 vision=$([[ ${DS41_VISION:-1} == 1 ]] && echo on || echo off)
 GLM53_SERVE_MAX_SEQS=${DS41_SERVE_STORES:-4} nohup "$py" "$here/ds41_server.py" --socket "$socket" --model-dir "${DS41_CKPT:?}" \
