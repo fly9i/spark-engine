@@ -4,7 +4,7 @@
 
 | 脚本 | 测量内容 |
 | --- | --- |
-| `bench/decode_bench.py [prose\|structured] [repeats] [max_tokens] [--temperature T] [--thinking] [--streams 1,2,3,4]` | 1~4 路并发下的 decode 速度（DGX Spark 社区常用方法，见[解码测速方法](#解码测速方法deepseek-与-qwen2026-10-29v037)）：默认贪心、关闭思考，32 token 预热，输出 400 个 token，多路时每路提示前加 `Request ID` 行；单流速度为 `(completion_tokens - 1) / (t_last - t_first)`，总速度 = 全部 decode token / 墙钟时间窗口；取 `repeats` 次运行的中位数 |
+| `bench/decode_bench.py [prose\|structured] [repeats] [max_tokens] [--temperature T] [--thinking] [--streams 1,2,3,4]` | 1~4 路并发下的 decode 速度（DGX Spark 社区常用方法，见[解码测速方法](#解码测速方法deepseek-与-qwen2026-10-29v038)）：默认贪心、关闭思考，32 token 预热，输出 400 个 token，多路时每路提示前加 `Request ID` 行；单流速度为 `(completion_tokens - 1) / (t_last - t_first)`，总速度 = 全部 decode token / 墙钟时间窗口；取 `repeats` 次运行的中位数 |
 | `bench/prefill_bench.py TOKENS [SEED]` | 对约 `TOKENS` 个 token 的合成提示词做 prefill（随机单词，因此不同 seed 之间没有共享前缀）；输出引擎的 prefill 时间和 tok/s |
 | `bench/ds41_decode_bench.py [--url URL] [--types prose,structured,code] [--conc 1,2,4]` | DeepSeek-V4.1-Flash 的数据（[ds41.zh-CN.md](ds41.zh-CN.md#7-性能)）：贪心，关闭思考，32 token 预热，每流 256 个 token，prose / structured / code 提示词 |
 | `bench/ds41_prefill_bench.py [repeats] [sizes]` | DeepSeek-V4.1-Flash 的 prefill 数据：4K–64K 的真实文本提示，每个唯一前缀，流式；tok/s = 提示 token 数 / TTFT，取 `repeats` 次的中位 |
@@ -20,8 +20,8 @@
 
 ## 结果
 
-GLM-5.3-Flash 与各 prefill 数据：2026-10-08 使用发布版二进制和默认设置测得（`spark.env` 默认值，`GLM53_PCACHE=0` 以测量冷 prefill），贪心、关思考，
-多路用旧的句尾 `(stream i/n)`，3 次中位数。DeepSeek 与 Qwen 的 decode：2026-10-29，见[解码测速方法](#解码测速方法deepseek-与-qwen2026-10-29v037)。
+GLM-5.3-Flash（decode 与 prefill）：2026-10-08 在 DGX OS 7.5.0、GPU 时钟锁定 2,200 MHz 下，使用发布版二进制和默认设置测得（`spark.env` 默认值，`GLM53_PCACHE=0` 以测量冷 prefill），贪心、关思考，
+多路用旧的句尾 `(stream i/n)`，3 次中位数。DeepSeek 与 Qwen 的 decode 以及 Qwen 的 prefill：2026-10-29，见[解码测速方法](#解码测速方法deepseek-与-qwen2026-10-29v038)。
 表中为所有流的 decode 总吞吐；括号内为单流速度。
 
 ### GLM-5.3-Flash，2× DGX Spark（TP2）
@@ -40,10 +40,10 @@ GLM-5.3-Flash 与各 prefill 数据：2026-10-08 使用发布版二进制和默�
 | 54,686 token | 35.17 s | 1,555 tok/s |
 | 54,880 token | 35.22 s | 1,558 tok/s |
 
-### 解码测速方法（DeepSeek 与 Qwen，2026-10-29，v0.3.7）
+### 解码测速方法（DeepSeek 与 Qwen，2026-10-29，v0.3.8）
 
 与 DGX Spark 社区常用的方法一致：用 `bench/decode_bench.py` 测运行中的服务；提示为 *prose*（逐步讲解哈希表原理）与 *structured*（从 1 数到 200）；
-每个请求输出 400 token（本次每条回复都跑满 400）；1~4 路并发，多路时每路提示前加一行 `Request ID: decode-<i>`（单路为原提示）；32 token 预热；
+每个请求输出 400 token（本次每条回复都跑满 400）；在 README「测试系统与 GPU 频率」一节所述的更新后系统上、默认 GPU 时钟下测得，每秒采样时钟，未记录到降频；1~4 路并发，多路时每路提示前加一行 `Request ID: decode-<i>`（单路为原提示）；32 token 预热；
 每档 5 次取中位数。两种采样方式在每列标注：**贪心、关思考**（温度 0）与 **T 1、开思考**（温度 1、top-p 1，思考 token 计入）。每路速度 =
 （completion token − 1）÷（末 token − 首 token）；聚合 = 全部解码 token ÷ 从最早一路首 token 到最晚一路末 token 的时间窗。因为有投机解码，
 速度随文本变化，换提示会得到不同数字。
@@ -54,10 +54,10 @@ GLM-5.3-Flash 与各 prefill 数据：2026-10-08 使用发布版二进制和默�
 
 | 流数 | Prose，贪心、关思考 | Structured，贪心、关思考 | Prose，T 1、开思考 | Structured，T 1、开思考 |
 | --- | --- | --- | --- | --- |
-| 1 | 63.9 tok/s（TTFT 178 ms） | 120.5 tok/s（TTFT 168 ms） | 55.4 tok/s（TTFT 277 ms） | 100.7 tok/s（TTFT 227 ms） |
-| 2 | 86.6（每路 45.9，TTFT 310 ms） | 168.5（每路 86.6，TTFT 297 ms） | 77.0（每路 39.8，TTFT 379 ms） | 142.8（每路 75.4，TTFT 384 ms） |
-| 3 | 103.9（每路 36.4，TTFT 413 ms） | 182.6（每路 63.5，TTFT 403 ms） | 90.0（每路 31.5，TTFT 524 ms） | 150.7（每路 56.1，TTFT 513 ms） |
-| 4 | 116.3（每路 30.6，TTFT 516 ms） | 213.3（每路 56.5，TTFT 515 ms） | 97.3（每路 26.0，TTFT 658 ms） | 166.9（每路 48.1，TTFT 654 ms） |
+| 1 | 67.3 tok/s（TTFT 172 ms） | 126.0 tok/s（TTFT 162 ms） | 58.0 tok/s（TTFT 236 ms） | 100.4 tok/s（TTFT 229 ms） |
+| 2 | 91.7（每路 47.9，TTFT 292 ms） | 177.2（每路 91.0，TTFT 280 ms） | 80.8（每路 42.5，TTFT 355 ms） | 157.5（每路 81.1，TTFT 360 ms） |
+| 3 | 108.4（每路 37.0，TTFT 389 ms） | 190.5（每路 66.2，TTFT 384 ms） | 94.2（每路 33.0，TTFT 486 ms） | 157.8（每路 59.6，TTFT 482 ms） |
+| 4 | 122.7（每路 32.4，TTFT 498 ms） | 222.3（每路 58.8，TTFT 491 ms） | 103.6（每路 27.0，TTFT 620 ms） | 165.2（每路 48.8，TTFT 615 ms） |
 
 ### Qwen3.8-Flash-Next，1× DGX Spark
 
@@ -65,20 +65,20 @@ GLM-5.3-Flash 与各 prefill 数据：2026-10-08 使用发布版二进制和默�
 
 | 流数 | Prose，贪心、关思考 | Structured，贪心、关思考 | Prose，T 1、开思考 | Structured，T 1、开思考 |
 | --- | --- | --- | --- | --- |
-| 1 | 65.0 tok/s（TTFT 141 ms） | 151.4 tok/s（TTFT 139 ms） | 48.5 tok/s（TTFT 209 ms） | 116.5 tok/s（TTFT 210 ms） |
-| 2 | 93.0（每路 48.0，TTFT 252 ms） | 224.1（每路 116.0，TTFT 250 ms） | 70.6（每路 39.6，TTFT 342 ms） | 97.2（每路 62.2，TTFT 340 ms） |
-| 3 | 115.7（每路 40.8，TTFT 353 ms） | 268.7（每路 95.0，TTFT 362 ms） | 85.2（每路 31.2，TTFT 488 ms） | 100.6（每路 43.0，TTFT 482 ms） |
-| 4 | 133.3（每路 35.3，TTFT 461 ms） | 287.9（每路 78.0，TTFT 482 ms） | 96.8（每路 27.3，TTFT 647 ms） | 119.0（每路 37.9，TTFT 632 ms） |
+| 1 | 68.4 tok/s（TTFT 136 ms） | 157.8 tok/s（TTFT 133 ms） | 51.2 tok/s（TTFT 203 ms） | 122.7 tok/s（TTFT 204 ms） |
+| 2 | 98.0（每路 50.4，TTFT 242 ms） | 230.7（每路 119.7，TTFT 241 ms） | 74.3（每路 40.8，TTFT 330 ms） | 78.1（每路 40.1，TTFT 328 ms） |
+| 3 | 122.4（每路 43.0，TTFT 342 ms） | 280.1（每路 99.2，TTFT 343 ms） | 90.9（每路 32.8，TTFT 467 ms） | 100.9（每路 39.0，TTFT 476 ms） |
+| 4 | 139.2（每路 36.8，TTFT 438 ms） | 310.3（每路 83.3，TTFT 462 ms） | 103.8（每路 28.5，TTFT 615 ms） | 108.0（每路 36.5，TTFT 592 ms） |
 
-采样（T 1）下数数提示 2~3 路的聚合反而低于单路；5 次结果一致（2 路 94~98 tok/s），是批量采样路径在高可预测文本上的表现，不是噪声。下面的 prefill
-仍是 2026-10-08 的数据。
+采样（T 1）下数数提示 2~3 路的聚合反而低于单路；5 次结果一致（2 路 77.8~80.6 tok/s），是批量采样路径在高可预测文本上的表现，不是噪声。下面的 prefill
+是 2026-10-29 用同一版本测的。
 
 | 提示词 | Prefill 时间 | Prefill 速度 |
 | --- | --- | --- |
-| 13,449 token | 7.16 s | 1,879 tok/s |
-| 13,456 token | 7.00 s | 1,922 tok/s |
-| 77,204 token | 41.20 s | 1,874 tok/s |
-| 77,274 token | 41.17 s | 1,877 tok/s |
+| 13,449 token | 6.54 s | 2,056 tok/s |
+| 13,456 token | 6.46 s | 2,084 tok/s |
+| 77,204 token | 38.72 s | 1,994 tok/s |
+| 77,274 token | 39.10 s | 1,976 tok/s |
 
 TTFT 随流数增加而增长，因为新请求是在正在运行的请求的 decode 轮次之间被接纳的。
 多轮对话的后续轮次会复用上一轮的状态：在 16K token 的对话中，Qwen 下一轮的 TTFT 约为 0.3 s，而无需完整 prefill

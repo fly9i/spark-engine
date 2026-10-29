@@ -577,20 +577,35 @@ fn decode_one(m: &Model, pol: &Policy, a: &mut Active, st: &mut Store) {
 /// device and synchronize once before the draft steps; rounds with a sampling sequence accept on the host.
 fn decode_batch(m: &Model, pol: &Policy, active: &mut [Active], dec: &[usize], stores: &mut [Store], graphs: &mut HashMap<Vec<usize>, BatchG>) {
     let mut clk = Clock::new();
+    let t_round = Instant::now();
     let mut pol = pol.for_batch(dec.len());
-    if dec.iter().all(|&i| active[i].temp <= 0.0) { if Policy::rate_sampled_only() { pol.rate = None; } else { pol.greedy_cost(dec.len()); } }
+    let sampled = !dec.iter().all(|&i| active[i].temp <= 0.0);
+    // the static round-time model of this round's kind (the online model's prior)
+    let prior = { let mut p = pol; if !sampled { p.greedy_cost(dec.len()); } p.rate };
+    if !sampled { if Policy::rate_sampled_only() { pol.rate = None; } else { pol.greedy_cost(dec.len()); } }
+    let online = super::graph::cost_online_on();
+    if online && pol.rate.is_some() {
+        if let Some(c) = super::graph::cost_get(dec.len(), sampled) { pol.rate = Some(c); }
+    }
     let pol = &pol;
     let mut order = dec.to_vec();
     order.sort_by_key(|&i| active[i].store);
     let key: Vec<usize> = order.iter().map(|&i| active[i].store).collect();
     // (sequences that just joined bring chains of other lengths: the width stays within the shortest)
     let dr = |i: usize| { let Phase::Decode { drafts, confs, .. } = &active[i].phase else { unreachable!() }; (drafts.len(), confs) };
-    let kv = if pol.rate.is_some() {
+    let chain = order.iter().map(|&i| dr(i).0).min().unwrap();
+    // per-sequence widths (QWEN_SPEC_RAGGED): the batch verifies the widest, the others' extra rows are padding
+    let ws: Option<Vec<usize>> = pol.ragged.then(|| {
+        let accs: Vec<Vec<f64>> = order.iter().map(|&i| if pol.rate.is_some() { active[i].cal.ests(dr(i).1) } else { dr(i).1.clone() }).collect();
+        pol.ragged_widths(&accs.iter().map(|e| e.as_slice()).collect::<Vec<_>>()).into_iter().map(|w| w.min(chain).max(1)).collect()
+    });
+    let kv = if let Some(ws) = &ws { *ws.iter().max().unwrap() }
+             else if pol.rate.is_some() {
                  let ests: Vec<Vec<f64>> = order.iter().map(|&i| active[i].cal.ests(dr(i).1)).collect();
                  pol.rate_width(&ests.iter().map(|e| e.as_slice()).collect::<Vec<_>>())
              }
              else { pol.width(&order.iter().map(|&i| kk_of(pol.verify_len(dr(i).1), &active[i])).collect::<Vec<_>>()) }
-        .min(order.iter().map(|&i| dr(i).0).min().unwrap());
+        .min(chain);
     let r1 = kv + 1;
     let rows: Vec<Vec<i64>> = order.iter().map(|&i| {
         let Phase::Decode { next, drafts, .. } = &active[i].phase else { unreachable!() };
@@ -598,15 +613,17 @@ fn decode_batch(m: &Model, pol: &Policy, active: &mut [Active], dec: &[usize], s
         r.extend_from_slice(&drafts[..kv]);
         r
     }).collect();
-    let kks: Vec<usize> = order.iter().map(|&i| kk_of(kv, &active[i])).collect();
+    let kks: Vec<usize> = order.iter().enumerate().map(|(g, &i)| kk_of(ws.as_ref().map_or(kv, |w| w[g]), &active[i])).collect();
     let ps: Vec<i64> = key.iter().map(|&s| stores[s].seq().pos).collect();
-    if !graphs.contains_key(&key) {
+    let fresh = !graphs.contains_key(&key);
+    if fresh {
         let t = Instant::now();
         let seqs: Vec<&Seq> = key.iter().map(|&s| stores[s].seq()).collect();
         graphs.insert(key.clone(), BatchG::capture(m, &seqs, pol.cap()));
         eprintln!("[qwen-serve] captured batch graph for stores {:?} in {:.0} ms", key, t.elapsed().as_secs_f64() * 1e3);
     }
     let bg = graphs.get_mut(&key).unwrap();
+    let held0 = bg.rows_held();
     let greedy = order.iter().all(|&i| active[i].temp <= 0.0);
     // coupled draft steps: a greedy round drafts by plain argmax (zero temperatures); a sampled one gets its keys below
     if greedy && bg.coupled() { bg.set_draft_keys(&vec![0.0; order.len()], &[]); }
@@ -675,7 +692,17 @@ fn decode_batch(m: &Model, pol: &Policy, active: &mut [Active], dec: &[usize], s
         active[i].look_used = used[g];
     }
     clk.lap(3, dec.len());
+    // the measured round (verify .. drafts; synchronized by the last draft step) into the online round-time model
+    if online && dec.len() > 1 && !fresh && held0 == bg_rows_after(graphs, &key) {
+        if let Some(prior) = prior {
+            let steps = next.iter().zip(&used).filter(|(_, u)| !**u).map(|(d, _)| d.0.len()).max().unwrap_or(1).saturating_sub(1);
+            super::graph::cost_observe(dec.len(), sampled, prior, kv, steps, t_round.elapsed().as_secs_f64() * 1e3);
+        }
+    }
 }
+
+/// Rows held by the batch graphs of `key` (a change during a round means a capture happened in it).
+fn bg_rows_after(graphs: &HashMap<Vec<usize>, BatchG>, key: &[usize]) -> i64 { graphs.get(key).map_or(-1, |g| g.rows_held()) }
 
 /// Keep the graphs of several stores within QWEN_SERVE_GRAPH_MB (default 3000; ~5 MB per captured verify row):
 /// drop the least recently used sets (single stores are kept).

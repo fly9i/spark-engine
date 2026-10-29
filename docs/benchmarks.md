@@ -4,7 +4,7 @@
 
 | Script | What it measures |
 | --- | --- |
-| `bench/decode_bench.py [prose\|structured] [repeats] [max_tokens] [--temperature T] [--thinking] [--streams 1,2,3,4]` | Decode speed at 1–4 concurrent streams (the DGX Spark community method, see [Decode method](#decode-method-deepseek-and-qwen-2026-10-29-v037)): greedy and thinking off by default, 32-token warm-up, 400 output tokens, a `Request ID` line before each concurrent prompt; per stream `(completion_tokens - 1) / (t_last - t_first)`, aggregate = all decode tokens / wall window; median of `repeats` runs |
+| `bench/decode_bench.py [prose\|structured] [repeats] [max_tokens] [--temperature T] [--thinking] [--streams 1,2,3,4]` | Decode speed at 1–4 concurrent streams (the DGX Spark community method, see [Decode method](#decode-method-deepseek-and-qwen-2026-10-29-v038)): greedy and thinking off by default, 32-token warm-up, 400 output tokens, a `Request ID` line before each concurrent prompt; per stream `(completion_tokens - 1) / (t_last - t_first)`, aggregate = all decode tokens / wall window; median of `repeats` runs |
 | `bench/prefill_bench.py TOKENS [SEED]` | Prefill of a synthetic prompt of about `TOKENS` tokens (random words, so different seeds share no prefix); prints the engine's prefill time and tok/s |
 | `bench/ds41_decode_bench.py [--url URL] [--types prose,structured,code] [--conc 1,2,4]` | The DeepSeek-V4.1-Flash numbers ([ds41.md](ds41.md#7-performance)): greedy, thinking off, 32-token warm-up, 256 tokens per stream, prose / structured / code prompts |
 | `bench/ds41_prefill_bench.py [repeats] [sizes]` | The DeepSeek-V4.1-Flash prefill numbers: 4K–64K prompts of real text, each with a unique prefix, streamed; tok/s = prompt tokens / TTFT, median of `repeats` |
@@ -22,9 +22,9 @@ without either being faster. Compare kernels with per-round timings at fixed row
 
 ## Results
 
-GLM-5.3-Flash and the prefill rows: measured on 2026-10-08 with the release binary and default settings (`spark.env`
+GLM-5.3-Flash (decode and prefill): measured on 2026-10-08 on DGX OS 7.5.0 with the GPU clock locked at 2,200 MHz, with the release binary and default settings (`spark.env`
 defaults, `GLM53_PCACHE=0` for cold prefill), greedy, thinking off, the older `(stream i/n)` suffix on concurrent prompts,
-median of 3. DeepSeek and Qwen decode: 2026-10-29, see [Decode method](#decode-method-deepseek-and-qwen-2026-10-29-v037).
+median of 3. DeepSeek and Qwen decode and Qwen prefill: 2026-10-29, see [Decode method](#decode-method-deepseek-and-qwen-2026-10-29-v038).
 Aggregate decode throughput over all streams; per-stream speed in parentheses.
 
 ### GLM-5.3-Flash, 2× DGX Spark (TP2)
@@ -43,11 +43,12 @@ Aggregate decode throughput over all streams; per-stream speed in parentheses.
 | 54,686 tokens | 35.17 s | 1,555 tok/s |
 | 54,880 tokens | 35.22 s | 1,558 tok/s |
 
-### Decode method (DeepSeek and Qwen, 2026-10-29, v0.3.7)
+### Decode method (DeepSeek and Qwen, 2026-10-29, v0.3.8)
 
 The method commonly used for DGX Spark: `bench/decode_bench.py` against the running server; prompts *prose* (a
 step-by-step explanation of how a hash map works) and *structured* (count from 1 to 200); 400 output tokens per request
-(every reply ran the full 400 here); 1 to 4 concurrent requests, each concurrent request with a `Request ID: decode-<i>`
+(every reply ran the full 400 here); measured on the updated system of the README's "Test system and GPU clock"
+section at default GPU clocks, clock sampled every second, no throttling recorded; 1 to 4 concurrent requests, each concurrent request with a `Request ID: decode-<i>`
 line before the prompt (one request: the prompt alone); 32-token warm-up; median of 5 runs. Two samplings, labelled on
 every column: **greedy, thinking off** (temperature 0) and **T 1, thinking on** (temperature 1, top-p 1; reasoning tokens
 are counted). Per request: (completion tokens − 1) / (last token − first token); aggregate = all decode tokens / the
@@ -60,10 +61,10 @@ Decode (aggregate tok/s; per request in parentheses). The service decodes 4 requ
 
 | Streams | Prose, greedy, thinking off | Structured, greedy, thinking off | Prose, T 1, thinking on | Structured, T 1, thinking on |
 | --- | --- | --- | --- | --- |
-| 1 | 63.9 tok/s (TTFT 178 ms) | 120.5 tok/s (TTFT 168 ms) | 55.4 tok/s (TTFT 277 ms) | 100.7 tok/s (TTFT 227 ms) |
-| 2 | 86.6 (45.9 each, TTFT 310 ms) | 168.5 (86.6 each, TTFT 297 ms) | 77.0 (39.8 each, TTFT 379 ms) | 142.8 (75.4 each, TTFT 384 ms) |
-| 3 | 103.9 (36.4 each, TTFT 413 ms) | 182.6 (63.5 each, TTFT 403 ms) | 90.0 (31.5 each, TTFT 524 ms) | 150.7 (56.1 each, TTFT 513 ms) |
-| 4 | 116.3 (30.6 each, TTFT 516 ms) | 213.3 (56.5 each, TTFT 515 ms) | 97.3 (26.0 each, TTFT 658 ms) | 166.9 (48.1 each, TTFT 654 ms) |
+| 1 | 67.3 tok/s (TTFT 172 ms) | 126.0 tok/s (TTFT 162 ms) | 58.0 tok/s (TTFT 236 ms) | 100.4 tok/s (TTFT 229 ms) |
+| 2 | 91.7 (47.9 each, TTFT 292 ms) | 177.2 (91.0 each, TTFT 280 ms) | 80.8 (42.5 each, TTFT 355 ms) | 157.5 (81.1 each, TTFT 360 ms) |
+| 3 | 108.4 (37.0 each, TTFT 389 ms) | 190.5 (66.2 each, TTFT 384 ms) | 94.2 (33.0 each, TTFT 486 ms) | 157.8 (59.6 each, TTFT 482 ms) |
+| 4 | 122.7 (32.4 each, TTFT 498 ms) | 222.3 (58.8 each, TTFT 491 ms) | 103.6 (27.0 each, TTFT 620 ms) | 165.2 (48.8 each, TTFT 615 ms) |
 
 ### Qwen3.8-Flash-Next, 1× DGX Spark
 
@@ -71,21 +72,21 @@ Decode (aggregate tok/s; per request in parentheses):
 
 | Streams | Prose, greedy, thinking off | Structured, greedy, thinking off | Prose, T 1, thinking on | Structured, T 1, thinking on |
 | --- | --- | --- | --- | --- |
-| 1 | 65.0 tok/s (TTFT 141 ms) | 151.4 tok/s (TTFT 139 ms) | 48.5 tok/s (TTFT 209 ms) | 116.5 tok/s (TTFT 210 ms) |
-| 2 | 93.0 (48.0 each, TTFT 252 ms) | 224.1 (116.0 each, TTFT 250 ms) | 70.6 (39.6 each, TTFT 342 ms) | 97.2 (62.2 each, TTFT 340 ms) |
-| 3 | 115.7 (40.8 each, TTFT 353 ms) | 268.7 (95.0 each, TTFT 362 ms) | 85.2 (31.2 each, TTFT 488 ms) | 100.6 (43.0 each, TTFT 482 ms) |
-| 4 | 133.3 (35.3 each, TTFT 461 ms) | 287.9 (78.0 each, TTFT 482 ms) | 96.8 (27.3 each, TTFT 647 ms) | 119.0 (37.9 each, TTFT 632 ms) |
+| 1 | 68.4 tok/s (TTFT 136 ms) | 157.8 tok/s (TTFT 133 ms) | 51.2 tok/s (TTFT 203 ms) | 122.7 tok/s (TTFT 204 ms) |
+| 2 | 98.0 (50.4 each, TTFT 242 ms) | 230.7 (119.7 each, TTFT 241 ms) | 74.3 (40.8 each, TTFT 330 ms) | 78.1 (40.1 each, TTFT 328 ms) |
+| 3 | 122.4 (43.0 each, TTFT 342 ms) | 280.1 (99.2 each, TTFT 343 ms) | 90.9 (32.8 each, TTFT 467 ms) | 100.9 (39.0 each, TTFT 476 ms) |
+| 4 | 139.2 (36.8 each, TTFT 438 ms) | 310.3 (83.3 each, TTFT 462 ms) | 103.8 (28.5 each, TTFT 615 ms) | 108.0 (36.5 each, TTFT 592 ms) |
 
 With sampling (T 1) the counting prompt at 2–3 concurrent requests is slower in aggregate than one request; the five runs
-agree (2 requests 94–98 tok/s), so this is the batched sampled path on highly predictable text, not noise. The prefill
-rows below are from 2026-10-08.
+agree (2 requests 77.8–80.6 tok/s), so this is the batched sampled path on highly predictable text, not noise. Prefill
+(below) was measured on 2026-10-29 with the same build.
 
 | Prompt | Prefill time | Prefill speed |
 | --- | --- | --- |
-| 13,449 tokens | 7.16 s | 1,879 tok/s |
-| 13,456 tokens | 7.00 s | 1,922 tok/s |
-| 77,204 tokens | 41.20 s | 1,874 tok/s |
-| 77,274 tokens | 41.17 s | 1,877 tok/s |
+| 13,449 tokens | 6.54 s | 2,056 tok/s |
+| 13,456 tokens | 6.46 s | 2,084 tok/s |
+| 77,204 tokens | 38.72 s | 1,994 tok/s |
+| 77,274 tokens | 39.10 s | 1,976 tok/s |
 
 TTFT grows with the number of streams because new requests are admitted between decode rounds of the running ones.
 Multi-turn follow-ups reuse the previous turn's state: on a 16K-token conversation the next turn's TTFT with Qwen is

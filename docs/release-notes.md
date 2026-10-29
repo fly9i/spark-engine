@@ -1,46 +1,43 @@
-spark-engine v0.3.7 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
+spark-engine v0.3.8 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
 
-Changes since v0.3.6: Qwen3.8-Flash-Next only (GLM-5.3-Flash and DeepSeek-V4.1-Flash outputs were checked identical:
-release goldens, prefill-path dumps and GLM / Qwen fixed-prompt texts match v0.3.6). Every change keeps Qwen's verified
-output unchanged: greedy replies are bitwise identical, sampled replies identical per seed.
+Changes since v0.3.7: Qwen3.8-Flash-Next engine changes, a DeepSeek start-script fix and re-measured numbers. GLM-5.3-Flash
+and DeepSeek-V4.1-Flash engine code is unchanged; their outputs were checked identical (DeepSeek release goldens and
+paired-prefill checks bitwise identical, GLM teacher-forced logits identical to an earlier export: KL 0.00000, top-1
+1.0000 over 167,943 positions). Every Qwen change keeps the verified output unchanged: greedy replies bitwise identical,
+sampled replies identical per seed.
 
-Startup (load → serving, cold): ~54 s → **~19 s**.
+**Fix — DeepSeek start script**: `engine-rs/serve/start-ds41.sh` waited for every background job, including the rank 0
+engine, which runs until stopped, so the front end was never started (since v0.3.3). It now waits only for the two ssh
+launches of ranks 1 and 2.
 
-Served decode at temperature 1 (fixed seeds, the same texts in every arm, tok/s summed over streams), v0.3.6 → v0.3.7:
+**Qwen prefill** (all bitwise identical): 12K-token prompt 6.155 → 5.83 s (−5.3%), 64K 33.29 → 31.42 s (−5.6%).
+- QSA attention: fp8 K/V shared-memory row stride 256 → 272 bytes (the 8 rows of a fragment load hit one bank, an
+  8-way conflict), in the prefill flash kernel and the decode / verify kernels.
+- QSA prefill attention: K and V share one tile buffer (V's `cp.async` issued after scoring, overlapping the softmax),
+  shared memory 40 → 22.7 KB, 4 blocks per SM.
+- HC prefill: the residual-stream reads of the upmix tail are issued before the GEMM main loop, hiding DRAM latency.
 
-| Streams | Chinese prose | Story | Essay question |
-| --- | --- | --- | --- |
-| 1 | 37.8 → 38.6 (+2.1%) | 45.8 → 47.0 (+2.8%) | 50.4 → 53.8 (+6.7%) |
-| 4 | 70.5 → 82.7 (+17.4%) | 78.5 → 89.9 (+14.7%) | 98.8 → 105.0 (+6.3%) |
+**Qwen decode scheduling**:
+- `QWEN_SPEC_COST_ONLINE` (default on): the rate rule's round-time model is fitted online (recursive least squares per
+  batch size and round type, the static `QWEN_SPEC_COST` as prior, slopes bounded to 0.5–2.5× of it). It only changes
+  which verify width is chosen; sampled 4-stream decode +0.7–2.9%, greedy unchanged.
+- `QWEN_SPEC_RAGGED` (default off): per-sequence verify widths inside a batch; output unchanged but slower in the
+  service, kept for experiments.
 
-(Interleaved A B B A service runs, each arm a fresh start; mean of the two runs per arm; every reply identical between
-the versions per request and seed.)
+**Test system and numbers**: the measuring nodes were updated to DGX OS 7.6.0 (kernel 7.0.0-1019, driver 580.178.04,
+new EC / UEFI / ConnectX-7 firmware), and a leftover service that had locked the GPU clock at 2,200 MHz was removed;
+earlier numbers were measured with that lock. All DeepSeek and Qwen tables in the README, `docs/benchmarks.md` and
+`docs/ds41.md` were re-measured on the updated system at default clocks (sustained runs, clock sampled every second, no
+throttling recorded). `bench/decode_bench.py`, greedy, thinking off, 1 / 2 / 3 / 4 streams, median of 5:
 
-Greedy decode (`bench/decode_bench.py`, median of 3): prose 65.4 / 88.2 / 107.9 / 123.3 tok/s and structured
-152.3 / 196.6 / 234.5 / 227.9 tok/s at 1 / 2 / 3 / 4 streams. Greedy prose at 3 / 4 streams gained about 2% from the
-GDN commit folding (105.5 → 107.9 and 120.3 → 122.2 in the same-day A/B); the rest of the changes target sampled
-requests and the batched rounds that contain them.
+| | Prose | Structured |
+| --- | --- | --- |
+| DeepSeek-V4.1-Flash (3× DGX Spark) | 67.3 / 91.7 / 108.4 / 122.7 tok/s | 126.0 / 177.2 / 190.5 / 222.3 tok/s |
+| Qwen3.8-Flash-Next (1× DGX Spark) | 68.4 / 98.0 / 122.4 / 139.2 tok/s | 157.8 / 230.7 / 280.1 / 310.3 tok/s |
 
-- **Read-ahead loading** (`QWEN_LOAD_AHEAD`, default on): one thread reads each layer's byte ranges of the shards with
-  O_DIRECT into huge-page host buffers ahead of use; one kernel copies a layer's ~6,200 tensors to their places on the GPU
-  (the GPU reads the host buffer in place). Page-cache reads ran at ~1.4 GB/s, O_DIRECT at ~10–12 GB/s. The read-ahead
-  is a shared module (`src/readahead.rs`) now also used by the DeepSeek loader.
-- **Coupled drafts for sampled requests** (`QWEN_DRAFT_COUPLED`, default on): a draft takes the argmax of its logits plus
-  the same Gumbel noise the verify will add at that position, so it guesses the token that will actually be sampled.
-  Accepted drafts per round at T = 1 0.84 → 0.90.
-- **GDN commit folded into the next verify** (`QWEN_GDN_FUSED_COMMIT`, default on): the accepted rows' gated-DeltaNet
-  state updates are no longer a separate pass over the 36 layers' states; their inputs are kept per sequence and the next
-  round's recurrence kernel applies them first (same operations, same order). 4 streams +1.3–4.9%.
-- **Verify width by rate in rounds with a sampled sequence** (`QWEN_SPEC_RATE=t`, default): the batch verifies the number
-  of drafts that maximizes expected tokens per estimated round time instead of a fixed two-width rule, and keeps drafting
-  only while one more step would pay off. All-greedy rounds keep the previous rule (on a greedy prose benchmark the rate
-  rule was 1–4% slower even with a separately fitted greedy cost, `QWEN_SPEC_COST_GREEDY`).
-- **Online acceptance calibration** (`QWEN_SPEC_ONLINE`, default on): the rate rule's acceptance estimates per
-  confidence bucket are learned while serving (per sequence and process-wide, greedy and sampled apart), with the
-  built-in table as prior. 2 / 4 streams at T = 1: −0.6 to +4.4%.
-- **Narrow launches for small EXL3 GEMVs** (`QWEN_EXL3_NARROW`, default on): decode GEMVs with fewer than 128 blocks
-  (N = 512 / 640 or K = 640) use 2-warp blocks of one 16-column tile; same per-output MMA order. 5–20% faster per kernel;
-  end to end within noise. The large dense EXL3 shapes already read at 207–227 GB/s (GB10 cold-read limit ~232 GB/s).
-- Measured and not adopted: the rate rule in greedy rounds (above); the MoE expert GEMVs on GLM's persistent schedule
-  (no gain); PDL on every Qwen kernel (−0.6 to −1.2%); verifying a second-choice sibling at the first rejection; a 12-bit
-  coding of the F16 weights (4% on the down projections only). New switches: [docs/qwen-switches.md](qwen-switches.md).
+Prefill: DeepSeek ~5,550 tok/s for 8K–64K prompts of new text (4K ~4,750), Qwen 2,056 / 2,084 tok/s at 13K and
+1,994 / 1,976 tok/s at 77K tokens.
+
+**Docs**: README sections "Test system and GPU clock" (component versions, default clocks vs a 2,200 MHz lock),
+"Measured by other users" and an FAQ (context below 1M, slow prefill and RDMA link checks, startup time, decode
+differences, node hangs); new switch rows in `docs/qwen-switches.md`.

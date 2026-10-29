@@ -471,6 +471,7 @@ impl Moe {
         ffi::moe_gate_scale(&gl, 512, &dd, &sh);
         let ws = emp(&[ffi::moe_ws_bytes(r, 4)], Kind::Uint8);
         let out = emp(&[r, D], Kind::Float);
+        let (idx, w) = moe_pad(idx, w);
         ffi::moe_experts(&x, r, &idx, &w, &self.tab, Some(&sh), &out, &ws, 4);
         out
     }
@@ -522,6 +523,7 @@ impl Moe {
         let s = if r > dec_rows() { 1 } else { 4 };
         let ws = emp(&[ffi::moe_ws_bytes(r, s)], Kind::Uint8);
         let out = emp(&[r, D], Kind::Float);
+        let (idx, w) = moe_pad(idx, w);
         ffi::moe_experts(x, r, &idx, &w, &self.tab, Some(&shared), &out, &ws, s);
         out
     }
@@ -1105,6 +1107,28 @@ thread_local! {
 }
 /// Run `f` (a verify capture) with the fused commit.
 pub fn with_fused_commit<T>(f: impl FnOnce() -> T) -> T { FUSE.with(|c| c.set(true)); let r = f(); FUSE.with(|c| c.set(false)); r }
+thread_local! {
+    /// set around a batch verify capture with per-sequence verify widths (graph.rs, QWEN_SPEC_RAGGED): src [rows] i64,
+    /// the row whose routed experts each row uses (itself, or for a padding row past its sequence's width that
+    /// sequence's first row)
+    static MOE_SRC: std::cell::RefCell<Option<Tensor>> = const { std::cell::RefCell::new(None) };
+}
+/// Run `f` (a verify capture) with the MoE rows routed as `src` says (see MOE_SRC).
+pub fn with_moe_src<T>(src: &Tensor, f: impl FnOnce() -> T) -> T {
+    MOE_SRC.with(|c| *c.borrow_mut() = Some(src.shallow_clone()));
+    let r = f();
+    MOE_SRC.with(|c| *c.borrow_mut() = None);
+    r
+}
+/// Padding rows take another row's experts and weights (MOE_SRC): they add no expert to the step, so the experts'
+/// weights are read as for the valid rows alone; each row's own product is computed as before (rows independent),
+/// and a padding row's output is never accepted.
+fn moe_pad(idx: Tensor, w: Tensor) -> (Tensor, Tensor) {
+    match MOE_SRC.with(|c| c.borrow().as_ref().map(|t| t.shallow_clone())) {
+        Some(src) if src.size()[0] == idx.size()[0] => (idx.index_select(0, &src), w.index_select(0, &src)),
+        _ => (idx, w),
+    }
+}
 impl Seq {
     /// The fused-commit buffers (allocated on first use: call before a graph capture).
     pub fn gpend(&self) -> &GPend {

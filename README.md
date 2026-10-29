@@ -21,27 +21,27 @@ One binary runs every model; `start.sh glm|glm3|ds41|qwen` picks one.
 
 ## At a glance
 
-**How decode is measured** (DeepSeek and Qwen, 2026-10-29, v0.3.7; the method commonly used for DGX Spark):
+**How decode is measured** (DeepSeek and Qwen, 2026-10-29, v0.3.8; the method commonly used for DGX Spark):
 `bench/decode_bench.py` against the running server, two prompts — *prose* (a step-by-step explanation of how a hash map
 works) and *structured* (count from 1 to 200) — 400 output tokens per request, 1 to 4 concurrent requests (each
 concurrent request has a `Request ID: decode-<i>` line before the prompt), median of 5 runs. Every row says its
 sampling: **greedy, thinking off** (temperature 0) or **T 1, thinking on** (temperature 1, reasoning tokens counted).
 Aggregate = all decode tokens / the window from the first token of the earliest request to the last token of the
 latest. GLM's rows are older (2026-10-08, v0.1.1, greedy, thinking off, a `(stream i/n)` suffix instead of the
-`Request ID` line). Prefill, TTFT and startup: DeepSeek prefill 2026-10-26, Qwen prefill 2026-10-08, startup 2026-10-28.
-More: [docs/benchmarks.md](docs/benchmarks.md), [docs/ds41.md](docs/ds41.md#7-performance). The table below was measured on
-DGX OS 7.5.0 with the GPU clock locked at 2,200 MHz; DeepSeek numbers after the 2026-10-29 system update, with and
-without that lock, are in [Test system and GPU clock](#test-system-and-gpu-clock).
+`Request ID` line). Prefill, TTFT and startup: DeepSeek and Qwen prefill 2026-10-29, startup 2026-10-28.
+More: [docs/benchmarks.md](docs/benchmarks.md), [docs/ds41.md](docs/ds41.md#7-performance). DeepSeek and Qwen were measured
+on the updated system of [Test system and GPU clock](#test-system-and-gpu-clock) at default GPU clocks (sustained runs,
+clock sampled every second, no throttling recorded); GLM's column is older (DGX OS 7.5.0, GPU clock locked at 2,200 MHz).
 
 | | **GLM-5.3-Flash** | **DeepSeek-V4.1-Flash** | **Qwen3.8-Flash-Next** |
 | --- | --- | --- | --- |
 | Hardware | 2× DGX Spark (TP2, RoCE); 3× also supported | 3× DGX Spark (TP3, RoCE mesh) | 1× DGX Spark |
 | Architecture | 45 layers: KDA linear-attn + MLA/DSA sparse-attn, 288-expert MoE | 40 layers (20 encoder + 20 decoder): compressed sparse attention with a hierarchical indexer, 384-expert top-6 MoE, Engram n-gram tables, mHC | 48 layers: gated-DeltaNet + QSA sparse-attn, 512-expert top-10 MoE, per-layer n-gram |
-| **Decode — prose, greedy, thinking off** (1/2/3/4 streams) | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 63.9 / 86.6 / 103.9 / 116.3 tok/s | 65.0 / 93.0 / 115.7 / 133.3 tok/s |
-| **Decode — structured, greedy, thinking off** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 120.5 / 168.5 / 182.6 / 213.3 tok/s | 151.4 / 224.1 / 268.7 / 287.9 tok/s |
-| **Decode — prose, T 1, thinking on** (1/2/3/4 streams) | not measured | 55.4 / 77.0 / 90.0 / 97.3 tok/s | 48.5 / 70.6 / 85.2 / 96.8 tok/s |
-| **Decode — structured, T 1, thinking on** (1/2/3/4 streams) | not measured | 100.7 / 142.8 / 150.7 / 166.9 tok/s | 116.5 / 97.2 / 100.6 / 119.0 tok/s |
-| **Prefill** | ~1,560 tok/s (10K–55K prompts) | ~5,400 tok/s (8K–64K prompts, new text; 4K ~4,600) | ~1,900 tok/s (13K–77K prompts) |
+| **Decode — prose, greedy, thinking off** (1/2/3/4 streams) | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 67.3 / 91.7 / 108.4 / 122.7 tok/s | 68.4 / 98.0 / 122.4 / 139.2 tok/s |
+| **Decode — structured, greedy, thinking off** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 126.0 / 177.2 / 190.5 / 222.3 tok/s | 157.8 / 230.7 / 280.1 / 310.3 tok/s |
+| **Decode — prose, T 1, thinking on** (1/2/3/4 streams) | not measured | 58.0 / 80.8 / 94.2 / 103.6 tok/s | 51.2 / 74.3 / 90.9 / 103.8 tok/s |
+| **Decode — structured, T 1, thinking on** (1/2/3/4 streams) | not measured | 100.4 / 157.5 / 157.8 / 165.2 tok/s | 122.7 / 78.1 / 100.9 / 108.0 tok/s |
+| **Prefill** | ~1,560 tok/s (10K–55K prompts) | ~5,550 tok/s (8K–64K prompts, new text; 4K ~4,750) | ~2,000 tok/s (13K–77K prompts) |
 | **TTFT** (short prompt) | ~370 ms | ~200 ms; 185 ms for a 7K prompt restored from the NVMe prefix cache | ~140 ms |
 | **Startup** (load → serving) | ~33 s | ~16 s (cold start, shards read from NVMe) | ~19 s (cold start) |
 | Speculative decoding | DFlash2 drafter, tree/chain verify | DSpark (the checkpoint's draft stages), drafts per sequence from a cost model | native MTP + prompt-lookup |
@@ -211,7 +211,9 @@ The three DGX Sparks (GB10) used for the numbers in this repository, after the s
 Host settings: `vm.compaction_proactiveness = 0`, `vm.watermark_boost_factor = 0`, no swap, deep CPU idle states
 disabled (WFI kept). Until 2026-10-29 the nodes ran DGX OS 7.5.0 (kernel 6.17, driver 580.173.02, older EC / UEFI /
 ConnectX-7 firmware) and a leftover service locked the GPU clock at 2,200 MHz; the earlier numbers in this repository
-were measured that way.
+were measured that way. In sustained runs of `bench/decode_bench.py` on the updated system (about 11 minutes per
+setting, clock sampled every second, no throttling recorded in either) default clocks and the 2,200 MHz lock were within
+±5% of each other, greedy 1–2% faster at default clocks.
 
 DeepSeek-V4.1-Flash-1017 (TP3) on the updated system, default clocks and with the clock locked at 2,200 MHz
 (`nvidia-smi -lgc 2200`). Same build and settings for both (default settings plus the optional conditional clamp,

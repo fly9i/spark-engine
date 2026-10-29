@@ -316,6 +316,16 @@ __global__ __launch_bounds__(256) void upmix_kernel(const half* __restrict__ t, 
     float c[2][4][4] = {};
     constexpr int NKC = RK / UM_KC;
     load(0, 0);
+    // the epilogue's residual-stream values, loaded now so their DRAM latency overlaps the GEMM
+    float xv[UM_BM * UM_BI / 256][4];
+    #pragma unroll
+    for (int j = 0; j < UM_BM * UM_BI / 256; ++j)
+    {
+        const int q = tid + 256 * j, row = q / UM_BI, ii = q % UM_BI, r = r0 + row, i = i0 + ii;
+        const float* xr = X + (int64_t) min(r, R - 1) * F;
+        #pragma unroll
+        for (int s = 0; s < 4; ++s) xv[j][s] = __ldcs(xr + s * D + i);
+    }
     for (int kc = 0; kc < NKC; ++kc)
     {
         if (kc + 1 < NKC) { load(kc + 1, (kc + 1) & 1); asm volatile("cp.async.wait_group 1;\n" ::); }
@@ -364,16 +374,16 @@ __global__ __launch_bounds__(256) void upmix_kernel(const half* __restrict__ t, 
             sg[(row + 8) * UM_GLD + col] = c[mt][nt][2]; sg[(row + 8) * UM_GLD + col + 1] = c[mt][nt][3];
         }
     __syncthreads();
-    for (int q = tid; q < UM_BM * UM_BI; q += 256)
+    #pragma unroll
+    for (int j = 0; j < UM_BM * UM_BI / 256; ++j)
     {
-        const int row = q / UM_BI, ii = q % UM_BI, r = r0 + row, i = i0 + ii;
+        const int q = tid + 256 * j, row = q / UM_BI, ii = q % UM_BI, r = r0 + row, i = i0 + ii;
         if (r >= R) break;
-        const float* xr = X + (int64_t) r * F;
         float v[4];
         #pragma unroll
         for (int s = 0; s < 4; ++s)
         {
-            const float n = xr[s * D + i] * scale[r * 4 + s] * w1[s * D + i];
+            const float n = xv[j][s] * scale[r * 4 + s] * w1[s * D + i];
             v[s] = n / (1.0f + __expf(-sg[row * UM_GLD + s * UM_BI + ii]));
         }
         mixed[(int64_t) r * D + i] = ((v[0] + v[1]) + (v[2] + v[3])) * 0.25f;

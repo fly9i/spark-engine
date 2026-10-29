@@ -200,7 +200,7 @@ fn batch_arm(m: &Model, prompts: &[Vec<i64>], rounds: usize, arm: &str, mut log:
     let t_cap = Instant::now();
     let mut bg = BatchG::capture(m, &seqs.iter().collect::<Vec<_>>(), pol.cap());
     // every verify width the policy can pick, captured before the timed rounds (the rate rule uses up to eight)
-    for w in 1..=pol.cap() { if pol.rate.is_none() && w != pol.k.min(pol.cap()) && w != pol.cap() { continue; } bg.prepare(m, &seqs.iter().collect::<Vec<_>>(), w + 1); }
+    for w in 1..=pol.cap() { if pol.rate.is_none() && !pol.ragged && w != pol.k.min(pol.cap()) && w != pol.cap() { continue; } bg.prepare(m, &seqs.iter().collect::<Vec<_>>(), w + 1); }
     let mut ms = [0.0f64; 3];
     let mut toks = 0usize;
     let mut rows_v = 0usize;
@@ -227,22 +227,29 @@ fn batch_arm(m: &Model, prompts: &[Vec<i64>], rounds: usize, arm: &str, mut log:
         let ests: Vec<Vec<f64>> = state.iter().zip(&cals).map(|((_, _, c), k)| k.ests(c)).collect();
         let kv = if pol.rate.is_some() { pol.rate_width(&ests.iter().map(|e| e.as_slice()).collect::<Vec<_>>()) }
                  else { pol.width(&state.iter().map(|(_, _, c)| pol.verify_len(c)).collect::<Vec<_>>()) }.min(state.iter().map(|s| s.1.len()).min().unwrap());
+        let chain = state.iter().map(|s| s.1.len()).min().unwrap();
+        // per-sequence widths (QWEN_SPEC_RAGGED): verify the widest, the others' extra rows are padding
+        let ws: Vec<usize> = if pol.ragged {
+            let accs: Vec<Vec<f64>> = state.iter().zip(&ests).map(|((_, _, c), e)| if pol.rate.is_some() { e.clone() } else { c.clone() }).collect();
+            pol.ragged_widths(&accs.iter().map(|e| e.as_slice()).collect::<Vec<_>>()).into_iter().map(|w| w.min(chain).max(1)).collect()
+        } else { vec![kv; state.len()] };
+        let kv = *ws.iter().max().unwrap();
         let r1 = kv + 1;
         hist[kv] += 1;
         let rows: Vec<Vec<i64>> = state.iter().map(|(n, d, _)| { let mut r = vec![*n]; r.extend_from_slice(&d[..kv]); r }).collect();
         // QWEN_HOST_ACCEPT=1 (A/B): the host-path accept (verify, argmax copy, host-written commit / catch-up inputs)
         let host_acc = std::env::var("QWEN_HOST_ACCEPT").is_ok();
         let gt: Vec<Vec<i64>> = if host_acc {
-            let (lg, _) = bg.verify(m, &seqs.iter().collect::<Vec<_>>(), &rows, &vec![kv; seqs.len()]);
+            let (lg, _) = bg.verify(m, &seqs.iter().collect::<Vec<_>>(), &rows, &ws);
             Vec::<i64>::try_from(lg.argmax(-1, false).to_device(Device::Cpu)).unwrap().chunks(r1).map(|c| c.to_vec()).collect()
-        } else { bg.round_greedy(m, &seqs.iter().collect::<Vec<_>>(), &rows, &vec![kv; seqs.len()]).0 };
+        } else { bg.round_greedy(m, &seqs.iter().collect::<Vec<_>>(), &rows, &ws).0 };
         lap(0, &mut t);
         let mut ns = Vec::new();
         let mut cids = Vec::new();
         for g in 0..seqs.len() {
             let mut a = 0;
-            while a < kv && gt[g][a] == rows[g][a + 1] { a += 1; }
-            if look_used[g] { look_rounds += 1; } else { cals[g].observe(&state[g].2, kv, a); }
+            while a < ws[g] && gt[g][a] == rows[g][a + 1] { a += 1; }
+            if look_used[g] { look_rounds += 1; } else { cals[g].observe(&state[g].2, ws[g], a); }
             looks[g].record(look_used[g], a + 1);
             if let Some((p, _)) = &props[g] {
                 let truth: Vec<i64> = rows[g][1..=a].iter().copied().chain([gt[g][a]]).collect();

@@ -16,6 +16,8 @@
 namespace qqsa {
 
 constexpr int HQ = 24, HK = 2, D = 256, ROT = 64, IH = 4, ID = 128, RING = 32;
+// shared-memory row stride of staged fp8 K / V rows (bytes): 256 + 16 keeps the 8 rows of a fragment load in distinct banks
+constexpr int FL_LD = D + 16;
 
 // inv_freq[0][i] = theta^(-2i/64) in double like the reference, computed once on the device by the same expression (FP64 exp /
 // log per element were most of qsa_prep's time on GB10). inv_freq[1]: YaRN (factor 4 over the native 262144 positions, as the
@@ -422,7 +424,7 @@ __global__ __launch_bounds__(128) void attn_tc_kernel(
     float* __restrict__ part_ml, float* __restrict__ part_acc, int splits)
 {
     constexpr int TS = SPLIT_TOK, SP = TS + 4;
-    __shared__ __align__(16) uint8_t sV[TS * D];
+    __shared__ __align__(16) uint8_t sV[TS * FL_LD];   // FL_LD row stride: see attn_fl_kernel
     __shared__ float sS[16 * SP];
     __shared__ float sVs[TS], sKs[TS], sM[16], sL[16];
     __shared__ int sTok[TS];
@@ -454,7 +456,7 @@ __global__ __launch_bounds__(128) void attn_tc_kernel(
     {
         int t = i / (D / 16), c = i % (D / 16), tok = sTok[t];
         uint4 v = tok >= 0 ? *(const uint4*) (vc + ((int64_t) tok * HK + kh) * D + c * 16) : make_uint4(0, 0, 0, 0);
-        *(uint4*) (sV + t * D + c * 16) = v;
+        *(uint4*) (sV + t * FL_LD + c * 16) = v;
     }
     // Q fragments (rows = heads, 12 valid), 16 k-steps of 16 dims
     uint32_t qa[16][4];
@@ -533,8 +535,8 @@ __global__ __launch_bounds__(128) void attn_tc_kernel(
         for (int j = 0; j < 8; ++j)
         {
             const int d = warp * 64 + j * 8 + qr;
-            uint32_t b0 = h2u(__hmul2(fp8x2(sV + tk * D + d, sV + (tk + 1) * D + d), s01));
-            uint32_t b1 = h2u(__hmul2(fp8x2(sV + (tk + 8) * D + d, sV + (tk + 9) * D + d), s89));
+            uint32_t b0 = h2u(__hmul2(fp8x2(sV + tk * FL_LD + d, sV + (tk + 1) * FL_LD + d), s01));
+            uint32_t b1 = h2u(__hmul2(fp8x2(sV + (tk + 8) * FL_LD + d, sV + (tk + 9) * FL_LD + d), s89));
             mma16816(o[j], a, b0, b1);
         }
     }
@@ -571,7 +573,7 @@ __global__ __launch_bounds__(128) void attn_tcp_kernel(
     float* __restrict__ part_ml, float* __restrict__ part_acc, int splits)
 {
     constexpr int TS = SPLIT_TOK, SP = TS + 4;
-    __shared__ __align__(16) uint8_t sV[TS * D];
+    __shared__ __align__(16) uint8_t sV[TS * FL_LD];   // FL_LD row stride: see attn_fl_kernel
     __shared__ float sS[16 * SP];
     __shared__ float sVs[TS], sKs[TS], sM[16], sL[16];
     __shared__ int sTok[TS];
@@ -602,7 +604,7 @@ __global__ __launch_bounds__(128) void attn_tcp_kernel(
     {
         int t = i / (D / 16), c = i % (D / 16), tok = sTok[t];
         uint4 v = tok >= 0 ? *(const uint4*) (vc + ((int64_t) tok * HK + kh) * D + c * 16) : make_uint4(0, 0, 0, 0);
-        *(uint4*) (sV + t * D + c * 16) = v;
+        *(uint4*) (sV + t * FL_LD + c * 16) = v;
     }
     // S = Q K^T for tokens [32 warp, 32 warp + 32)
     {
@@ -688,8 +690,8 @@ __global__ __launch_bounds__(128) void attn_tcp_kernel(
         for (int j = 0; j < 8; ++j)
         {
             const int d = warp * 64 + j * 8 + qr;
-            const uint32_t b0 = h2u(fp8x2(sV + tk * D + d, sV + (tk + 1) * D + d));
-            const uint32_t b1 = h2u(fp8x2(sV + (tk + 8) * D + d, sV + (tk + 9) * D + d));
+            const uint32_t b0 = h2u(fp8x2(sV + tk * FL_LD + d, sV + (tk + 1) * FL_LD + d));
+            const uint32_t b1 = h2u(fp8x2(sV + (tk + 8) * FL_LD + d, sV + (tk + 9) * FL_LD + d));
             float th[4] = {}, tl[4] = {};
             mma16816(th, ah, b0, b1);
             mma16816(tl, al, b0, b1);
@@ -724,13 +726,19 @@ __device__ __forceinline__ void cpa16(void* s, const void* g)
     unsigned a = (unsigned) __cvta_generic_to_shared(s);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(a), "l"(g));
 }
-__global__ __launch_bounds__(128) void attn_fl_kernel(
+__global__ __launch_bounds__(128, 4) void attn_fl_kernel(
     const float* __restrict__ q, int R, const int* __restrict__ pos0p, const int* __restrict__ sel, const int* __restrict__ cnt, int sel_ld,
     const uint8_t* __restrict__ kc, const float* __restrict__ ksc, const uint8_t* __restrict__ vc, const float* __restrict__ vsc,
     const float* __restrict__ gate, float* __restrict__ out)
 {
     constexpr int SP = FT + 4;
-    __shared__ __align__(16) uint8_t sK[FT * D], sV[FT * D];
+    // K / V rows FL_LD = 272 bytes apart: with 256 the 8 token rows of a fragment load share one bank (8-way conflicts on
+    // the 2-byte K and 1-byte V reads); 272 spreads them over 8 banks (same values, bitwise equal).
+    // one tile buffer for K, then V: V's load is issued once the scores are done and overlaps the softmax (22.5 KB of
+    // shared memory instead of 40: three blocks per SM instead of two)
+    __shared__ __align__(16) uint8_t sKV[FT * FL_LD];
+    uint8_t* const sK = sKV;
+    uint8_t* const sV = sKV;
     __shared__ float sS[16 * SP];
     __shared__ float sKs[FT], sVs[FT], sM[16], sL[16], sC[16];
     __shared__ int sTok[FT];
@@ -770,12 +778,8 @@ __global__ __launch_bounds__(128) void attn_fl_kernel(
         for (int i = tid; i < FT * (D / 16); i += 128)
         {
             int t = i / (D / 16), c = i % (D / 16), tok = sTok[t];
-            if (tok >= 0)
-            {
-                cpa16(sK + t * D + c * 16, kc + ((int64_t) tok * HK + kh) * D + c * 16);
-                cpa16(sV + t * D + c * 16, vc + ((int64_t) tok * HK + kh) * D + c * 16);
-            }
-            else { *(uint4*) (sK + t * D + c * 16) = make_uint4(0, 0, 0, 0); *(uint4*) (sV + t * D + c * 16) = make_uint4(0, 0, 0, 0); }
+            if (tok >= 0) cpa16(sK + t * FL_LD + c * 16, kc + ((int64_t) tok * HK + kh) * D + c * 16);
+            else *(uint4*) (sK + t * FL_LD + c * 16) = make_uint4(0, 0, 0, 0);
         }
         asm volatile("cp.async.commit_group;\n" ::);
         asm volatile("cp.async.wait_group 0;\n" ::);
@@ -785,7 +789,7 @@ __global__ __launch_bounds__(128) void attn_fl_kernel(
         for (int j = 0; j < 2; ++j)
         {
             const int tb = warp * 16 + j * 8;
-            const uint8_t* kr = sK + (tb + qr) * D;
+            const uint8_t* kr = sK + (tb + qr) * FL_LD;
             float c[4] = {};
             #pragma unroll
             for (int ks = 0; ks < 16; ++ks)
@@ -800,7 +804,14 @@ __global__ __launch_bounds__(128) void attn_fl_kernel(
                 sS[row * SP + col] = col < nt ? c[i] * sKs[col] : -FLT_MAX;
             }
         }
-        __syncthreads();
+        __syncthreads();   // the scores are done with K: V into the buffer
+        for (int i = tid; i < FT * (D / 16); i += 128)
+        {
+            int t = i / (D / 16), c = i % (D / 16), tok = sTok[t];
+            if (tok >= 0) cpa16(sV + t * FL_LD + c * 16, vc + ((int64_t) tok * HK + kh) * D + c * 16);
+            else *(uint4*) (sV + t * FL_LD + c * 16) = make_uint4(0, 0, 0, 0);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
         // online softmax: warp w owns head rows 4w..4w+3
         #pragma unroll
         for (int i = 0; i < 4; ++i)
@@ -826,6 +837,7 @@ __global__ __launch_bounds__(128) void attn_fl_kernel(
                 sC[row] = corr; sM[row] = mn; sL[row] = sL[row] * corr + l;
             }
         }
+        asm volatile("cp.async.wait_group 0;\n" ::);
         __syncthreads();
         // O = O * corr + P V for dims [64 warp, 64 warp + 64)
         const float c0 = sC[qr], c1 = sC[qr + 8];
@@ -845,8 +857,8 @@ __global__ __launch_bounds__(128) void attn_fl_kernel(
             for (int j = 0; j < 8; ++j)
             {
                 const int d = warp * 64 + j * 8 + qr;
-                uint32_t b0 = h2u(__hmul2(fp8x2(sV + tk * D + d, sV + (tk + 1) * D + d), s01));
-                uint32_t b1 = h2u(__hmul2(fp8x2(sV + (tk + 8) * D + d, sV + (tk + 9) * D + d), s89));
+                uint32_t b0 = h2u(__hmul2(fp8x2(sV + tk * FL_LD + d, sV + (tk + 1) * FL_LD + d), s01));
+                uint32_t b1 = h2u(__hmul2(fp8x2(sV + (tk + 8) * FL_LD + d, sV + (tk + 9) * FL_LD + d), s89));
                 mma16816(o[j], a, b0, b1);
             }
         }

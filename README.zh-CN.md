@@ -18,22 +18,22 @@ RDMA all-reduce、FP8 KV、NVMe 前缀缓存、服务前端。只链接 PyTorch 
 
 ## 概览
 
-**解码测速方法**（DeepSeek 与 Qwen，2026-10-29，v0.3.7；与 DGX Spark 社区常用的方法一致）：用 `bench/decode_bench.py` 测运行中的服务，两种提示——
+**解码测速方法**（DeepSeek 与 Qwen，2026-10-29，v0.3.8；与 DGX Spark 社区常用的方法一致）：用 `bench/decode_bench.py` 测运行中的服务，两种提示——
 *prose*（逐步讲解哈希表原理）与 *structured*（从 1 数到 200）——每个请求输出 400 token，1~4 路并发（多路时每路提示前加一行 `Request ID: decode-<i>`），
 每档 5 次取中位数。每行注明采样方式：**贪心、关思考**（温度 0）或 **T 1、开思考**（温度 1，思考 token 计入）。聚合 = 全部解码 token ÷ 从最早一路首 token
 到最晚一路末 token 的时间窗。GLM 的数据较旧（2026-10-08，v0.1.1，贪心、关思考，多路用句尾 `(stream i/n)` 而不是 `Request ID` 行）。预填、TTFT 与启动：
-DeepSeek 预填 2026-10-26，Qwen 预填 2026-10-08，启动 2026-10-28。更多见 [docs/benchmarks.zh-CN.md](docs/benchmarks.zh-CN.md)、[docs/ds41.zh-CN.md](docs/ds41.zh-CN.md#7-性能)。下表是在 DGX OS 7.5.0、
-GPU 时钟锁定 2,200 MHz 时测的；2026-10-29 系统更新后 DeepSeek 在锁频与不锁频下的数据见[测试系统与 GPU 频率](#测试系统与-gpu-频率)。
+DeepSeek 与 Qwen 预填 2026-10-29，启动 2026-10-28。更多见 [docs/benchmarks.zh-CN.md](docs/benchmarks.zh-CN.md)、[docs/ds41.zh-CN.md](docs/ds41.zh-CN.md#7-性能)。DeepSeek 与 Qwen 在
+[测试系统与 GPU 频率](#测试系统与-gpu-频率)所述的更新后系统上、默认 GPU 时钟下测得（连续满载，每秒采样时钟，未记录到降频）；GLM 一列是旧数据（DGX OS 7.5.0，GPU 时钟锁定 2,200 MHz）。
 
 | | **GLM-5.3-Flash** | **DeepSeek-V4.1-Flash** | **Qwen3.8-Flash-Next** |
 | --- | --- | --- | --- |
 | 硬件 | 2× DGX Spark（TP2，RoCE）；也支持 3× | 3× DGX Spark（TP3，RoCE 全互连） | 1× DGX Spark |
 | 架构 | 45 层：KDA 线性注意力 + MLA/DSA 稀疏注意力，288 专家 MoE | 40 层（20 编码器 + 20 解码器）：带分层 indexer 的压缩稀疏注意力，384 专家 top-6 MoE，Engram n-gram 表，mHC | 48 层：门控 DeltaNet + QSA 稀疏注意力，512 专家 top-10 MoE，逐层 n-gram |
-| **解码 — prose，贪心、关思考**（1/2/3/4 路） | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 63.9 / 86.6 / 103.9 / 116.3 tok/s | 65.0 / 93.0 / 115.7 / 133.3 tok/s |
-| **解码 — structured，贪心、关思考**（1/2/3/4 路） | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 120.5 / 168.5 / 182.6 / 213.3 tok/s | 151.4 / 224.1 / 268.7 / 287.9 tok/s |
-| **解码 — prose，T 1、开思考**（1/2/3/4 路） | 未测 | 55.4 / 77.0 / 90.0 / 97.3 tok/s | 48.5 / 70.6 / 85.2 / 96.8 tok/s |
-| **解码 — structured，T 1、开思考**（1/2/3/4 路） | 未测 | 100.7 / 142.8 / 150.7 / 166.9 tok/s | 116.5 / 97.2 / 100.6 / 119.0 tok/s |
-| **prefill** | ~1,560 tok/s（10K–55K 提示） | ~5,400 tok/s（8K–64K 提示，新文本；4K 约 4,600） | ~1,900 tok/s（13K–77K 提示） |
+| **解码 — prose，贪心、关思考**（1/2/3/4 路） | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 67.3 / 91.7 / 108.4 / 122.7 tok/s | 68.4 / 98.0 / 122.4 / 139.2 tok/s |
+| **解码 — structured，贪心、关思考**（1/2/3/4 路） | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 126.0 / 177.2 / 190.5 / 222.3 tok/s | 157.8 / 230.7 / 280.1 / 310.3 tok/s |
+| **解码 — prose，T 1、开思考**（1/2/3/4 路） | 未测 | 58.0 / 80.8 / 94.2 / 103.6 tok/s | 51.2 / 74.3 / 90.9 / 103.8 tok/s |
+| **解码 — structured，T 1、开思考**（1/2/3/4 路） | 未测 | 100.4 / 157.5 / 157.8 / 165.2 tok/s | 122.7 / 78.1 / 100.9 / 108.0 tok/s |
+| **prefill** | ~1,560 tok/s（10K–55K 提示） | ~5,550 tok/s（8K–64K 提示，新文本；4K 约 4,750） | ~2,000 tok/s（13K–77K 提示） |
 | **TTFT**（短提示） | ~370 ms | ~200 ms；7K 提示从 NVMe 前缀缓存恢复时 185 ms | ~140 ms |
 | **启动**（加载→可服务） | ~33 s | ~16 s（冷启动，分片直接从 NVMe 读） | ~19 s（冷启动） |
 | 投机解码 | DFlash2 草稿器，树/链验证 | DSpark（检查点自带的草稿级），每序列草稿数由代价模型决定 | 原生 MTP + prompt-lookup |
@@ -188,7 +188,8 @@ GitHub Actions 在 arm64 runner 上为版本 tag（以及手动触发）构建�
 
 主机设置：`vm.compaction_proactiveness = 0`、`vm.watermark_boost_factor = 0`、关闭 swap、关闭 CPU 深度空闲（保留 WFI）。
 2026-10-29 之前节点运行 DGX OS 7.5.0（内核 6.17、驱动 580.173.02、较旧的 EC / UEFI / ConnectX-7 固件），且一个遗留服务把
-GPU 时钟锁在 2,200 MHz；本仓库此前的数据都是在这种状态下测的。
+GPU 时钟锁在 2,200 MHz；本仓库此前的数据都是在这种状态下测的。更新后的系统上用 `bench/decode_bench.py` 连续满载测试（每种设置约 11 分钟，
+每秒采样时钟，两种设置都未记录到降频），默认时钟与锁定 2,200 MHz 相差在 ±5% 以内，贪心时默认时钟快 1–2%。
 
 更新后的系统上 DeepSeek-V4.1-Flash-1017（TP3）在默认时钟与锁定 2,200 MHz（`nvidia-smi -lgc 2200`）下的对比。两组使用同一
 版本与设置（默认设置加可选的条件钳制 `DS41_ABLATE_CLAMP`），脚本与 [docs/ds41.zh-CN.md](docs/ds41.zh-CN.md#7-性能) 相同：

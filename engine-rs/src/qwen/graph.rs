@@ -124,14 +124,16 @@ impl Decoder {
 /// up to QWEN_SPEC_KMAX (default 10) drafts, and each sequence verifies its drafts up to the last one inside the product
 /// bound. QWEN_SPEC_CUMCONF=0: QWEN_SPEC_K (default 3) drafts every round.
 #[derive(Clone, Copy, Debug)]
-pub struct Policy { pub k: usize, pub kmax: usize, pub theta: Option<f64>, pub all: bool, pub rate: Option<[f64; 3]> }
+pub struct Policy { pub k: usize, pub kmax: usize, pub theta: Option<f64>, pub all: bool, pub rate: Option<[f64; 3]>,
+                    /// per-sequence verify widths in a batch (`ragged_on`); rag: (ms per verified row, ms per padding row)
+                    pub ragged: bool, pub rag: [f64; 2] }
 impl Policy {
     pub fn from_env() -> Self {
         let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
         let k = num("QWEN_SPEC_K").unwrap_or(3.0) as usize;
         let theta = Some(num("QWEN_SPEC_CUMCONF").unwrap_or(0.7)).filter(|&t| t > 0.0);
         let kmax = num("QWEN_SPEC_KMAX").map_or(if theta.is_some() { 10 } else { k }, |v| v as usize).max(1);
-        Policy { k: k.max(1), kmax, theta, all: false, rate: None }
+        Policy { k: k.max(1), kmax, theta, all: false, rate: None, ragged: false, rag: [0.0, 0.0] }
     }
     /// Most drafts a chain produces.
     pub fn cap(&self) -> usize { if self.theta.is_some() { self.kmax } else { self.k } }
@@ -181,7 +183,10 @@ impl Policy {
             assert_eq!(c.len(), 6, "QWEN_SPEC_COST: six numbers");
             let x = (b - 1) as f64;
             p.rate = Some([c[0] + c[1] * x, c[2] + c[3] * x, c[4] + c[5] * x]);
+            p.rag[0] = c[3];
         }
+        p.ragged = b > 1 && p.theta.is_some() && ragged_widths_on();
+        p.rag[1] = pad_cost();
         p
     }
     /// The rate rule's costs for an all-greedy round of b sequences (QWEN_SPEC_COST_GREEDY, same form as QWEN_SPEC_COST):
@@ -198,6 +203,7 @@ impl Policy {
         assert_eq!(c.len(), 6, "QWEN_SPEC_COST_GREEDY: six numbers");
         let x = (b - 1) as f64;
         self.rate = Some([c[0] + c[1] * x, c[2] + c[3] * x, c[4] + c[5] * x]);
+        self.rag[0] = c[3];
     }
     /// QWEN_SPEC_RATE=t: the rate rule is for rounds with a sampled sequence only.
     pub fn rate_sampled_only() -> bool { !matches!(std::env::var("QWEN_SPEC_RATE").as_deref(), Ok("1")) }
@@ -224,6 +230,55 @@ impl Policy {
         }
         (bw, best)
     }
+    /// Per-sequence verify widths (`ragged`): the batch verifies max(w) rows per sequence, a sequence's rows past its own
+    /// width are padding (MoE rows reuse its first row's experts: QWEN_SPEC_RAGGED in graph.rs) and cannot be accepted.
+    /// Rate rule: the widths maximizing (sequences + sum of expected accepted drafts) / round time with
+    /// time = base + c_w W + c_r sum(w) + c_pad (b W - sum(w)) + draft (W - 1), W = max(w), c_r = the cost's per-sequence
+    /// slope, c_w = the rest of the per-width cost; solved per cap W by Dinkelbach iterations (each sequence then picks
+    /// its own width independently). Without the rate rule: each sequence's θ length. `accs`: acceptance estimates (rate
+    /// rule) or confidences.
+    pub fn ragged_widths(&self, accs: &[&[f64]]) -> Vec<usize> {
+        let n = accs.iter().map(|c| c.len()).min().unwrap_or(1).min(self.kmax).max(1);
+        match self.rate {
+            Some(_) => self.ragged_best(accs).0,
+            None => accs.iter().map(|c| self.verify_len(c).min(n)).collect(),
+        }
+    }
+    fn ragged_best(&self, accs: &[&[f64]]) -> (Vec<usize>, f64) {
+        let [base, cv, cd] = self.rate.expect("rate policy");
+        let b = accs.len() as f64;
+        let n = accs.iter().map(|c| c.len()).min().unwrap_or(1).min(self.kmax).max(1);
+        let (cr, cp) = (self.rag[0], self.rag[1]);
+        let cw = (cv - b * cr).max(0.0);
+        // e[g][w]: expected accepted drafts of sequence g verifying w drafts
+        let e: Vec<Vec<f64>> = accs.iter().map(|c| {
+            let (mut p, mut s) = (1.0, 0.0);
+            std::iter::once(0.0).chain(c.iter().take(n).map(|&a| { p *= a; s += p; s })).collect()
+        }).collect();
+        let time = |ws: &[usize]| {
+            let wm = *ws.iter().max().unwrap() as f64;
+            let sw: f64 = ws.iter().map(|&w| w as f64).sum();
+            base + cw * wm + cr * sw + cp * (b * wm - sw) + cd * (wm - 1.0)
+        };
+        let value = |ws: &[usize]| (b + ws.iter().zip(&e).map(|(&w, eg)| eg[w]).sum::<f64>()) / time(ws);
+        let (mut best, mut bw) = (-1.0, vec![1; accs.len()]);
+        // any cap: the one-step lookahead of `more` must see n + 1
+        for cap in 1..=n {
+            let mut lam = 0.0;
+            let mut ws = vec![cap; accs.len()];
+            for _ in 0..4 {
+                // maximize sum(e) - lam * time: per sequence e[w] - lam (c_r - c_pad) w, w in 1..=cap
+                ws = e.iter().map(|eg| (1..=cap).max_by(|&x, &y| {
+                    let f = |w: usize| eg[w] - lam * (cr - cp) * w as f64;
+                    f(x).partial_cmp(&f(y)).unwrap().then(y.cmp(&x))
+                }).unwrap()).collect();
+                lam = value(&ws);
+            }
+            let v = value(&ws);
+            if v > best { best = v; bw = ws; }
+        }
+        (bw, best)
+    }
     /// The first chain of a sequence (eager, right after its prefill): at most k drafts.
     pub fn first(&self) -> Policy { Policy { kmax: self.kmax.min(self.k), ..*self } }
     /// Drafts of one sequence worth verifying (at least 1).
@@ -238,6 +293,22 @@ impl Policy {
     /// (Cal::est), otherwise the confidences.
     pub fn more(&self, confs: &[Vec<f64>]) -> bool {
         let n = confs[0].len();
+        if self.ragged {
+            if n >= self.cap() { return false; }
+            if self.rate.is_some() {
+                // per-sequence widths: one more step when the best widths with it (its acceptance guessed as the last
+                // draft's) beat the best now
+                let cs: Vec<&[f64]> = confs.iter().map(|c| c.as_slice()).collect();
+                let (_, now) = self.ragged_best(&cs);
+                let ext: Vec<Vec<f64>> = confs.iter().map(|c| { let mut v = c.clone(); v.push(*c.last().unwrap_or(&0.0)); v }).collect();
+                let es: Vec<&[f64]> = ext.iter().map(|c| c.as_slice()).collect();
+                let p = Policy { kmax: self.kmax.min(n + 1), ..*self };
+                return p.ragged_best(&es).1 > now;
+            }
+            // θ widths per sequence: deeper while some sequence is still inside the bound (at least k)
+            let inside = |c: &Vec<f64>| c.iter().product::<f64>() >= self.theta.unwrap_or(0.0);
+            return n < self.k || confs.iter().any(inside);
+        }
         if self.rate.is_some() {
             // rate rule: draft one more step only when verifying it too would beat the best width so far, its acceptance
             // guessed as the last draft's (one-step lookahead; a deeper chain that is then cut short costs its draft
@@ -267,6 +338,81 @@ impl Policy {
         } else { *lens.iter().max().unwrap() }
     }
 }
+
+/// Online round-time model of the rate rule (QWEN_SPEC_COST_ONLINE, read per round; default on; "0": off): per batch size and round
+/// kind (greedy / sampled) a recursive least-squares fit with forgetting of the measured round time
+/// ms = base + cv W + cd steps (W the verify width, steps the MTP draft steps after the catch-up), starting from the
+/// static cost (QWEN_SPEC_COST / _GREEDY) as the prior. A verified row costs more on text whose rows route to more
+/// distinct experts (2026-10-29: ~5 ms on thinking prose, ~2.3 ms on counting), and the last few dozen rounds of the
+/// batch see that. QWEN_SPEC_COST_FORGET (default 0.95). The slopes stay within 0.5..2.5x the prior's: with the
+/// width stuck at one value the fit cannot separate base and per-width cost, and a per-width cost blown up by a base
+/// error would keep the width small for good (seen with QWEN_SPEC_RATE=1 on greedy rounds: structured c2 226 -> 106 tok/s).
+/// 2026-10-29 service ABBA x2 (seed 11, sampled thinking rounds; greedy rounds keep the θ rule): c4 prose +1.5..2.9% (every
+/// on-run above every off-run), structured +0.7..2.9%, c2 0..+0.9%; greedy unchanged within noise. Fitted at c4 on
+/// thinking text: per width 11.8 ms (prior 9.3), base 55 (69). QWEN_SPEC_COST_LOG=1: the fit
+/// per batch kind every 200 rounds.
+pub fn cost_online_on() -> bool { std::env::var("QWEN_SPEC_COST_ONLINE").as_deref() != Ok("0") }
+struct Rls { th: [f64; 3], p: [[f64; 3]; 3], n: u32, prior: [f64; 3] }
+const RLS_P0: [f64; 3] = [400.0, 9.0, 1.0];
+static COST_RLS: std::sync::Mutex<Vec<((usize, bool), Rls)>> = std::sync::Mutex::new(Vec::new());
+fn cost_forget() -> f64 {
+    static F: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("QWEN_SPEC_COST_FORGET").ok().and_then(|v| v.parse().ok()).unwrap_or(0.95))
+}
+/// Fold one measured round (b sequences, sampled or not, verify width w, `steps` draft steps, ms) into the model.
+pub fn cost_observe(b: usize, sampled: bool, prior: [f64; 3], w: usize, steps: usize, ms: f64) {
+    let mut v = COST_RLS.lock().unwrap();
+    let i = match v.iter().position(|(k, _)| *k == (b, sampled)) {
+        Some(i) => i,
+        None => {
+            let mut p = [[0.0; 3]; 3];
+            for (j, row) in p.iter_mut().enumerate() { row[j] = RLS_P0[j]; }
+            v.push(((b, sampled), Rls { th: prior, p, n: 0, prior }));
+            v.len() - 1
+        }
+    };
+    let r = &mut v[i].1;
+    let x = [1.0, w as f64, steps as f64];
+    let pred: f64 = (0..3).map(|j| r.th[j] * x[j]).sum();
+    // graph captures, prefill interleaving: rounds far above the model are skipped
+    if r.n > 4 && ms > 2.5 * pred.max(1.0) { return; }
+    let lam = cost_forget();
+    let px: Vec<f64> = (0..3).map(|j| (0..3).map(|k| r.p[j][k] * x[k]).sum()).collect();
+    let den = lam + (0..3).map(|j| x[j] * px[j]).sum::<f64>();
+    let k: Vec<f64> = px.iter().map(|v| v / den).collect();
+    let e = ms - pred;
+    for j in 0..3 { r.th[j] += k[j] * e; }
+    let mut np = [[0.0; 3]; 3];
+    for j in 0..3 { for l in 0..3 { np[j][l] = (r.p[j][l] - k[j] * px[l]) / lam; } }
+    // no wind-up: the uncertainty never grows past the prior's
+    for j in 0..3 { if np[j][j] > RLS_P0[j] { let f = (RLS_P0[j] / np[j][j]).sqrt(); for l in 0..3 { np[j][l] *= f; np[l][j] *= f; } } }
+    r.p = np;
+    r.th[0] = r.th[0].max(5.0);
+    for j in 1..3 { r.th[j] = r.th[j].clamp(0.5 * r.prior[j], 2.5 * r.prior[j]); }
+    r.n += 1;
+    if r.n % 200 == 0 && std::env::var("QWEN_SPEC_COST_LOG").as_deref() == Ok("1") {
+        eprintln!("[qwen-cost] b={b} sampled={sampled} n={} fit base {:.1} per-width {:.2} per-step {:.2} (prior {:.1} {:.2} {:.2})",
+                  r.n, r.th[0], r.th[1], r.th[2], r.prior[0], r.prior[1], r.prior[2]);
+    }
+}
+/// The fitted (base, per width, per draft step) once a few rounds were seen.
+pub fn cost_get(b: usize, sampled: bool) -> Option<[f64; 3]> {
+    COST_RLS.lock().unwrap().iter().find(|(k, _)| *k == (b, sampled)).filter(|(_, r)| r.n >= 6).map(|(_, r)| r.th)
+}
+
+/// QWEN_SPEC_RAGGED (read per batch policy and at graph capture; "1": on; default off): per-sequence verify widths in a
+/// batch. "2" (diagnostic): the padding mechanism captured, widths uniform as without it. Outputs unchanged (probe:
+/// every arm's tokens equal). 2026-10-29: the mechanism alone costs nothing measurable (qwen-batch -0.4 / +0.7%);
+/// qwen-batch greedy, rate rule: thinking count + prose x2 +5.3% (verify 78.4 -> 72.5 ms a round), 4 x hash-map -1.3%;
+/// but the service ABBA (seed 11, multi-stream decode bench) was negative: T=1 thinking structured c2 / c4 -2.0 / -5.6%,
+/// prose -0.2 / -2.3%, greedy prose c2 / c4 -6.3 / -14.6% (the per-sequence θ widths draft while any sequence is inside
+/// the bound, i.e. the `max` rule's long chains), greedy structured +1.0 / +3.0%. Same runs: a verified row costs
+/// ~2.3 ms on counting text but ~5 ms on thinking prose (more distinct experts per row), which the fixed per-row cost of
+/// the rate rule does not see; the width cost needs the routed experts, not the row count.
+pub fn ragged_on() -> bool { matches!(std::env::var("QWEN_SPEC_RAGGED").as_deref(), Ok("1") | Ok("2")) }
+fn ragged_widths_on() -> bool { std::env::var("QWEN_SPEC_RAGGED").as_deref() == Ok("1") }
+/// QWEN_SPEC_PAD_COST (ms per padding row of a ragged batch verify; default 0.3).
+fn pad_cost() -> f64 { std::env::var("QWEN_SPEC_PAD_COST").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3) }
 
 /// A draft's acceptance by its confidence, from the CALIB table (whatever QWEN_SPEC_CALIB says): the rate rule's estimate.
 fn calib(c: f64) -> f64 {
@@ -394,7 +540,7 @@ struct Part { r1: i64, io: Mapped, o: PartOff, g: graph::Owned, logits: Tensor, 
               commit: graph::Owned, catch: Option<graph::Owned>, catch_cpl: Option<graph::Owned>, nd_dev: Tensor, nd_map: Tensor, _keep: (Pending, Vec<Tensor>) }
 /// Offsets in Part::io: inputs ids [b*r1] i64, pos [b] i32, kk [b] i32, packed rings; accept outputs / host-path inputs
 /// nd [b] i32, cids [b*r1] i64, sel [b] i64; output greedy [b*r1] i64.
-struct PartOff { ids: usize, pos: usize, kk: usize, packed: usize, nd: usize, cids: usize, sel: usize, greedy: usize }
+struct PartOff { ids: usize, pos: usize, kk: usize, packed: usize, nd: usize, cids: usize, sel: usize, greedy: usize, src: Option<usize> }
 /// Draft step: hidden [b, 4, 2560] and tokens [b] in, (token, confidence) appended to out[cnt] (mapped: spos, out).
 /// With coupled drafting (`coupled_on` at capture) also the draft temperatures [b] f32 and keys [kc, b] u64 (mapped, after
 /// out), written by `set_draft_keys`, and a second step graph picking coupled tokens (`Cpl::g`; the catch-up likewise,
@@ -489,7 +635,10 @@ impl BatchG {
         let rb = m.ple_row_bytes().unwrap_or(0) as usize;
         let mut l = Lay(0);
         let o = PartOff { ids: l.take(8 * bu * ru), pos: l.take(4 * bu), kk: l.take(4 * bu), packed: l.take(bu * ru * rb),
-                          nd: l.take(4 * bu), cids: l.take(8 * bu * ru), sel: l.take(8 * bu), greedy: l.take(8 * bu * ru) };
+                          nd: l.take(4 * bu), cids: l.take(8 * bu * ru), sel: l.take(8 * bu), greedy: l.take(8 * bu * ru),
+                          src: None };
+        // QWEN_SPEC_RAGGED at capture: per-row MoE source rows [b*r1] i64 (identity, or a padding row's sequence row 0)
+        let o = PartOff { src: ragged_on().then(|| l.take(8 * bu * ru)), ..o };
         let io = Mapped::new(l.0);
         let ids = io.tensor(o.ids, &[b * r1], Kind::Int64);
         let pos = io.tensor(o.pos, &[b], Kind::Int);
@@ -506,9 +655,12 @@ impl BatchG {
         // QWEN_GDN_FUSED_COMMIT: the verify applies the last commit's pending rows first (their buffers exist before capture)
         let fused = super::model::fused_commit_on();
         if fused { for q in seqs { q.gpend(); } }
+        let src = o.src.map(|off| io.tensor(off, &[b * r1], Kind::Int64));
+        if let Some(off) = o.src { io.put(off, &(0..b * r1).collect::<Vec<i64>>()); }
         let (g, (logits, x, pend)) = capture_shared(|| {
             let run = || m.run_batch_dev(seqs, &ids, &pos, packed.as_ref(), &rows, false, false);
-            if fused { super::model::with_fused_commit(run) } else { run() }
+            let run = || if fused { super::model::with_fused_commit(run) } else { run() };
+            match &src { Some(t) => super::model::with_moe_src(t, run), None => run() }
         });
         // greedy accept on the device (the host repeats the same rule on the copied-out tokens)
         let spos = self.step.as_ref().map(|s| s.spos.shallow_clone());
@@ -543,7 +695,7 @@ impl BatchG {
         });
         let catch = catch_g(false);
         let catch_cpl = if self.coupled() { catch_g(true) } else { None };
-        let keep = vec![ids, pos, kk, cids, sel, greedy].into_iter().chain(packed).collect();
+        let keep = vec![ids, pos, kk, cids, sel, greedy].into_iter().chain(packed).chain(src).collect();
         self.parts[r1 as usize] = Some(Part { r1, io, o, g, logits, x, accept, commit, catch, catch_cpl, nd_dev: nd, nd_map, _keep: (pend, keep) });
     }
 
@@ -563,6 +715,11 @@ impl BatchG {
         p.io.put(p.o.ids, &flat);
         p.io.put(p.o.pos, &seqs.iter().map(|s| s.pos as i32).collect::<Vec<_>>());
         p.io.put(p.o.kk, &kk.iter().map(|&v| v as i32).collect::<Vec<_>>());
+        if let Some(off) = p.o.src {
+            // rows 0..=kk[g] of sequence g are its own; the rest are padding (its row 0's experts)
+            let src: Vec<i64> = (0..rows.len()).flat_map(|g| (0..r1).map(move |i| (g * r1 + if i <= kk[g] { i } else { 0 }) as i64)).collect();
+            p.io.put(off, &src);
+        }
         if m.ple_row_bytes().is_some() {
             let h: Vec<u8> = seqs.iter().zip(rows).flat_map(|(s, r)| m.ple_pack(s, r).unwrap()).collect();
             p.io.put(p.o.packed, &h);
