@@ -1,4 +1,4 @@
-![spark-engine](docs/assets/banner.png)
+![spark-engine](docs/assets/banner-tp3.png)
 
 # spark-engine
 
