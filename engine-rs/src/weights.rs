@@ -993,7 +993,26 @@ pub(crate) fn mm16_chain_half(x:&Tensor,w1:&Tensor,w2:&Tensor)->Option<Tensor> {
     if !plain_half_prefill(&y1,w2) {return None;}
     Some(y1.matmul(&w2.transpose(0,1)))
 }
+thread_local! {
+    /// GLM TP3 paired prefill: the SP row-parallel projection's FP32 partial and its weight, the reduce-scatter left to
+    /// the caller (with_sp_defer)
+    static SP_DEFER: std::cell::RefCell<Option<Option<(Tensor,Tensor)>>> = const { std::cell::RefCell::new(None) };
+}
+/// Runs `f` with the SP scatter on but the row-parallel projection's reduce-scatter deferred: returns f's result (the
+/// FP32 partial, all rows) and (partial, weight); the caller reduce-scatters the partial and applies
+/// round_row_output(_, weight) -- the same operations as row_mm16's SP path.
+pub(crate) fn with_sp_defer<R>(f:impl FnOnce()->R)->(R,(Tensor,Tensor)) {
+    SP_DEFER.with(|d|*d.borrow_mut()=Some(None));
+    let r=with_sp_scatter(f);
+    let got=SP_DEFER.with(|d|d.borrow_mut().take()).flatten().expect("with_sp_defer: no row-parallel projection");
+    (r,got)
+}
 pub fn row_mm16(x: &Tensor, w: &Tensor) -> Tensor {
+    if SP_SCATTER.with(|c|c.get()) && crate::tp::dense_enabled() && SP_DEFER.with(|d|d.borrow().is_some()) {
+        let p=mm16_partial(x,w).contiguous();
+        SP_DEFER.with(|d|{let mut d=d.borrow_mut();assert!(d.as_ref().unwrap().is_none(),"with_sp_defer: two row-parallel projections");*d=Some(Some((p.shallow_clone(),w.shallow_clone())));});
+        return p;
+    }
     if SP_SCATTER.with(|c|c.get()) && crate::tp::dense_enabled() {
         if let Some(y)=row_mm16_rs_split(x,w) {return round_row_output(y,w);}
         return round_row_output(crate::tp::reduce_scatter_rows(&mm16_partial(x,w).contiguous()),w);

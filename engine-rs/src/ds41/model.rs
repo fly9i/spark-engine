@@ -2631,27 +2631,56 @@ impl Model {
         let is_cand = l == c.candidate_source;
         let use_cand = !is_cand && c.candidate_source >= 0 && c.candidate_source < l;
         // prefill chunks: the ranks split the rows (the indexer is replicated, every row computed alone) and gather the
-        // selections with one exact FP32 sum (indices < 2^24, every element from one rank); not the candidate source,
-        // whose candidate blocks every rank needs whole (DS41_INDEX_SPLIT_ROWS: least rows, 256; 0 off)
+        // selections with one exact FP32 sum (indices < 2^24, every element from one rank) (DS41_INDEX_SPLIT_ROWS: least
+        // rows, 256; 0 off). The candidate source splits too (DS41_INDEX_SPLIT_CAND, default on): the later index layers
+        // of the chunk split the same rows, so a rank keeps only its rows' candidate blocks (`Shared::cand_rows`).
         static SPLIT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
         let split_rows = *SPLIT.get_or_init(|| std::env::var("DS41_INDEX_SPLIT_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(256));
+        static SPLIT_CAND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let split_cand = *SPLIT_CAND.get_or_init(|| std::env::var("DS41_INDEX_SPLIT_CAND").map_or(true, |v| v != "0"));
         let (rank, world) = (self.sp.rank as i64, self.sp.world as i64);
-        if world > 1 && split_rows > 0 && t >= split_rows && !is_cand && k_top > 0 && !crate::tp::graph::capturing() {
+        if world > 1 && split_rows > 0 && t >= split_rows && (!is_cand || split_cand) && k_top > 0 && !crate::tp::graph::capturing() {
             let (r0, r1) = (t * rank / world, t * (rank + 1) / world);
             let n = r1 - r0;
             let r = |v: &Tensor| v.narrow(0, r0, n);
             let (q, wts) = match sh.index_q.take() { Some((q, w)) => (r(&q), r(&w)), None => self.index_q(layer, &r(x), &r(qr), &r(pos)) };
-            let cand = use_cand.then(|| r(sh.candidates.as_ref().expect("candidate source not run")));
-            let (mine, _) = self.index_blocks(&q, &wts, &k, &r(pos), ratio, clen, k_top, offset, false, cand.as_ref());
+            let cand = use_cand.then(|| {
+                let c = sh.candidates.as_ref().expect("candidate source not run");
+                if sh.cand_rows.is_some() { assert_eq!(sh.cand_rows, Some((r0, n)), "candidate rows split differently"); c.shallow_clone() } else { r(c) }
+            });
+            let (mine, cand_out) = self.index_blocks(&q, &wts, &k, &r(pos), ratio, clen, k_top, offset, is_cand, cand.as_ref());
+            if is_cand { sh.candidates = cand_out; sh.cand_rows = Some((r0, n)); }
             let all = Tensor::zeros([t, k_top], (Kind::Float, self.dev));
             let _ = all.narrow(0, r0, n).copy_(&mine);
             crate::tp::allreduce(&all);
             return all.to_kind(Kind::Int64);
         }
         let (q, wts) = match sh.index_q.take() { Some(v) => v, None => self.index_q(layer, x, qr, pos) };
+        // decode / verify at long contexts (DS41_INDEX_KEY_SPLIT: least keys, 65536; 0 off): the ranks split the keys
+        // of the full-scoring layers instead (index_key_split); the later candidate layers stay replicated
+        static KSPLIT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        let key_split = *KSPLIT.get_or_init(|| std::env::var("DS41_INDEX_KEY_SPLIT").ok().and_then(|v| v.parse().ok()).unwrap_or(65536));
+        if world > 1 && key_split > 0 && clen >= key_split.max(world * 4 * k_top) && t <= 16 && !use_cand && k_top > 0
+            && !crate::tp::graph::capturing() && attn_fused() && c.index_heads == 32 && c.index_dim == 128 && ops_fused() && topk_fused() {
+            let (q, wts) = match sh.index_q.take() { Some(v) => v, None => self.index_q(layer, x, qr, pos) };
+            let (ids, cand_out) = prof("idx.key_split", || self.index_key_split(&q, &wts, &k, pos, ratio, clen, k_top, offset, is_cand));
+            // DS41_INDEX_KEY_SPLIT_CHECK=1: also the replicated selection, asserted equal (indices and candidate blocks)
+            static KCHK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *KCHK.get_or_init(|| std::env::var("DS41_INDEX_KEY_SPLIT_CHECK").as_deref() == Ok("1")) {
+                let (ri, rc) = self.index_blocks(&q, &wts, &k, pos, ratio, clen, k_top, offset, is_cand, None);
+                assert!(ri.equal(&ids), "index key split: indices differ (layer {l}, clen {clen})");
+                if let (Some(a), Some(b)) = (&rc, &cand_out) { assert!(a.equal(b), "index key split: candidate blocks differ (layer {l})"); }
+                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n % 200 == 1 { eprintln!("[ds41] index key split check: {n} selections equal (layer {l}, rows {t}, keys {clen})"); }
+            }
+            if is_cand { sh.candidates = cand_out; sh.cand_rows = None; }
+            return ids;
+        }
+        assert!(!use_cand || sh.cand_rows.is_none(), "candidate blocks hold one rank's rows only");
         let cand = use_cand.then(|| sh.candidates.as_ref().expect("candidate source not run").shallow_clone());
         let (ids, cand_out) = self.index_blocks(&q, &wts, &k, pos, ratio, clen, k_top, offset, is_cand, cand.as_ref());
-        if is_cand { sh.candidates = cand_out; }
+        if is_cand { sh.candidates = cand_out; sh.cand_rows = None; }
         ids
     }
 
@@ -2678,6 +2707,48 @@ impl Model {
         (Tensor::cat(&ids, 0), is_cand.then(|| Tensor::cat(&cands, 0)))
     }
 
+    /// index_rows of a few rows (decode, verify) at long contexts with the keys split over the ranks: rank r scores keys
+    /// [k0, k1) (contiguous, boundaries on candidate blocks), the same scores bit for bit (pos shifted by k0 * ratio: the
+    /// kernel's reachable length (pos + 1) / ratio drops by exactly k0), takes its own top k_top (topk_idx: ties to the
+    /// lower index) and all-gathers (score bits, key index); the merged top k_top over the ranks' lists in rank order
+    /// (= index order, ties to the lower position = the lower index) is the full row's. The candidate source also
+    /// all-gathers its blocks' best scores (max is exact) and selects the candidate blocks from the whole row of them as
+    /// before. Needs every row's reachable keys >= k_top (decode rows sit at the end of the context).
+    #[allow(clippy::too_many_arguments)]
+    fn index_key_split(&self, q: &Tensor, wts: &Tensor, k: &Tensor, pos: &Tensor, ratio: i64, clen: i64, k_top: i64, offset: i64, is_cand: bool) -> (Tensor, Option<Tensor>) {
+        extern "C" { fn rs_sp_all_gather(i: *const std::ffi::c_void, o: *mut std::ffi::c_void, bytes: i64, async_: i32) -> i32; }
+        let c = &self.c;
+        let t = q.size()[0];
+        let (rank, world) = (self.sp.rank as i64, self.sp.world as i64);
+        let blk = c.candidate_block.max(1);
+        let edge = |r: i64| if r >= world { clen } else { clen * r / world / blk * blk };
+        let (k0, k1) = (edge(rank), edge(rank + 1));
+        let posl = pos - k0 * ratio;
+        let s = super::kern::index_score(q, &k.narrow(0, k0, k1 - k0), wts, &posl, ratio);           // [T, k1 - k0]
+        let loc = super::kern::topk_idx(&s, &posl, ratio, k_top, 0);                                    // [T, k_top]
+        let mine = super::kern::ks_pack(&s, &loc, k0);                                                  // [T, k_top, 2]
+        let all = Tensor::empty([world, t, k_top, 2], (Kind::Int, self.dev));
+        assert_eq!(unsafe { rs_sp_all_gather(mine.data_ptr(), all.data_ptr(), mine.numel() as i64 * 4, 0) }, 0, "rs_sp_all_gather (index keys)");
+        let (mvals, midx) = super::kern::ks_unpack(&all);                                               // [T, world k_top]
+        let whole = Tensor::full([t], world * k_top - 1, (Kind::Int64, self.dev));
+        let sel = super::kern::topk_idx(&mvals, &whole, 1, k_top, 0);
+        let ids = super::kern::ks_final(&sel, &midx, offset);
+        let cand = is_cand.then(|| {
+            // the candidate blocks: every rank's block scores (padded to the widest rank's count), in rank order
+            let nbs: Vec<i64> = (0..world).map(|r| (edge(r + 1) - edge(r) + blk - 1) / blk).collect();
+            let nbm = (*nbs.iter().max().unwrap() + 3) / 4 * 4;   // (the all-gather moves whole 16 bytes)
+            let bm = block_max(&s, blk);                                                               // [T, nb_r]
+            let bm = if nbm > nbs[rank as usize] { Tensor::cat(&[bm, Tensor::full([t, nbm - nbs[rank as usize]], f64::NEG_INFINITY, (Kind::Float, self.dev))], 1) } else { bm }.contiguous();
+            let allb = Tensor::empty([world, t, nbm], (Kind::Float, self.dev));
+            assert_eq!(unsafe { rs_sp_all_gather(bm.data_ptr(), allb.data_ptr(), bm.numel() as i64 * 4, 0) }, 0, "rs_sp_all_gather (block scores)");
+            let parts: Vec<Tensor> = (0..world).map(|r| allb.get(r).narrow(1, 0, nbs[r as usize])).collect();
+            let bs = Tensor::cat(&parts, 1);
+            let lens = (pos + 1).floor_divide_scalar(ratio);
+            select_candidate_from_max(&bs, &lens, c.candidate_topk_blocks, blk, clen)
+        });
+        (ids, cand)
+    }
+
     /// The indexer's selection for rows q [T, nh, id] / wts [T, nh] / pos [T] against index keys k [Tc, id]: (pool
     /// indices [T, k_top], the candidate blocks [T, Tc] when `is_cand`), with `cand` the candidate blocks of these rows
     /// for later index layers.
@@ -2692,9 +2763,9 @@ impl Model {
         static CAND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let cand_k = *CAND.get_or_init(|| std::env::var("DS41_INDEX_CAND").map_or(true, |v| v != "0"));
         let fused = attn_fused() && nh == 32 && id == 128;
-        let pre = match (cand, fused && cand_k && !is_cand) { (Some(cd), true) => super::kern::index_score_cand(q, k, wts, pos, ratio, cd), _ => None };
+        let pre = match (cand, fused && cand_k && !is_cand) { (Some(cd), true) => prof("idx.score_cand", || super::kern::index_score_cand(q, k, wts, pos, ratio, cd)), _ => None };
         let masked = pre.is_some();
-        let mut score = if let Some(s) = pre { s } else if fused { super::kern::index_score(q, k, wts, pos, ratio) } else {
+        let mut score = if let Some(s) = pre { s } else if fused { prof("idx.score", || super::kern::index_score(q, k, wts, pos, ratio)) } else {
             let s = q.matmul(&k.tr().unsqueeze(0)).relu();                                                      // [T, nh, Tc]
             let score = (s * wts.unsqueeze(-1)).sum_dim_intlist([1].as_slice(), false, Kind::BFloat16);         // [T, Tc]
             let cpos = Tensor::arange(clen.max(1), (Kind::Int64, self.dev));
@@ -2702,12 +2773,12 @@ impl Model {
         };
         let mut cand_out = None;
         if is_cand {
-            cand_out = Some(select_candidate_blocks(&score, &lens, c.candidate_topk_blocks, c.candidate_block));
+            cand_out = Some(prof("idx.cand_sel", || select_candidate_blocks(&score, &lens, c.candidate_topk_blocks, c.candidate_block)));
         } else if let (Some(cand), false) = (cand, masked) {
             score = score.masked_fill(&cand.logical_not(), f64::NEG_INFINITY);
         }
         if k_top == 0 { return (Tensor::full([t, 0], -1, (Kind::Int64, self.dev)), cand_out); }
-        if ops_fused() && topk_fused() { return (super::kern::topk_idx(&score, pos, ratio, k_top, offset), cand_out); }
+        if ops_fused() && topk_fused() { return (prof("idx.topk", || super::kern::topk_idx(&score, pos, ratio, k_top, offset)), cand_out); }
         let (_, ids) = score.topk(k_top, -1, true, false);
         let (ids, _) = ids.sort(-1, false);
         // (no host scalar here: a pageable host-to-device copy would drain the queue every index layer)
@@ -2892,6 +2963,8 @@ impl Seq {
 #[derive(Default)]
 pub struct Shared {
     pub(super) topk: Option<Tensor>, pub(super) candidates: Option<Tensor>,
+    /// Some((first row, rows)): `candidates` holds only this rank's rows of the chunk (the split candidate source)
+    pub(super) cand_rows: Option<(i64, i64)>,
     /// SWA bounded replay: window keys before this position are not attended; the KV source does not compress again
     pub(super) win_lo: i64, pub(super) skip_compress: bool,
     /// this sequence's rows of the indexer inputs computed for the whole batch (index_q), taken by the next indexer
@@ -2903,16 +2976,24 @@ pub struct Shared {
 /// Level one of the hierarchical indexer (model.py select_candidate_blocks): keep the `topk_blocks` best blocks of
 /// `block` positions per query (block score = its best position; the query's newest block always kept).
 fn select_candidate_blocks(score: &Tensor, lens: &Tensor, topk_blocks: i64, block: i64) -> Tensor {
+    select_candidate_from_max(&block_max(score, block), lens, topk_blocks, block, score.size()[1])
+}
+/// The block scores of select_candidate_blocks: the best position of each `block` positions (FP32; the tail block padded
+/// with -inf).
+fn block_max(score: &Tensor, block: i64) -> Tensor {
     let (t, width) = (score.size()[0], score.size()[1]);
     let pad = (block - width % block) % block;
     let s = score.to_kind(Kind::Float);
     let s = if pad > 0 { Tensor::cat(&[s, Tensor::full([t, pad], f64::NEG_INFINITY, (Kind::Float, score.device()))], 1) } else { s };
-    let nb = (width + pad) / block;
-    let bs = s.view([t, nb, block]).amax([-1].as_slice(), false);
+    s.view([t, (width + pad) / block, block]).amax([-1].as_slice(), false)
+}
+/// select_candidate_blocks from the block scores bs [T, nb] of a `width`-wide score row.
+fn select_candidate_from_max(bs: &Tensor, lens: &Tensor, topk_blocks: i64, block: i64, width: i64) -> Tensor {
+    let (t, nb) = (bs.size()[0], bs.size()[1]);
     let last = (lens - 1).floor_divide_scalar(block);
-    let blocks = Tensor::arange(nb, (Kind::Int64, score.device()));
+    let blocks = Tensor::arange(nb, (Kind::Int64, bs.device()));
     let bs = bs.masked_fill(&blocks.unsqueeze(0).eq_tensor(&last.unsqueeze(-1)), f64::INFINITY);
     let (vals, ids) = bs.topk(topk_blocks.min(nb), -1, true, false);
-    let keep = Tensor::zeros([t, nb], (Kind::Bool, score.device())).scatter(1, &ids, &vals.gt(f64::NEG_INFINITY));
+    let keep = Tensor::zeros([t, nb], (Kind::Bool, bs.device())).scatter(1, &ids, &vals.gt(f64::NEG_INFINITY));
     keep.repeat_interleave_self_int(block, 1, None).narrow(1, 0, width)
 }

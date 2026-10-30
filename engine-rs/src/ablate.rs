@@ -163,6 +163,12 @@ fn fuse_mode() -> u8 {
 /// DS41 encoder two-micro-batch prefill overlap must then stay off (its per-batch z rows are locally indexed; the
 /// fused path carries the row base in the offset count pointer instead).
 pub fn unfused_active() -> bool { clamp().is_some() && fuse_mode() < 2 }
+thread_local! {
+    /// The count gate's row base for the passes now running (GLM TP3 paired prefill: chunk B's rows follow chunk A's, so
+    /// the two interleaved passes keep separate counters; 0 otherwise).
+    static ROW_BASE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+pub fn set_row_base(base: i64) { ROW_BASE.with(|b| b.set(base)); }
 /// Kernel view of one site's clamp (`SparkClamp` in shim/ablate_clamp.cuh).
 #[repr(C)]
 pub struct ClampArgs { d: *const f32, tau: *const f32, lo: *const f32, target: *const f32, k: i32, count: *mut i32, min: i32, reset: i32 }
@@ -177,10 +183,11 @@ impl Clamp {
     /// the pass), None for the final site; rows = rows of z.
     fn args(&self, tau: &Tensor, lo: &Tensor, target: Option<&Tensor>, gate: Option<(usize, usize)>, rows: i64) -> ClampArgs {
         let gated = self.min > 1 && gate.is_some();
-        if gated { assert!(rows <= CLAMP_COUNT_ROWS, "SPARK_ABLATE_CLAMP_MIN: {rows} rows in one pass"); }
+        let base = ROW_BASE.with(|b| b.get());
+        if gated { assert!(base + rows <= CLAMP_COUNT_ROWS, "SPARK_ABLATE_CLAMP_MIN: {rows} rows in one pass (base {base})"); }
         ClampArgs { d: self.d.data_ptr() as *const f32, tau: tau.data_ptr() as *const f32, lo: lo.data_ptr() as *const f32,
                     target: target.map_or(std::ptr::null(), |t| t.data_ptr() as *const f32), k: self.d.size()[0] as i32,
-                    count: if gated { self.count.data_ptr() as *mut i32 } else { std::ptr::null_mut() }, min: self.min,
+                    count: if gated { unsafe { (self.count.data_ptr() as *mut i32).add(base as usize) } } else { std::ptr::null_mut() }, min: self.min,
                     reset: i32::from(gate == Some((0, 0))) }
     }
     /// The clamp of the sublayer input normed by `ln` for the fused MHC pre finish (None: no clamp at this site, or

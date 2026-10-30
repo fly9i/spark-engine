@@ -58,7 +58,8 @@ in `spark.env`.
 
 TP3 was developed and accepted with the project's own SPX1 checkpoint of GLM-5.3-Flash (revision V1.2, not published;
 V1.1 is [fly9i/GLM-5.3-Flash-SPX1-V1.1](https://huggingface.co/fly9i/GLM-5.3-Flash-SPX1-V1.1)): spec decode
-+21% over TP2 (60.2 vs 49.7 tok/s on the project's mixed benchmark), prefill +4%, KL vs. the FP8 reference unchanged
++21% over TP2 (60.2 vs 49.7 tok/s on the project's mixed benchmark), prefill +4% (v0.3.10's paired prefill schedule adds +3.5% / +3.3%: 8K 1,779 → 1,841, 32K 1,694 → 1,754 tok/s,
+alternated A/B, outputs bitwise unchanged), KL vs. the FP8 reference unchanged
 (0.01370 vs 0.01364). With the public EXL3 checkpoint TP3 uses the same code paths but has **not been measured**; TP2
 remains the tested configuration for it.
 

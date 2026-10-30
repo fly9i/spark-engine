@@ -720,8 +720,186 @@ impl Engine {
         let logits=self.w.logits(&z);
         Some((logits,DecodeStates(states),features))
     }
+    /// GLM53_PREFILL_SP_PAIR=1 (TP3, L0): a prefill unit of more than GLM53_PREFILL_CHUNK rows (the server's solo chunk,
+    /// GLM53_SERVE_CHUNK_SOLO) runs as two chunks A (the first GLM53_PREFILL_CHUNK rows) and B (the rest) taken through
+    /// the layers in lockstep: layer i of A, then layer i of B with A's layer-i state -- the same per-chunk computation
+    /// and dependencies as two consecutive prefill_record_sp calls, so the result is bit for bit theirs. The point is the
+    /// schedule: every collective runs on the comm stream (tp::comm_mode) and is waited on only where its result is
+    /// used, so B's gathers overlap A's attention / MoE and A's reduce-scatters overlap B's, and a rank that finishes
+    /// its attention heads early (MLA 32/16/16) starts the other chunk's work instead of waiting. Only the path the TP3
+    /// profile takes (SP_HALF_Z, SP_HALF_GATHER, SHARED_FUSE + SHARED_HALF, HALF_REUSE, FEATURE_REUSE); anything else
+    /// falls back to prefill_record_sp. The clamp's count gate keeps B's per-row counters after A's (ablate::set_row_base;
+    /// sharing them made A's later layers see B's counts). GLM53_PREFILL_SP_PAIR_CHECK=1 also runs the two plain calls on a
+    /// snapshot and prints the logits / features / states differences (0 when correct). With the comm stream overlapped,
+    /// GLM53_RDMA_ARN_WAIT_SPLIT=1 is needed (without it the early finish kernels' spinning CTAs slowed compute by 6%).
+    /// GLM53_PREFILL_SP_PAIR on TP3 and a unit of t > GLM53_PREFILL_CHUNK rows: that chunk size (the unit is taken as
+    /// two chunks, paired or, when not pairable, one after the other -- never as one larger chunk, which would change
+    /// the GEMM shapes)
+    fn sp_pair_chunk(&self,t:i64)->Option<i64> {
+        if std::env::var("GLM53_PREFILL_SP_PAIR").as_deref()!=Ok("1") || crate::tp::world().world!=3 {return None;}
+        let a=std::env::var("GLM53_PREFILL_CHUNK").ok().and_then(|v|v.parse::<i64>().ok()).unwrap_or(4096);
+        (t>a).then_some(a)
+    }
+    fn sp_pair_eligible(&self,t:i64)->Option<i64> {
+        let flag=|k:&str|std::env::var(k).as_deref()==Ok("1");
+        let a=self.sp_pair_chunk(t)?;
+        if t-a<128 || !self.sp_eligible(a) || !self.sp_eligible(t-a) {return None;}
+        if !(flag("GLM53_PREFILL_SP_HALF_Z") && flag("GLM53_PREFILL_SP_HALF_GATHER") && flag("GLM53_PREFILL_SHARED_FUSE") && flag("GLM53_PREFILL_HALF_REUSE")
+             && flag("GLM53_PREFILL_FEATURE_REUSE") && crate::moe::shared_half_enabled()) {return None;}
+        if crate::ablate::capturing() || crate::deep_probe::next_input_pending() || crate::tp::ag_overlap_enabled() {return None;}
+        Some(a)
+    }
+    fn prefill_record_sp_pair(&mut self,ids:&Tensor,ds:Option<DecodeStates>,collect:bool,last:bool,ta:i64)->(Tensor,DecodeStates,Vec<Tensor>) {
+        use crate::tp::{all_gather_rows_comm,reduce_scatter_rows_comm,CommPending};
+        let t=ids.size()[0];let tp=crate::tp::world();let w=tp.world as i64;
+        if let Some(s)=ds.as_ref().and_then(|d|d.0.iter().find_map(|s|match s {LayerState::MlaLatent(s)=>Some(s),_=>None})) {s.ensure_room(t);}
+        struct Lane {id:usize,cbase:i64,t:i64,tpad:i64,half:i64,residual:Tensor,deferred:Option<(crate::mhc::PreOut,CommPending,Option<Tensor>)>,pre:Option<crate::mhc::PreOut>,
+                     agz:Option<CommPending>,rsa:Option<(CommPending,Tensor)>,agx:Option<(CommPending,CommPending)>,agz2:Option<CommPending>,
+                     pre2:Option<crate::mhc::PreOut>,feat_pending:bool,feats:Vec<CommPending>}
+        let mk=|id:usize,ids:Tensor,me:&Self|->Lane {
+            let t=ids.size()[0];let tpad=(t+w-1)/w*w;let half=tpad/w;let lo=tp.rank as i64*half;
+            let x=me.w.embed_prefill(&ids);
+            let x=if tpad>t {let p=Tensor::zeros([tpad,x.size()[1]],(x.kind(),x.device()));let _=p.narrow(0,0,t).copy_(&x);p} else {x};
+            Lane{id,cbase:0,t,tpad,half,residual:hc_expand(&x.narrow(0,lo,half)).contiguous(),deferred:None,pre:None,agz:None,rsa:None,agx:None,agz2:None,pre2:None,feat_pending:false,feats:Vec::new()}
+        };
+        let mut lanes=[mk(0,ids.narrow(0,0,ta),self),mk(1,ids.narrow(0,ta,t-ta),self)];
+        // the clamp count gate (SPARK_ABLATE_CLAMP_MIN): B's per-row counters after A's (two interleaved passes)
+        lanes[1].cbase=lanes[0].half;
+        let real=|l:&Lane,g:Tensor|if l.tpad>l.t {g.narrow(0,0,l.t)} else {g};
+        let n=self.w.layers.len();
+        let mut prior=ds.map(|d|{assert_eq!(d.0.len(),n);d.0.into_iter()});
+        let mut states:Vec<LayerState>=Vec::with_capacity(n);
+        let mut feats_out:Vec<Tensor>=Vec::new();
+        let grouped=std::env::var("GLM53_PREFILL_GROUPED").unwrap_or_default();
+        let nv=nvtx_on();
+        crate::tp::comm_mode(true);
+        // GLM53_PREFILL_SP_PAIR_ORDER=lane (diagnostic): A finishes a layer before B starts it
+        let groups:Vec<Vec<usize>>=if std::env::var("GLM53_PREFILL_SP_PAIR_ORDER").as_deref()==Ok("lane") {vec![vec![0],vec![1]]} else {vec![vec![0,1]]};
+        for (i,layer) in self.w.layers.iter().enumerate() {
+          let old=prior.as_mut().map(|p|p.next().unwrap());
+          let mut st=old;
+          for g in &groups {
+            // attention inputs of both chunks; their gathers queue on the comm stream
+            for l in lanes.iter_mut().enumerate().filter(|(k,_)|g.contains(k)).map(|(_,l)|l) {
+                let _g=Nvtx::new(nv,"mhc-attn");
+                crate::ablate::set_row_base(l.cbase);
+                let (pre,z_half)=if let Some((prev,pm,wd))=l.deferred.take() {
+                    let m=pm.wait();let m=match wd {Some(wd)=>crate::weights::round_row_output(m,&wd),None=>m};
+                    let (r,p,z)=crate::mhc::mhc_post_pre(&m,&l.residual,&prev,&layer.hc.attn_fn,&layer.hc.attn_scale,&layer.hc.attn_base,&layer.hc.in_ln);
+                    l.residual=r;(p,z)
+                } else {mhc_pre(&l.residual,&layer.hc.attn_fn,&layer.hc.attn_scale,&layer.hc.attn_base,&layer.hc.in_ln)};
+                if l.feat_pending {l.feats.push(all_gather_rows_comm(&hc_contract(&l.residual)));l.feat_pending=false;}
+                l.pre=Some(pre);
+                l.agz=Some(all_gather_rows_comm(&z_half.to_kind(tch::Kind::Half)));
+            }
+            // attention: A with the prior state, B with A's; the output projections' reduce-scatters queue
+            for l in lanes.iter_mut().enumerate().filter(|(k,_)|g.contains(k)).map(|(_,l)|l) {
+                let z={let _g=Nvtx::new(nv,"gather-z");let g=l.agz.take().unwrap().wait();real(l,g).to_kind(tch::Kind::Float)};
+                let _att=Nvtx::new(nv,if layer.kda.is_some(){"kda"}else{"mla"});
+                let (ls,(part,wo))=crate::weights::with_sp_defer(|| if let Some(kw)=&layer.kda {
+                    let st0=match st.take() {Some(LayerState::Kda(s))=>s,Some(_)=>panic!("层 {i} 状态类型不符"),None=>crate::kda::KdaState::with_heads(z.device(),kw.wq.size()[0]/128)};
+                    let (_o,s2)=crate::kda::kda_forward_state(kw,&z,st0);LayerState::Kda(s2)
+                } else {
+                    let wm=layer.mla.as_ref().unwrap();
+                    let mut s2=match st.take() {Some(LayerState::MlaLatent(s))=>s,Some(_)=>panic!("latent MLA requires latent state"),None=>crate::mla_latent::State::new(wm,crate::mla_latent::capacity())};
+                    let _o=crate::mla_latent::chunk(wm,&z,&mut s2);LayerState::MlaLatent(s2)
+                });
+                st=Some(ls);
+                l.rsa=Some((reduce_scatter_rows_comm(&part),wo));
+            }
+            // FFN inputs: post + pre on this rank's rows, route them, gather the Half input and the packed routes
+            for l in lanes.iter_mut().enumerate().filter(|(k,_)|g.contains(k)).map(|(_,l)|l) {
+                let (pa,wo)=l.rsa.take().unwrap();
+                let a_half=crate::weights::round_row_output(pa.wait(),&wo);
+                assert_eq!(a_half.size()[0],l.half,"SP attention must return this rank's rows");
+                crate::ablate::set_row_base(l.cbase);
+                let (r2,pre2,z2_half)={let _g=Nvtx::new(nv,"mhc-ffn");crate::mhc::mhc_post_pre(&a_half,&l.residual,l.pre.as_ref().unwrap(),&layer.hc.ffn_fn,&layer.hc.ffn_scale,&layer.hc.ffn_base,&layer.hc.post_ln)};
+                l.residual=r2;l.pre2=Some(pre2);
+                if let Some(mm)=&layer.moe {
+                    let (ti,wi)={let _g=Nvtx::new(nv,"route");crate::moe::route(&z2_half,&mm.w_gate,&mm.bias,8)};
+                    let packed=Tensor::cat(&[ti.to_kind(tch::Kind::Float),wi.to_kind(tch::Kind::Float)],1).contiguous();
+                    let x16_half=z2_half.to_kind(tch::Kind::Half);
+                    l.agx=Some((all_gather_rows_comm(&x16_half),all_gather_rows_comm(&packed)));
+                } else {l.agz2=Some(all_gather_rows_comm(&z2_half));}
+            }
+            // FFN; the outputs' reduce-scatters queue (waited on at the next layer's post + pre)
+            for l in lanes.iter_mut().enumerate().filter(|(k,_)|g.contains(k)).map(|(_,l)|l) {
+                let pm=if let Some(mm)=&layer.moe {
+                    let (px,pr)=l.agx.take().unwrap();
+                    let (x16,routes)={let _g=Nvtx::new(nv,"gather-z2");(px.wait(),pr.wait())};
+                    let (topi,wts)=(routes.narrow(1,0,8).to_kind(tch::Kind::Int64),routes.narrow(1,8,8).contiguous());
+                    let _f=Nvtx::new(nv,"moe");
+                    let shared={let _g=Nvtx::new(nv,"shared");match crate::moe::shared_partial_half(mm,&x16) {Some(p)=>p,None=>
+                        crate::weights::mm16_partial(&crate::moe::shared_activation_with_half(mm,&x16.to_kind(tch::Kind::Float),Some(&x16)),&mm.sh_wd)}};
+                    let y={let _g=Nvtx::new(nv,"experts");self.fast.as_mut().unwrap().expert_grouped_add(i,&x16,&topi,&wts,grouped=="recon",Some(&shared))};
+                    drop(shared);
+                    (reduce_scatter_rows_comm(&y.contiguous()),None)
+                } else {
+                    let z2={let _g=Nvtx::new(nv,"gather-z2");l.agz2.take().unwrap().wait()};   // (padded rows kept, as prefill_record_sp)
+                    let _f=Nvtx::new(nv,"dense-mlp");
+                    let (_y,(part,wd))=crate::weights::with_sp_defer(||mlp_forward_f(i,layer,&z2,&mut self.native,&mut self.pool));
+                    (reduce_scatter_rows_comm(&part),Some(wd))
+                };
+                let pre2=l.pre2.take().unwrap();
+                // (the dense layers' row output is rounded like row_mm16's when waited on; the MoE sum is used as is)
+                let (pm,wd)=pm;
+                if collect && [5,14,24,33,42].contains(&i) && i<n-1 {l.feat_pending=true;}
+                if i==n-1 {crate::ablate::set_row_base(l.cbase);let m=pm.wait();let m=match wd {Some(wd)=>crate::weights::round_row_output(m,&wd),None=>m};l.residual=mhc_post(&m,&l.residual,&pre2);}
+                else {l.deferred=Some((pre2,pm,wd));}
+            }
+          }
+          states.push(st.take().unwrap());
+        }
+        crate::ablate::set_row_base(0);
+        crate::moefast::route_error_check(self.w.device);
+        // features in layer order, each A's rows then B's
+        if collect {
+            let fa:Vec<Tensor>=lanes[0].feats.drain(..).map(|p|p.wait()).collect();
+            let fb:Vec<Tensor>=lanes[1].feats.drain(..).map(|p|p.wait()).collect();
+            for (a,b) in fa.into_iter().zip(fb) {feats_out.push(Tensor::cat(&[real(&lanes[0],a),real(&lanes[1],b)],0));}
+        }
+        let lb=&lanes[1];
+        let s=hc_contract(&lb.residual);
+        let s_last=if last {all_gather_rows_comm(&s.narrow(0,(lb.t-1)%lb.half,1)).wait().narrow(0,(lb.t-1)/lb.half,1)} else {
+            let sa=hc_contract(&lanes[0].residual);
+            Tensor::cat(&[real(&lanes[0],all_gather_rows_comm(&sa).wait()),real(lb,all_gather_rows_comm(&s).wait())],0)};
+        crate::tp::comm_mode(false);
+        let sq=&s_last*&s_last;let ms=sq.mean_dim(&[-1i64][..],true,tch::Kind::Float);
+        let z=crate::ablate::clamp_final(&self.w.final_norm*(s_last*(ms+1e-5).rsqrt()));
+        let logits=self.w.logits(&z);
+        (logits,DecodeStates(states),feats_out)
+    }
     fn prefill_record_impl(&mut self,ids:&Tensor,ds:Option<DecodeStates>,collect:bool,last:bool)->(Tensor,DecodeStates,Vec<Tensor>) {
         // GLM53_PREFILL_SP_ALL=1 (diagnostic): every row's logits through the sequence-parallel path too
+        if last || std::env::var("GLM53_PREFILL_SP_ALL").as_deref()==Ok("1") {
+            if let Some(ta)=self.sp_pair_eligible(ids.size()[0]) {
+                // GLM53_PREFILL_SP_PAIR_CHECK=1: also the two plain calls on a snapshot, compared (logits, features, states)
+                let chk=std::env::var("GLM53_PREFILL_SP_PAIR_CHECK").unwrap_or_default();
+                if chk=="1" || chk=="2" {
+                    let snap=ds.as_ref().map(snapshot);
+                    // (2: the reference twice -- how reproducible the plain calls are)
+                    let (lp,sp,fp)=if chk=="1" {self.prefill_record_sp_pair(ids,ds,collect,last,ta)} else {
+                        let (_l1,s1,f1)=self.prefill_record_sp(&ids.narrow(0,0,ta),ds,collect,last).expect("SP prefill");
+                        let (l2,s2,f2)=self.prefill_record_sp(&ids.narrow(0,ta,ids.size()[0]-ta),Some(s1),collect,last).expect("SP prefill");
+                        (l2,s2,f1.into_iter().zip(f2).map(|(a,b)|Tensor::cat(&[a,b],0)).collect())};
+                    let (_l1,s1,f1)=self.prefill_record_sp(&ids.narrow(0,0,ta),snap,collect,last).expect("SP prefill");
+                    let (l2,s2,f2)=self.prefill_record_sp(&ids.narrow(0,ta,ids.size()[0]-ta),Some(s1),collect,last).expect("SP prefill");
+                    let fd:Vec<(f64,f64)>=fp.iter().zip(f1.iter().zip(f2.iter())).map(|(p,(a,b))|{let na=a.size()[0];
+                        (f64::try_from((p.narrow(0,0,na)-a).abs().max()).unwrap(),f64::try_from((p.narrow(0,na,p.size()[0]-na)-b).abs().max()).unwrap())}).collect();
+                    eprintln!("[sp-pair-check] rows {} (a {ta}): logits {} features {:?} (n {} vs {}+{}) states {}",ids.size()[0],
+                        f64::try_from((&lp-&l2).abs().max()).unwrap(),fd,fp.len(),f1.len(),f2.len(),states_max_diff(&sp,&s2));
+                    return (l2,s2,{let mut f=f1;for (a,b) in f.iter_mut().zip(f2) {*a=Tensor::cat(&[a.shallow_clone(),b],0);} f});
+                }
+                return self.prefill_record_sp_pair(ids,ds,collect,last,ta);
+            }
+        }
+        if let Some(a)=self.sp_pair_chunk(ids.size()[0]) {
+            // not pairable (e.g. B under 128 rows): the two chunks one after the other, as with the server's plain chunk
+            let t=ids.size()[0];
+            let (_l1,s1,f1)=self.prefill_record_impl(&ids.narrow(0,0,a),ds,collect,last);
+            let (l2,s2,f2)=self.prefill_record_impl(&ids.narrow(0,a,t-a),Some(s1),collect,last);
+            return (l2,s2,{let mut f=f1;for (x,y) in f.iter_mut().zip(f2) {*x=Tensor::cat(&[x.shallow_clone(),y],0);} f});
+        }
         if (last || std::env::var("GLM53_PREFILL_SP_ALL").as_deref()==Ok("1")) && self.sp_eligible(ids.size()[0]) {
             return self.prefill_record_sp(ids,ds,collect,last).expect("SP prefill");
         }

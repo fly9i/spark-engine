@@ -616,6 +616,35 @@ pub fn index_score(q: &Tensor, k: &Tensor, w: &Tensor, pos: &Tensor, ratio: i64)
     out
 }
 
+/// Key-split indexer steps (model.rs index_key_split): pack this rank's top k (local indices `loc` [T, k] into the
+/// scores s [T, n] of keys k0..) as (score bits, key index) Int32 pairs [T, k, 2].
+pub fn ks_pack(s: &Tensor, loc: &Tensor, k0: i64) -> Tensor {
+    extern "C" { fn ds41_ks_pack(s: *const std::ffi::c_void, n: i32, loc: *const i64, k: i32, k0: i32, out: *mut std::ffi::c_void, t: i32, st: *mut std::ffi::c_void) -> i32; }
+    let (t, n, k) = (s.size()[0], s.size()[1], loc.size()[1]);
+    let (s, loc) = (s.contiguous(), loc.contiguous());
+    let out = Tensor::empty([t, k, 2], (Kind::Int, s.device()));
+    assert_eq!(unsafe { ds41_ks_pack(s.data_ptr(), n as i32, loc.data_ptr() as *const i64, k as i32, k0 as i32, out.data_ptr(), t as i32, rs_current_stream()) }, 0, "ds41_ks_pack");
+    out
+}
+/// The gathered pairs [W, T, k, 2] -> (scores [T, W k] BF16, key indices [T, W k] Int32), rank order.
+pub fn ks_unpack(all: &Tensor) -> (Tensor, Tensor) {
+    extern "C" { fn ds41_ks_unpack(all: *const std::ffi::c_void, w: i32, t: i32, k: i32, vals: *mut std::ffi::c_void, idx: *mut i32, st: *mut std::ffi::c_void) -> i32; }
+    let (w, t, k) = (all.size()[0], all.size()[1], all.size()[2]);
+    let vals = Tensor::empty([t, w * k], (Kind::BFloat16, all.device()));
+    let idx = Tensor::empty([t, w * k], (Kind::Int, all.device()));
+    assert_eq!(unsafe { ds41_ks_unpack(all.data_ptr(), w as i32, t as i32, k as i32, vals.data_ptr(), idx.data_ptr() as *mut i32, rs_current_stream()) }, 0, "ds41_ks_unpack");
+    (vals, idx)
+}
+/// The selected positions sel [T, k] of the merged lists -> pool indices idx[sel] + offset (-1 stays).
+pub fn ks_final(sel: &Tensor, idx: &Tensor, offset: i64) -> Tensor {
+    extern "C" { fn ds41_ks_final(sel: *const i64, idx: *const i32, wk: i32, k: i32, offset: i64, out: *mut i64, t: i32, st: *mut std::ffi::c_void) -> i32; }
+    let (t, k, wk) = (sel.size()[0], sel.size()[1], idx.size()[1]);
+    let sel = sel.contiguous();
+    let out = Tensor::empty([t, k], (Kind::Int64, sel.device()));
+    assert_eq!(unsafe { ds41_ks_final(sel.data_ptr() as *const i64, idx.data_ptr() as *const i32, wk as i32, k as i32, offset, out.data_ptr() as *mut i64, t as i32, rs_current_stream()) }, 0, "ds41_ks_final");
+    out
+}
+
 /// `index_score` with the non-candidate keys -inf (cand Bool [T, Tc]: score.masked_fill(!cand, -inf) bit for bit; tiles
 /// with no candidate are not scored). None: the kernel takes no candidates for these rows (the caller masks).
 pub fn index_score_cand(q: &Tensor, k: &Tensor, w: &Tensor, pos: &Tensor, ratio: i64, cand: &Tensor) -> Option<Tensor> {
@@ -1526,6 +1555,58 @@ pub fn test(ckpt: &std::path::Path) {
     }
     if std::env::var("DS41_KT_ONLY").as_deref() == Ok("s2") { s2_test(&ck, dev); return; }
     if std::env::var("DS41_KT_ONLY").as_deref() == Ok("rs") { rs_test(dev); return; }
+    if std::env::var("DS41_KT_ONLY").as_deref() == Ok("topk") {
+        // topk_idx: the multi-CTA path for few long rows (tkw) against the one-CTA-per-row kernel, bitwise: heavy ties
+        // (scores on a coarse grid), -inf runs (candidate layers), rows with lens < Tc, odd widths
+        extern "C" { fn ds41_topk_wide_force(v: i32); }
+        let mut bad = 0;
+        for &tc in &[32768i64, 49152, 65536, 98304, 262147, 1048576] {
+            for &t in &[1i64, 6] {
+                for &(k, grid) in &[(512i64, 4.0f64), (2048, 16.0), (512, 1024.0)] {
+                    let mut sc = (Tensor::randn([t, tc], (Kind::Float, dev)) * grid).round() / grid;
+                    if grid > 100.0 { sc = sc.masked_fill(&Tensor::rand([t, tc], (Kind::Float, dev)).gt(16384.0 / tc as f64), f64::NEG_INFINITY); }
+                    let sc = sc.to_kind(Kind::BFloat16);
+                    let pos = Tensor::randint_low(tc / 2, tc, [t], (Kind::Int64, dev));
+                    let time = |f: &dyn Fn() -> Tensor| { for _ in 0..3 { let _ = f(); } tch::Cuda::synchronize(0);
+                        let t0 = std::time::Instant::now(); for _ in 0..20 { let _ = f(); } tch::Cuda::synchronize(0); t0.elapsed().as_secs_f64() * 1e6 / 20.0 };
+                    unsafe { ds41_topk_wide_force(0) };
+                    let a = topk_idx(&sc, &pos, 1, k, 7);
+                    let ta = time(&|| topk_idx(&sc, &pos, 1, k, 7));
+                    unsafe { ds41_topk_wide_force(1) };
+                    let b = topk_idx(&sc, &pos, 1, k, 7);
+                    let tb = time(&|| topk_idx(&sc, &pos, 1, k, 7));
+                    let same = a.equal(&b);
+                    if !same { bad += 1; }
+                    eprintln!("[ds41-kernel-test] topk_idx Tc={tc} T={t} k={k} grid={grid}: row {ta:.1}us wide {tb:.1}us{}", if same { "" } else { " DIFF" });
+                }
+            }
+        }
+        unsafe { ds41_topk_wide_force(-1) };
+        // the tiled indexer score kernel from 2 rows (DS41_INDEX_TILED_MIN) against the per-row kernel
+        extern "C" { fn ds41_index_tiled_min_force(v: i32); }
+        for &tc in &[8192i64, 16384, 32768, 65536, 131072, 524288] {
+            for &t in &[1i64, 2, 3, 5, 7] {
+                let q = (Tensor::randn([t, 32, 128], (Kind::Float, dev)) * 0.5).to_kind(Kind::BFloat16);
+                let kk = (Tensor::randn([tc, 128], (Kind::Float, dev)) * 0.5).to_kind(Kind::BFloat16);
+                let w = Tensor::randn([t, 32], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+                let pos = Tensor::randint_low(tc / 2, tc, [t], (Kind::Int64, dev));
+                let time = |f: &dyn Fn() -> Tensor| { for _ in 0..3 { let _ = f(); } tch::Cuda::synchronize(0);
+                    let t0 = std::time::Instant::now(); for _ in 0..20 { let _ = f(); } tch::Cuda::synchronize(0); t0.elapsed().as_secs_f64() * 1e6 / 20.0 };
+                unsafe { ds41_index_tiled_min_force(99) };
+                let a = index_score(&q, &kk, &w, &pos, 1);
+                let ta = time(&|| index_score(&q, &kk, &w, &pos, 1));
+                unsafe { ds41_index_tiled_min_force(1) };
+                let b = index_score(&q, &kk, &w, &pos, 1);
+                let tb = time(&|| index_score(&q, &kk, &w, &pos, 1));
+                let same = a.equal(&b);
+                if !same { bad += 1; }
+                eprintln!("[ds41-kernel-test] index_score Tc={tc} T={t}: per-row {ta:.1}us tiled {tb:.1}us{}", if same { "" } else { " DIFF" });
+            }
+        }
+        unsafe { ds41_index_tiled_min_force(0) };
+        eprintln!("[ds41-kernel-test] topk / tiled: {}", if bad == 0 { "ALL IDENTICAL".to_string() } else { format!("{bad} DIFF") });
+        return;
+    }
     if std::env::var("DS41_KT_ONLY").as_deref() == Ok("idx") {
         // the per-row indexer score kernel: key groups per CTA (DS41_INDEX_KT read once per process: here the launches
         // through ds41_index_score_kt_force) and candidate tiles, bitwise against KT = 1 + mask, at real long-context shapes

@@ -386,9 +386,9 @@ __global__ void arn_rows_send_bf16_kernel(const float* data,long long blk_f,long
 }
 // out chunk (FP32) = sum in rank order of this rank's own FP32 partial and the peers' BF16 partials of block `rank`
 __global__ void arn_rows_finish_bf16_kernel(float* out,const float* own,long long blk_f,long long off_f,long long m_f,int rank,int world,
-                                            const Host* h,DevState* st,unsigned long long split){
+                                            const Host* h,DevState* st,unsigned long long split,int wait=1){
   const unsigned long long s=st->fseq+1;const int slot=(int)(s%NSLOT);
-  if(threadIdx.x==0){
+  if(wait&&threadIdx.x==0){
     const bool two=split&&(unsigned long long)m_f*2>=split;
     for(int r=0;r<world;++r){
       if(r==rank)continue;
@@ -478,9 +478,9 @@ __global__ void arn_rows_send_bf16v_kernel(typename std::conditional<std::is_sam
 // out (BF16, this rank's block) chunk = BF16(sum in rank order of the BF16 partials of block `rank`); this rank's own is
 // read back from its send slot (the rounded values it sent)
 __global__ void arn_rows_finish_bf16r_kernel(__nv_bfloat16* out,long long m_f,long long off_f,int rank,int world,
-                                             const Host* h,DevState* st,unsigned long long split){
+                                             const Host* h,DevState* st,unsigned long long split,int wait=1){
   const unsigned long long s=st->fseq+1;const int slot=(int)(s%NSLOT);
-  if(threadIdx.x==0){
+  if(wait&&threadIdx.x==0){
     const bool two=split&&(unsigned long long)m_f*2>=split;
     for(int r=0;r<world;++r){
       if(r==rank)continue;
@@ -505,10 +505,24 @@ __global__ void arn_rows_finish_bf16r_kernel(__nv_bfloat16* out,long long m_f,lo
 }
 // ag: `out` is the whole buffer, `own` this rank's block (copied into its place); else (FP32) `out` is this rank's block,
 // `own` the whole partial buffer: out chunk = sum over r in rank order of block `rank` of rank r's partial
-__global__ void arn_rows_finish_kernel(unsigned char* out,const unsigned char* own,long long blk,long long off,long long m,int rank,int world,
-                                       int ag,const Host* h,DevState* st,unsigned long long split){
+// GLM53_RDMA_ARN_WAIT_SPLIT=1: the row finish kernels' wait for the peers' flags as its own one-CTA launch before them
+// (then launched with wait = 0): a finish kernel issued early (comm stream, overlapped with compute) otherwise holds up to
+// GLM53_RDMA_ARN_BIG_BLOCKS CTAs spinning on the SMs until the data lands. `two_at`: the split test's byte count.
+__global__ void arn_rows_wait_kernel(int rank,int world,unsigned long long two_at,const Host* h,const DevState* st,unsigned long long split){
   const unsigned long long s=st->fseq+1;const int slot=(int)(s%NSLOT);
-  if(threadIdx.x==0){
+  if(threadIdx.x!=0)return;
+  const bool two=split&&two_at>=split;
+  for(int r=0;r<world;++r){
+    if(r==rank)continue;
+    long long spins=0;
+    while(h->recv_flag[r][0][slot]!=s||(two&&h->recv_flag[r][1][slot]!=s)){if(++spins>(1ll<<34))__trap();}
+  }
+}
+static bool arn_wait_split(){static const bool on=[]{const char* e=std::getenv("GLM53_RDMA_ARN_WAIT_SPLIT");return e&&e[0]=='1';}();return on;}
+__global__ void arn_rows_finish_kernel(unsigned char* out,const unsigned char* own,long long blk,long long off,long long m,int rank,int world,
+                                       int ag,const Host* h,DevState* st,unsigned long long split,int wait=1){
+  const unsigned long long s=st->fseq+1;const int slot=(int)(s%NSLOT);
+  if(wait&&threadIdx.x==0){
     const bool two=split&&(unsigned long long)m>=split;
     for(int r=0;r<world;++r){
       if(r==rank)continue;
@@ -841,7 +855,8 @@ extern "C" int glm53_rdma_arn_rows_cuda(const void* in,void* out,long long blk,i
   for(long long t=0;t<nch+K;++t){
     if(t<nch)arn_rows_send_kernel<<<blocks(len(t)),256,0,s>>>(i8,blk,t*mmax,len(t),g_rank,g_world,ag,flags,g_host_dev,g_state);
     const long long a=t-K;
-    if(a>=0)arn_rows_finish_kernel<<<blocks(len(a)),256,0,s>>>(o8,i8,blk,a*mmax,len(a),g_rank,g_world,ag,g_host_dev,g_state,g_split);
+    if(a>=0){const int w=!arn_wait_split();if(!w)arn_rows_wait_kernel<<<1,32,0,s>>>(g_rank,g_world,(unsigned long long)len(a),g_host_dev,g_state,g_split);
+      arn_rows_finish_kernel<<<blocks(len(a)),256,0,s>>>(o8,i8,blk,a*mmax,len(a),g_rank,g_world,ag,g_host_dev,g_state,g_split,w);}
   }
   return (int)cudaGetLastError();
 }
@@ -858,7 +873,8 @@ extern "C" int glm53_rdma_arn_rows_bf16_cuda(const float* in,float* out,long lon
   for(long long t=0;t<nch+K;++t){
     if(t<nch)arn_rows_send_bf16_kernel<<<blocks(len(t)),256,0,s>>>(in,blk_f,t*mmax,len(t),g_world,flags,g_host_dev,g_state);
     const long long a=t-K;
-    if(a>=0)arn_rows_finish_bf16_kernel<<<blocks(len(a)),256,0,s>>>(out,in,blk_f,a*mmax,len(a),g_rank,g_world,g_host_dev,g_state,g_split);
+    if(a>=0){const int w=!arn_wait_split();if(!w)arn_rows_wait_kernel<<<1,32,0,s>>>(g_rank,g_world,(unsigned long long)len(a)*2,g_host_dev,g_state,g_split);
+      arn_rows_finish_bf16_kernel<<<blocks(len(a)),256,0,s>>>(out,in,blk_f,a*mmax,len(a),g_rank,g_world,g_host_dev,g_state,g_split,w);}
   }
   return (int)cudaGetLastError();
 }
@@ -875,7 +891,8 @@ template<class T> static int rows_bf16r(typename std::conditional<std::is_same<T
   for(long long t=0;t<nch+K;++t){
     if(t<nch)arn_rows_send_bf16v_kernel<T><<<blocks(len(t)),256,0,s>>>(in,blk_f,t*mmax,len(t),n_valid,g_world,flags,g_host_dev,g_state);
     const long long a=t-K;
-    if(a>=0)arn_rows_finish_bf16r_kernel<<<blocks(len(a)),256,0,s>>>((__nv_bfloat16*)out,len(a),a*mmax,g_rank,g_world,g_host_dev,g_state,g_split);
+    if(a>=0){const int w=!arn_wait_split();if(!w)arn_rows_wait_kernel<<<1,32,0,s>>>(g_rank,g_world,(unsigned long long)len(a)*2,g_host_dev,g_state,g_split);
+      arn_rows_finish_bf16r_kernel<<<blocks(len(a)),256,0,s>>>((__nv_bfloat16*)out,len(a),a*mmax,g_rank,g_world,g_host_dev,g_state,g_split,w);}
   }
   return (int)cudaGetLastError();
 }

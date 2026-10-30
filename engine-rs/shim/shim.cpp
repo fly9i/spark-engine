@@ -892,6 +892,12 @@ extern "C" int rs_sp_reduce_scatter_comb(const void* pout, int pair_b16, const i
     if (async) return -1;
     return f(at::cuda::getCurrentCUDAStream()) == 0 ? 0 : -2;
 }
+// GLM TP3 paired prefill: rs_reduce_scatter's FP32 row-block path issued on the comm stream without joining; >= 0: a
+// handle for rs_ar_wait, < 0: not available (the caller reduces synchronously)
+extern "C" int rs_reduce_scatter_comm_async(void* in, void* out, int64_t numel_out) {
+    if (!rdma_arn_on() || !g_comm_mode || (numel_out * 4) % 16) return -1;
+    return on_comm([&](cudaStream_t s) { return glm53_rdma_arn_rows_cuda(in, out, numel_out * 4, 0, s); }, false);
+}
 extern "C" int rs_sp_all_gather(const void* in, void* out, int64_t bytes, int async) {
     if (!rdma_arn_on() || bytes % 16) return -1;
     auto f = [&](cudaStream_t s) { return glm53_rdma_arn_rows_cuda(in, out, bytes, 1, s); };
@@ -965,9 +971,11 @@ extern "C" int rs_reduce_scatter(void* in, void* out, int64_t numel_out, int dty
         // P5: FP32 over both RoCE ports (bitwise equal: 2-rank sum x0+x1).
         if (rdma_big_on() && dtype == 2 && (unsigned long long)numel_out * 4 <= glm53_rdma_big_max_bytes() && ((unsigned long long)numel_out * 4) % 16 == 0)
             return glm53_rdma_big_reduce_scatter(in, out, (unsigned long long)numel_out * 4, at::cuda::getCurrentCUDAStream());
-        // TP3: row blocks over the N-way RDMA (NCCL is socket-only there)
-        if (rdma_arn_on() && dtype == 2 && (numel_out * 4) % 16 == 0)
+        // TP3: row blocks over the N-way RDMA (NCCL is socket-only there); in comm mode on the comm stream, joined
+        if (rdma_arn_on() && dtype == 2 && (numel_out * 4) % 16 == 0) {
+            if (g_comm_mode) return on_comm([&](cudaStream_t s) { return glm53_rdma_arn_rows_cuda(in, out, numel_out * 4, 0, s); }, true) == 0 ? 0 : 1;
             return glm53_rdma_arn_rows_cuda(in, out, numel_out * 4, 0, at::cuda::getCurrentCUDAStream());
+        }
         auto i = blob(in, {numel_out * g_world}, dtype);auto o = blob(out, {numel_out}, dtype);
         c10d::ReduceScatterOptions opts;opts.reduceOp=c10d::ReduceOp::SUM;
         g_pg->_reduce_scatter_base(o, i, opts)->wait();return 0;
@@ -1003,8 +1011,10 @@ extern "C" int rs_all_gather(void* in, void* out, int64_t numel_in, int dtype) {
         const int64_t esize = dtype == 2 ? 4 : (dtype == 3 ? 8 : 2);
         if (rdma_big_on() && (unsigned long long)(numel_in * esize) <= glm53_rdma_big_max_bytes() && (numel_in * esize) % 16 == 0)
             return glm53_rdma_big_all_gather(in, out, (unsigned long long)(numel_in * esize), at::cuda::getCurrentCUDAStream());
-        if (rdma_arn_on() && (numel_in * esize) % 16 == 0)
+        if (rdma_arn_on() && (numel_in * esize) % 16 == 0) {
+            if (g_comm_mode) return on_comm([&](cudaStream_t s) { return glm53_rdma_arn_rows_cuda(in, out, numel_in * esize, 1, s); }, true) == 0 ? 0 : 1;
             return glm53_rdma_arn_rows_cuda(in, out, numel_in * esize, 1, at::cuda::getCurrentCUDAStream());
+        }
         auto i = blob(in, {numel_in}, dtype);auto o = blob(out, {numel_in * g_world}, dtype);
         g_pg->_allgather_base(o, i)->wait();return 0;
     } catch (const std::exception& e) {fprintf(stderr, "[shim] all_gather: %s\n", e.what());return 1;}

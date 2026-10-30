@@ -399,6 +399,50 @@ impl PendingGather {
         assert_eq!(unsafe{rs_work_wait(self.handle)},0,"all_gather wait");self.out
     }
 }
+/// GLM TP3 paired prefill (GLM53_PREFILL_SP_PAIR): every collective of the rows path on the comm stream in issue
+/// order (the same order on every rank); the async ones return a CommPending whose `wait` makes the current stream
+/// wait (no host block). Leaving the mode joins the comm stream.
+pub fn comm_mode(on:bool) {
+    if pair_sync() {return;}
+    settle_pending();
+    extern "C"{fn rs_comm_mode(on:i32)->i32;}
+    assert_eq!(unsafe{rs_comm_mode(i32::from(on))},0,"rs_comm_mode");
+}
+pub struct CommPending {out:Tensor,_keep:Vec<Tensor>,h:i32}
+impl CommPending {
+    pub fn wait(self)->Tensor {
+        if self.h<0 {return self.out;}   // (done synchronously)
+        extern "C"{fn rs_ar_wait(h:i32)->i32;}
+        assert_eq!(unsafe{rs_ar_wait(self.h)},0,"rs_ar_wait");self.out
+    }
+}
+fn pair_sync()->bool {static E:std::sync::OnceLock<bool>=std::sync::OnceLock::new();*E.get_or_init(||std::env::var("GLM53_PREFILL_SP_PAIR_SYNC").as_deref()==Ok("1"))}
+/// all_gather_rows on the comm stream (comm mode), not joined.
+pub fn all_gather_rows_comm(t:&Tensor)->CommPending {
+    if pair_sync() {return CommPending{out:all_gather_rows(t),_keep:vec![],h:-1};}
+    settle_pending();
+    assert!(is_tp());let t=t.contiguous();
+    extern "C"{fn rs_sp_all_gather(i:*const std::ffi::c_void,o:*mut std::ffi::c_void,bytes:i64,async_:i32)->i32;}
+    let mut shape=t.size();shape[0]*=world().world as i64;let out=Tensor::empty(shape.as_slice(),(t.kind(),t.device()));
+    let bytes=t.numel() as i64*t.kind().elt_size_in_bytes() as i64;
+    let h=unsafe{rs_sp_all_gather(t.data_ptr(),out.data_ptr(),bytes,1)};
+    assert!(h>=0,"rs_sp_all_gather async ({bytes} bytes)");CommPending{out,_keep:vec![t],h}
+}
+/// reduce_scatter_rows (FP32) on the comm stream (comm mode), not joined: the same rank-block sum.
+pub fn reduce_scatter_rows_comm(t:&Tensor)->CommPending {
+    if pair_sync() {return CommPending{out:reduce_scatter_rows(t),_keep:vec![],h:-1};}
+    settle_pending();
+    assert!(is_tp());assert!(t.is_contiguous());assert_eq!(t.kind(),tch::Kind::Float);
+    let w=world().world as i64;
+    let t=if t.size()[0]%w!=0 {
+        let mut shape=t.size();shape[0]=(shape[0]+w-1)/w*w;
+        let p=Tensor::zeros(shape.as_slice(),(t.kind(),t.device()));let _=p.narrow(0,0,t.size()[0]).copy_(t);p
+    } else {t.shallow_clone()};
+    extern "C"{fn rs_reduce_scatter_comm_async(i:*mut u8,o:*mut u8,n:i64)->i32;}
+    let mut shape=t.size();shape[0]/=w;let out=Tensor::empty(shape.as_slice(),(t.kind(),t.device()));
+    let h=unsafe{rs_reduce_scatter_comm_async(t.data_ptr() as *mut u8,out.data_ptr() as *mut u8,out.numel() as i64)};
+    assert!(h>=0,"rs_reduce_scatter_comm_async");CommPending{out,_keep:vec![t],h}
+}
 /// Rows of `own` (this rank's) and `other` in rank order, concatenated along dim 0.
 pub fn cat_rank_rows(own:&Tensor,other:&Tensor)->Tensor {
     if world().rank==0 {Tensor::cat(&[own,other],0)} else {Tensor::cat(&[other,own],0)}

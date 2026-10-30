@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cub/block/block_scan.cuh>
+#include <cub/block/block_reduce.cuh>
 #include "topk_select.cuh"
 
 namespace {
@@ -812,24 +813,205 @@ extern "C" int ds41_event_record(void* e, cudaStream_t st) { return (int)cudaEve
 extern "C" int ds41_event_sync(void* e) { return (int)cudaEventSynchronize((cudaEvent_t)e); }
 extern "C" int ds41_event_free(void* e) { return (int)cudaEventDestroy((cudaEvent_t)e); }
 
+// topk_idx for a few long rows (decode / verify at long contexts: one CTA per row scanned a 1M-wide row three times on
+// one SM, ~0.3 ms per index layer at 512k): each row split into slices of TKW_SL keys, one CTA per (slice, row). The
+// same selection and output as topk_idx_kernel (the k largest keys, ties to the lower index, ascending index order,
+// -1 at index >= lens): the two 8-bit radix passes add slice histograms into a global one, a one-CTA-per-row step finds
+// the digit / count still needed (the same scan as topk_threshold), then every slice counts its keys above / equal to
+// the threshold and writes its selected indices at the offset the earlier slices' counts give. Not in topk_select.cuh:
+// its users take one CTA per row; this is the DS41 output format (pool indices + offset, -1 past lens).
+constexpr int TKW_SL = 16384, TKW_NT = 256;
+struct TkwRow { unsigned prefix; int need; };
+__global__ __launch_bounds__(TKW_NT) void tkw_hist_kernel(const __nv_bfloat16* __restrict__ score, int Tc, unsigned* __restrict__ hist,
+                                                          const TkwRow* __restrict__ st, int pass) {
+  __shared__ unsigned h[256];
+  const int t = blockIdx.y, c0 = blockIdx.x * TKW_SL, c1 = min(Tc, c0 + TKW_SL);
+  const __nv_bfloat16* row = score + (long long)t * Tc;
+  h[threadIdx.x] = 0;
+  __syncthreads();
+  const unsigned want = pass ? st[t].prefix : 0u;
+  for (int i = c0 + threadIdx.x; i < c1; i += TKW_NT) {
+    const unsigned key = tk_key(row[i]);
+    if (pass == 0) atomicAdd(&h[key >> 8], 1u);
+    else if ((key >> 8) == want) atomicAdd(&h[key & 255u], 1u);
+  }
+  __syncthreads();
+  if (h[threadIdx.x]) atomicAdd(&hist[t * 256 + threadIdx.x], h[threadIdx.x]);
+}
+// digit of this pass: the count from the top reaches need; hist[t] zeroed for the next pass
+__global__ __launch_bounds__(32) void tkw_digit_kernel(unsigned* __restrict__ hist, TkwRow* __restrict__ st, int k, int pass) {
+  const int t = blockIdx.x, lane = threadIdx.x;
+  unsigned* hh = hist + t * 256;
+  unsigned c[8]; unsigned s = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) { c[j] = hh[255 - 8 * lane - j]; s += c[j]; }
+  unsigned inc = s;
+#pragma unroll
+  for (int off = 1; off < 32; off <<= 1) { const unsigned v = __shfl_up_sync(0xffffffffu, inc, off); if (lane >= off) inc += v; }
+  const unsigned exc = inc - s, nd = pass ? (unsigned)st[t].need : (unsigned)k;
+  const unsigned hit = __ballot_sync(0xffffffffu, inc >= nd);
+  const int first = __ffs(hit) - 1;
+  __syncwarp();
+  if (lane == first) {
+    unsigned run = exc; int j = 0;
+    for (; j < 8; ++j) { if (run + c[j] >= nd) break; run += c[j]; }
+    const unsigned digit = 255u - 8u * lane - j;
+    st[t].prefix = pass ? (st[t].prefix << 8) | digit : digit;
+    st[t].need = (int)(nd - run);
+  }
+  __syncwarp();
+#pragma unroll
+  for (int j = 0; j < 8; ++j) hh[8 * lane + j] = 0;
+}
+// per slice: keys above / equal to the threshold
+__global__ __launch_bounds__(TKW_NT) void tkw_count_kernel(const __nv_bfloat16* __restrict__ score, int Tc, const TkwRow* __restrict__ st,
+                                                           int2* __restrict__ cnt) {
+  const int t = blockIdx.y, c0 = blockIdx.x * TKW_SL, c1 = min(Tc, c0 + TKW_SL);
+  const __nv_bfloat16* row = score + (long long)t * Tc;
+  const unsigned thr = st[t].prefix;
+  int gt = 0, eq = 0;
+  for (int i = c0 + threadIdx.x; i < c1; i += TKW_NT) { const unsigned key = tk_key(row[i]); gt += key > thr; eq += key == thr; }
+  typedef cub::BlockReduce<int, TKW_NT> Red;
+  __shared__ typename Red::TempStorage tg, te;
+  gt = Red(tg).Sum(gt); eq = Red(te).Sum(eq);
+  if (threadIdx.x == 0) cnt[t * gridDim.x + blockIdx.x] = make_int2(gt, eq);
+}
+// per slice: the selected indices in index order, after those of the earlier slices
+__global__ __launch_bounds__(TKW_NT) void tkw_write_kernel(const __nv_bfloat16* __restrict__ score, const int64_t* __restrict__ pos, int ratio,
+                                                           int Tc, int k, long long offset, const TkwRow* __restrict__ st,
+                                                           const int2* __restrict__ cnt, int64_t* __restrict__ out) {
+  typedef cub::BlockScan<int, TKW_NT> Scan;
+  __shared__ typename Scan::TempStorage tmp;
+  __shared__ int s_carry[2];
+  const int t = blockIdx.y, p = blockIdx.x, c0 = p * TKW_SL, c1 = min(Tc, c0 + TKW_SL);
+  const unsigned thr = st[t].prefix, need = (unsigned)st[t].need;
+  if (threadIdx.x == 0) {
+    int gtb = 0, eqb = 0;
+    for (int j = 0; j < p; ++j) { const int2 v = cnt[t * gridDim.x + j]; gtb += v.x; eqb += v.y; }
+    s_carry[0] = eqb; s_carry[1] = gtb + min(eqb, (int)need);
+  }
+  __syncthreads();
+  const int2 mine = cnt[t * gridDim.x + p];
+  if (mine.x == 0 && (mine.y == 0 || (unsigned)s_carry[0] >= need)) return;
+  const __nv_bfloat16* row = score + (long long)t * Tc;
+  const long long lens = (pos[t] + 1) / ratio;
+  for (int b0 = c0; b0 < c1; b0 += TKW_NT) {
+    const int i = b0 + threadIdx.x;
+    const unsigned key = i < c1 ? tk_key(row[i]) : 0u;
+    const int eq = i < c1 && key == thr, gt = i < c1 && key > thr;
+    if (__syncthreads_count(eq | gt) == 0) continue;
+    int eqr, eqt;
+    Scan(tmp).ExclusiveSum(eq, eqr, eqt);
+    __syncthreads();
+    const int sel = gt || (eq && (unsigned)(s_carry[0] + eqr) < need);
+    int sr, stt;
+    Scan(tmp).ExclusiveSum(sel, sr, stt);
+    if (sel) out[(long long)t * k + s_carry[1] + sr] = i >= lens ? -1 : (long long)i + offset;
+    __syncthreads();
+    if (threadIdx.x == 0) { s_carry[0] += eqt; s_carry[1] += stt; }
+    __syncthreads();
+  }
+}
+// workspace of the wide path (eager only: grown with cudaMalloc, never during a graph capture)
+static int g_tkw_force = -1;   // (ds41-kernel-test: 0 off, 1 on, -1 DS41_TOPK_WIDE_MIN)
+extern "C" void ds41_topk_wide_force(int v) { g_tkw_force = v; }
+static unsigned* g_tkw_hist = nullptr; static TkwRow* g_tkw_st = nullptr; static int2* g_tkw_cnt = nullptr; static size_t g_tkw_cap = 0;
+static bool tkw_run(const __nv_bfloat16* score, const int64_t* pos, int ratio, int T, int Tc, int k, long long offset, int64_t* out, cudaStream_t st) {
+  static const int wide_min = std::getenv("DS41_TOPK_WIDE_MIN") ? std::atoi(std::getenv("DS41_TOPK_WIDE_MIN")) : 65536;
+  if (g_tkw_force == 0 || (g_tkw_force < 0 && (wide_min <= 0 || Tc < wide_min)) || T > 16) return false;
+  cudaStreamCaptureStatus cs;
+  if (cudaStreamIsCapturing(st, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) return false;
+  const int P = (Tc + TKW_SL - 1) / TKW_SL;
+  const size_t need_cap = (size_t)T * P;
+  if (need_cap > g_tkw_cap || !g_tkw_hist) {
+    cudaStreamSynchronize(st);
+    cudaFree(g_tkw_hist); cudaFree(g_tkw_st); cudaFree(g_tkw_cnt);
+    const size_t cap = need_cap > 16 * 128 ? need_cap : 16 * 128;   // 16 rows of up to 2M keys
+    if (cudaMalloc(&g_tkw_hist, 16 * 256 * sizeof(unsigned)) || cudaMalloc(&g_tkw_st, 16 * sizeof(TkwRow)) || cudaMalloc(&g_tkw_cnt, cap * sizeof(int2))) {
+      g_tkw_hist = nullptr; g_tkw_cap = 0; return false;
+    }
+    cudaMemset(g_tkw_hist, 0, 16 * 256 * sizeof(unsigned));   // the digit kernel leaves it zeroed after each pass
+    g_tkw_cap = cap;
+  }
+  const dim3 g(P, T);
+  tkw_hist_kernel<<<g, TKW_NT, 0, st>>>(score, Tc, g_tkw_hist, g_tkw_st, 0);
+  tkw_digit_kernel<<<T, 32, 0, st>>>(g_tkw_hist, g_tkw_st, k, 0);
+  tkw_hist_kernel<<<g, TKW_NT, 0, st>>>(score, Tc, g_tkw_hist, g_tkw_st, 1);
+  tkw_digit_kernel<<<T, 32, 0, st>>>(g_tkw_hist, g_tkw_st, k, 1);
+  tkw_count_kernel<<<g, TKW_NT, 0, st>>>(score, Tc, g_tkw_st, g_tkw_cnt);
+  tkw_write_kernel<<<g, TKW_NT, 0, st>>>(score, pos, ratio, Tc, k, offset, g_tkw_st, g_tkw_cnt, out);
+  return true;
+}
 extern "C" int ds41_topk_idx(const void* score, const int64_t* pos, int ratio, int T, int Tc, int k, long long offset, int64_t* out, cudaStream_t st) {
   if (T < 1 || k < 1 || k > Tc) return 1;
+  // few long rows (DS41_TOPK_WIDE_MIN: least width, 65536; 0 off): the multi-CTA path, the same output (1M-wide row:
+  // 0.87 ms -> 0.06 ms; at 32k the six launches lose)
+  if (tkw_run((const __nv_bfloat16*)score, pos, ratio, T, Tc, k, offset, out, st)) return (int)cudaGetLastError();
   pdl_launch(topk_idx_kernel, dim3(T), dim3(TK_THREADS), 0, st, (const __nv_bfloat16*)score, pos, ratio, Tc, k, offset, out);
+  return (int)cudaGetLastError();
+}
+// Key-split indexer (decode at long contexts; model.rs index_key_split): the pack / unpack / final steps around the
+// all-gather of each rank's top k, one launch each instead of ~20 small libtorch ops per index layer.
+// pack: pairs[t][j] = (score bits of local index loc[t][j] (-inf bits for -1), loc + k0 or -1)
+__global__ void ks_pack_kernel(const __nv_bfloat16* __restrict__ s, int n, const int64_t* __restrict__ loc, int k, int k0, int2* __restrict__ out, int T) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= T * k) return;
+  const int t = i / k;
+  const long long l = loc[i];
+  const unsigned short bits = l >= 0 ? __bfloat16_as_ushort(s[(long long)t * n + l]) : (unsigned short)0xFF80u;
+  out[i] = make_int2((int)bits, l >= 0 ? (int)(l + k0) : -1);
+}
+// unpack: all [W][T][k] pairs -> vals [T][W k] BF16 and idx [T][W k] in rank order
+__global__ void ks_unpack_kernel(const int2* __restrict__ all, int W, int T, int k, __nv_bfloat16* __restrict__ vals, int* __restrict__ idx) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= W * T * k) return;
+  const int r = i / (T * k), t = (i / k) % T, j = i % k;
+  const int2 p = all[i];
+  const long long o = (long long)t * W * k + (long long)r * k + j;
+  vals[o] = __ushort_as_bfloat16((unsigned short)p.x);
+  idx[o] = p.y;
+}
+// final: ids[t][j] = idx[t][sel[t][j]] + offset (-1 stays -1)
+__global__ void ks_final_kernel(const int64_t* __restrict__ sel, const int* __restrict__ idx, int wk, int k, long long offset, int64_t* __restrict__ out, int T) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= T * k) return;
+  const int t = i / k;
+  const int g = idx[(long long)t * wk + sel[i]];
+  out[i] = g < 0 ? -1 : (long long)g + offset;
+}
+extern "C" int ds41_ks_pack(const void* s, int n, const int64_t* loc, int k, int k0, void* out, int T, cudaStream_t st) {
+  ks_pack_kernel<<<(T * k + 255) / 256, 256, 0, st>>>((const __nv_bfloat16*)s, n, loc, k, k0, (int2*)out, T);
+  return (int)cudaGetLastError();
+}
+extern "C" int ds41_ks_unpack(const void* all, int W, int T, int k, void* vals, int* idx, cudaStream_t st) {
+  ks_unpack_kernel<<<(W * T * k + 255) / 256, 256, 0, st>>>((const int2*)all, W, T, k, (__nv_bfloat16*)vals, idx);
+  return (int)cudaGetLastError();
+}
+extern "C" int ds41_ks_final(const int64_t* sel, const int* idx, int wk, int k, long long offset, int64_t* out, int T, cudaStream_t st) {
+  ks_final_kernel<<<(T * k + 255) / 256, 256, 0, st>>>(sel, idx, wk, k, offset, out, T);
   return (int)cudaGetLastError();
 }
 // cand (Bool [T, Tc] or null): the scores of the non-candidate keys are -inf (the per-row kernel skips whole tiles of
 // them: index_score_kt); the tiled kernel takes no cand (returns 2 then: the caller masks)
 static int g_index_kt_force = 0;   // (ds41-kernel-test)
 extern "C" void ds41_index_score_kt_force(int kt) { g_index_kt_force = kt; }
+static int g_index_tiled_min_force = 0;   // (ds41-kernel-test)
+extern "C" void ds41_index_tiled_min_force(int v) { g_index_tiled_min_force = v; }
 extern "C" int ds41_index_score_cand(const void* q, const void* k, const void* w, const int64_t* pos, int ratio, const bool* cand, void* out, int T, int Tc, cudaStream_t st);
 extern "C" int ds41_index_score(const void* q, const void* k, const void* w, const int64_t* pos, int ratio, void* out, int T, int Tc, cudaStream_t st) {
   return ds41_index_score_cand(q, k, w, pos, ratio, nullptr, out, T, Tc, st);
 }
 extern "C" int ds41_index_score_cand(const void* q, const void* k, const void* w, const int64_t* pos, int ratio, const bool* cand, void* out, int T, int Tc, cudaStream_t st) {
   if (T < 1 || Tc < 1) return 0;
-  // many rows (prefill, verify): shared key tiles (DS41_INDEX_TILED=0 the per-row kernel); the same values either way
+  // many rows (prefill, verify): shared key tiles (DS41_INDEX_TILED=0 the per-row kernel); the same values either way.
+  // DS41_INDEX_TILED_LONG (default on): also few rows against many keys (decode / verify at long contexts, where the
+  // per-row kernel reads every key once per row and its 131k+ key ranges miss L2: 512k keys, 1 / 7 rows 0.98 / 6.9 ms
+  // per-row, 0.77 / 0.79 ms tiled; below ~64k keys the tiled kernel's ~0.1 ms floor loses)
   static const bool tiled = !(std::getenv("DS41_INDEX_TILED") && std::getenv("DS41_INDEX_TILED")[0] == '0');
-  if (tiled && T >= 8) {
+  static const bool tiled_long = !(std::getenv("DS41_INDEX_TILED_LONG") && std::getenv("DS41_INDEX_TILED_LONG")[0] == '0');
+  const int tl_force = g_index_tiled_min_force;   // (ds41-kernel-test: 99 never, 1 always for few rows)
+  const bool long_rows = tl_force ? T >= tl_force : (tiled_long && !cand && (Tc >= 131072 || (Tc >= 65536 && T >= 5)));
+  if (tiled && (T >= 8 || long_rows)) {
     if (cand) return 2;
     index_score_tiled_kernel<<<dim3((T + 7) / 8, (Tc + IS_KS - 1) / IS_KS), 256, 0, st>>>((const __nv_bfloat16*)q, (const __nv_bfloat16*)k,
         (const __nv_bfloat16*)w, pos, ratio, (__nv_bfloat16*)out, T, Tc);

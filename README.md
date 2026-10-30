@@ -41,7 +41,7 @@ clock sampled every second, no throttling recorded); GLM's column is older (DGX 
 | **Decode — structured, greedy, thinking off** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 126.6 / 181.9 / 194.8 / 226.0 tok/s | 157.8 / 230.7 / 280.1 / 310.3 tok/s |
 | **Decode — prose, T 1, thinking on** (1/2/3/4 streams) | not measured | 57.2 / 82.2 / 95.0 / 105.5 tok/s | 51.2 / 74.3 / 90.9 / 103.8 tok/s |
 | **Decode — structured, T 1, thinking on** (1/2/3/4 streams) | not measured | 109.2 / 153.3 / 153.5 / 180.9 tok/s | 122.7 / 78.1 / 100.9 / 108.0 tok/s |
-| **Prefill** | ~1,560 tok/s (10K–55K prompts) | ~5,570 tok/s (8K–64K prompts, new text; 4K ~4,760); a decode step at 128K context 27.0 ms | ~2,000 tok/s (13K–77K prompts) |
+| **Prefill** | ~1,560 tok/s (10K–55K prompts) | ~5,570 tok/s (8K–64K prompts, new text; 4K ~4,760); a decode step at 128K context 27.0 ms; 1M-token context: prefill ~4,540 tok/s, decode ~56 tok/s (1 stream, greedy) | ~2,000 tok/s (13K–77K prompts) |
 | **TTFT** (short prompt) | ~370 ms | ~200 ms; 185 ms for a 7K prompt restored from the NVMe prefix cache | ~140 ms |
 | **Startup** (load → serving) | ~33 s | ~16 s (cold start, shards read from NVMe) | ~19 s (cold start) |
 | Speculative decoding | DFlash2 drafter, tree/chain verify | DSpark (the checkpoint's draft stages), drafts per sequence from a cost model | native MTP + prompt-lookup |

@@ -307,4 +307,7 @@ bitwise the same as before. The topology env sets:
 | `GLM53_RDMA_AR_INIT`, `GLM53_TP_SMALL_COMM`, `GLM53_TP_SMALL_COMM_ACTIVE` | `0` | The two-rank transports are off. | — |
 | `GLM53_RDMA_ARN_RS_BF16` | `1` | Prefill row reduce-scatter carries the peers' partial sums as BF16 (own rows FP32, FP32 rank-ordered sum). | L1 |
 | `GLM53_PREFILL_SP_HALF_Z` | `1` | The prefill z all-gather in Half. | L1 |
+| `GLM53_PREFILL_SP_PAIR`, `GLM53_SERVE_CHUNK_SOLO` | `1`, `8192` | A prompt served alone is sent in 8192-row units; each runs as two 4096-row chunks taken through the layers in lockstep (layer i of the first chunk, then layer i of the second), with every collective on the communication stream and waited on only where its result is used, so one chunk's gathers and reduce-scatters overlap the other's attention and MoE. The same computation as two consecutive 4096-row chunks; a unit that cannot be paired (second chunk under 128 rows) runs as the two chunks one after the other. 8K / 32K prefill +3.5% / +3.3%. | L0 |
+| `GLM53_RDMA_ARN_WAIT_SPLIT` | `1` | The row reduce-scatter / all-gather finish kernels wait for the peers in a separate one-CTA kernel instead of in each of their (up to 96) CTAs; without it the early-issued finish kernels of the paired schedule keep SMs spinning and slow the compute. Same results. | L0 |
+| `GLM53_COMM_STREAM_PRIO` | `1` | The communication stream at the highest priority. | L0 |
 | `NCCL_SOCKET_IFNAME`, `NCCL_IB_DISABLE=1` | from `SPARK_TP3_IFNAME` | NCCL only bootstraps the process group over sockets. | — |
