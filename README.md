@@ -21,14 +21,14 @@ One binary runs every model; `start.sh glm|glm3|ds41|qwen` picks one.
 
 ## At a glance
 
-**How decode is measured** (DeepSeek and Qwen, 2026-10-29, v0.3.8; the method commonly used for DGX Spark):
+**How decode is measured** (DeepSeek 2026-10-30, v0.3.9; Qwen 2026-10-29, v0.3.8; the method commonly used for DGX Spark):
 `bench/decode_bench.py` against the running server, two prompts — *prose* (a step-by-step explanation of how a hash map
 works) and *structured* (count from 1 to 200) — 400 output tokens per request, 1 to 4 concurrent requests (each
 concurrent request has a `Request ID: decode-<i>` line before the prompt), median of 5 runs. Every row says its
 sampling: **greedy, thinking off** (temperature 0) or **T 1, thinking on** (temperature 1, reasoning tokens counted).
 Aggregate = all decode tokens / the window from the first token of the earliest request to the last token of the
 latest. GLM's rows are older (2026-10-08, v0.1.1, greedy, thinking off, a `(stream i/n)` suffix instead of the
-`Request ID` line). Prefill, TTFT and startup: DeepSeek and Qwen prefill 2026-10-29, startup 2026-10-28.
+`Request ID` line). Prefill, TTFT and startup: DeepSeek prefill 2026-10-30, Qwen prefill 2026-10-29, startup 2026-10-28.
 More: [docs/benchmarks.md](docs/benchmarks.md), [docs/ds41.md](docs/ds41.md#7-performance). DeepSeek and Qwen were measured
 on the updated system of [Test system and GPU clock](#test-system-and-gpu-clock) at default GPU clocks (sustained runs,
 clock sampled every second, no throttling recorded); GLM's column is older (DGX OS 7.5.0, GPU clock locked at 2,200 MHz).
@@ -37,11 +37,11 @@ clock sampled every second, no throttling recorded); GLM's column is older (DGX 
 | --- | --- | --- | --- |
 | Hardware | 2× DGX Spark (TP2, RoCE); 3× also supported | 3× DGX Spark (TP3, RoCE mesh) | 1× DGX Spark |
 | Architecture | 45 layers: KDA linear-attn + MLA/DSA sparse-attn, 288-expert MoE | 40 layers (20 encoder + 20 decoder): compressed sparse attention with a hierarchical indexer, 384-expert top-6 MoE, Engram n-gram tables, mHC | 48 layers: gated-DeltaNet + QSA sparse-attn, 512-expert top-10 MoE, per-layer n-gram |
-| **Decode — prose, greedy, thinking off** (1/2/3/4 streams) | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 67.3 / 91.7 / 108.4 / 122.7 tok/s | 68.4 / 98.0 / 122.4 / 139.2 tok/s |
-| **Decode — structured, greedy, thinking off** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 126.0 / 177.2 / 190.5 / 222.3 tok/s | 157.8 / 230.7 / 280.1 / 310.3 tok/s |
-| **Decode — prose, T 1, thinking on** (1/2/3/4 streams) | not measured | 58.0 / 80.8 / 94.2 / 103.6 tok/s | 51.2 / 74.3 / 90.9 / 103.8 tok/s |
-| **Decode — structured, T 1, thinking on** (1/2/3/4 streams) | not measured | 100.4 / 157.5 / 157.8 / 165.2 tok/s | 122.7 / 78.1 / 100.9 / 108.0 tok/s |
-| **Prefill** | ~1,560 tok/s (10K–55K prompts) | ~5,550 tok/s (8K–64K prompts, new text; 4K ~4,750) | ~2,000 tok/s (13K–77K prompts) |
+| **Decode — prose, greedy, thinking off** (1/2/3/4 streams) | 52.9 / 66.5 / 73.3 / 82.9 tok/s | 67.4 / 92.8 / 109.3 / 124.7 tok/s | 68.4 / 98.0 / 122.4 / 139.2 tok/s |
+| **Decode — structured, greedy, thinking off** (1/2/3/4 streams) | 92.5 / 119.1 / 158.0 / 168.0 tok/s | 126.6 / 181.9 / 194.8 / 226.0 tok/s | 157.8 / 230.7 / 280.1 / 310.3 tok/s |
+| **Decode — prose, T 1, thinking on** (1/2/3/4 streams) | not measured | 57.2 / 82.2 / 95.0 / 105.5 tok/s | 51.2 / 74.3 / 90.9 / 103.8 tok/s |
+| **Decode — structured, T 1, thinking on** (1/2/3/4 streams) | not measured | 109.2 / 153.3 / 153.5 / 180.9 tok/s | 122.7 / 78.1 / 100.9 / 108.0 tok/s |
+| **Prefill** | ~1,560 tok/s (10K–55K prompts) | ~5,570 tok/s (8K–64K prompts, new text; 4K ~4,760); a decode step at 128K context 27.0 ms | ~2,000 tok/s (13K–77K prompts) |
 | **TTFT** (short prompt) | ~370 ms | ~200 ms; 185 ms for a 7K prompt restored from the NVMe prefix cache | ~140 ms |
 | **Startup** (load → serving) | ~33 s | ~16 s (cold start, shards read from NVMe) | ~19 s (cold start) |
 | Speculative decoding | DFlash2 drafter, tree/chain verify | DSpark (the checkpoint's draft stages), drafts per sequence from a cost model | native MTP + prompt-lookup |

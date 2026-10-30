@@ -883,11 +883,11 @@ static int sp_rs(const void* in, void* out, int64_t blk_f, int64_t n_valid, int 
 }
 extern "C" int rs_sp_reduce_scatter(const void* in, void* out, int64_t blk_f, int64_t n_valid, int async) { return sp_rs(in, out, blk_f, n_valid, async, false); }
 extern "C" int rs_sp_reduce_scatter_b16(const void* in, void* out, int64_t blk_f, int64_t n_valid, int async) { return sp_rs(in, out, blk_f, n_valid, async, true); }
-extern "C" int glm53_rdma_arn_rows_bf16r_comb_cuda(const float*,const int*,const float*,int,int,void*,long long,long long,cudaStream_t);
+extern "C" int glm53_rdma_arn_rows_bf16r_comb_cuda(const void*,int,const int*,const float*,int,int,void*,long long,long long,cudaStream_t);
 // rs_sp_reduce_scatter of a routed-expert combine computed in the send (rdma_arn.cu Comb)
-extern "C" int rs_sp_reduce_scatter_comb(const float* pout, const int* pairmap, const float* add, int topk, int hcols, void* out, int64_t blk_f, int64_t n_valid, int async) {
+extern "C" int rs_sp_reduce_scatter_comb(const void* pout, int pair_b16, const int* pairmap, const float* add, int topk, int hcols, void* out, int64_t blk_f, int64_t n_valid, int async) {
     if (!rdma_arn_on()) return -1;
-    auto f = [&](cudaStream_t s) { return glm53_rdma_arn_rows_bf16r_comb_cuda(pout, pairmap, add, topk, hcols, out, blk_f, n_valid, s); };
+    auto f = [&](cudaStream_t s) { return glm53_rdma_arn_rows_bf16r_comb_cuda(pout, pair_b16, pairmap, add, topk, hcols, out, blk_f, n_valid, s); };
     if (g_comm_mode) { const int r = on_comm(f, !async); return async ? r : (r == 0 ? 0 : -2); }
     if (async) return -1;
     return f(at::cuda::getCurrentCUDAStream()) == 0 ? 0 : -2;
@@ -900,6 +900,13 @@ extern "C" int rs_sp_all_gather(const void* in, void* out, int64_t bytes, int as
     return f(at::cuda::getCurrentCUDAStream()) == 0 ? 0 : -2;
 }
 // 原地 allreduce(SUM);wait() 只挂流依赖,不阻塞 host。
+extern "C" int glm53_rdma_arn_b16_cuda(const void*, void*, long long, cudaStream_t);
+// out = BF16 of the rank-ordered FP32 sum of the BF16 partials `in` (BF16 on the wire; small messages); 1: not eligible
+extern "C" int rs_allreduce_b16(const void* in, void* out, int64_t numel) {
+    if (!rdma_arn_on()) return 1;
+    if (g_comm_mode) { const int r = on_comm([&](cudaStream_t s) { return glm53_rdma_arn_b16_cuda(in, out, numel, s); }, true); return r == 0 ? 0 : 1; }
+    return glm53_rdma_arn_b16_cuda(in, out, numel, at::cuda::getCurrentCUDAStream()) == 0 ? 0 : 1;
+}
 extern "C" int rs_allreduce(void* p, int64_t numel, int dtype) {
     try {
         if (rdma_arn_on() && dtype == 2) {

@@ -440,6 +440,70 @@ __global__ void attn_fin_kernel(const float* __restrict__ pmx, const float* __re
 // Indexer scores (model.py Indexer, the BF16 einsum): out[t][c] = bf16(sum_h bf16(relu(bf16(q[t][h] . k[c])) * w[t][h]))
 // (FP32 head sum), -inf for c >= (pos[t] + 1) / ratio (not yet compressed for that query). 32 heads x 128 dims.
 // grid (ceil(Tc / 64), T), 4 warps of 16 compressed rows; q of the token in shared memory.
+// KT > 1 (index_score_kt): a CTA takes KT groups of 64 keys (group j at blockIdx.x * 64 KT + 64 j), q staged once for all
+// of them and the key loads of the groups independent: the same per-key MMA sequence and epilogue (bitwise KT = 1)
+template <int KT>
+__global__ __launch_bounds__(128) void index_score_kt(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ w, const int64_t* __restrict__ pos, int ratio, __nv_bfloat16* __restrict__ out, int Tc,
+    const bool* __restrict__ cand) {
+  constexpr int NH = 32, ID = 128, QP = ID + 8;
+  __shared__ __align__(16) __nv_bfloat16 qs[NH * QP];
+  const int t = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, qd = lane & 3;
+  for (int i = threadIdx.x; i < NH * ID / 8; i += blockDim.x) {
+    const int h = i / (ID / 8), c = (i % (ID / 8)) * 8;
+    *reinterpret_cast<uint4*>(qs + h * QP + c) = *reinterpret_cast<const uint4*>(q + ((long long)t * NH + h) * ID + c);
+  }
+  __syncthreads();
+  const bool* cr = cand ? cand + (long long)t * Tc : nullptr;
+  float wt[4][2];
+#pragma unroll
+  for (int n = 0; n < 4; ++n)
+#pragma unroll
+    for (int e = 0; e < 2; ++e) wt[n][e] = __bfloat162float(w[(long long)t * NH + n * 8 + 2 * qd + e]);
+  const long long lens = (pos[t] + 1) / ratio;
+#pragma unroll
+  for (int j = 0; j < KT; ++j) {
+    const int c0 = blockIdx.x * 64 * KT + j * 64 + warp * 16;
+    if (c0 >= Tc) break;
+    // candidate blocks (later index layers): a tile of 16 keys none of which is a candidate is -inf without scoring
+    if (cr && !__any_sync(0xffffffffu, lane < 16 && c0 + lane < Tc && cr[c0 + lane])) {
+      if (qd == 0) for (int hh = 0; hh < 2; ++hh) { const int c = c0 + g + hh * 8; if (c < Tc) out[(long long)t * Tc + c] = __float2bfloat16(-INFINITY); }
+      continue;
+    }
+    const int r0 = min(c0 + g, Tc - 1), r1 = min(c0 + g + 8, Tc - 1);
+    const __nv_bfloat16* k0 = k + (long long)r0 * ID + 2 * qd;
+    const __nv_bfloat16* k1 = k + (long long)r1 * ID + 2 * qd;
+    uint32_t a[ID / 16][4];
+#pragma unroll
+    for (int kk = 0; kk < ID; kk += 16) { a[kk / 16][0] = ld32(k0 + kk); a[kk / 16][1] = ld32(k1 + kk); a[kk / 16][2] = ld32(k0 + kk + 8); a[kk / 16][3] = ld32(k1 + kk + 8); }
+    float acc[4][4];
+    for (int n = 0; n < 4; ++n) for (int c = 0; c < 4; ++c) acc[n][c] = 0.f;
+#pragma unroll
+    for (int kk = 0; kk < ID; kk += 16) {
+#pragma unroll
+      for (int n = 0; n < 4; ++n) {
+        const __nv_bfloat16* qr = qs + (n * 8 + g) * QP + kk + 2 * qd;
+        mma(acc[n], a[kk / 16][0], a[kk / 16][1], a[kk / 16][2], a[kk / 16][3], ld32(qr), ld32(qr + 8));
+      }
+    }
+    float sum[2] = {0.f, 0.f};
+    for (int n = 0; n < 4; ++n)
+      for (int c = 0; c < 4; ++c) {
+        const float v = fmaxf(__bfloat162float(__float2bfloat16(acc[n][c])), 0.f);
+        sum[c >> 1] += __bfloat162float(__float2bfloat16(v * wt[n][c & 1]));
+      }
+    for (int hh = 0; hh < 2; ++hh) {
+      sum[hh] += __shfl_xor_sync(0xffffffffu, sum[hh], 1);
+      sum[hh] += __shfl_xor_sync(0xffffffffu, sum[hh], 2);
+    }
+    if (qd == 0) {
+      for (int hh = 0; hh < 2; ++hh) {
+        const int c = c0 + g + hh * 8;
+        if (c < Tc) out[(long long)t * Tc + c] = (c >= lens || (cr && !cr[c])) ? __float2bfloat16(-INFINITY) : __float2bfloat16(sum[hh]);
+      }
+    }
+  }
+}
 __global__ __launch_bounds__(128) void index_score_kernel(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ w, const int64_t* __restrict__ pos, int ratio, __nv_bfloat16* __restrict__ out, int Tc) {
   constexpr int NH = 32, ID = 128, QP = ID + 8;
@@ -753,16 +817,34 @@ extern "C" int ds41_topk_idx(const void* score, const int64_t* pos, int ratio, i
   pdl_launch(topk_idx_kernel, dim3(T), dim3(TK_THREADS), 0, st, (const __nv_bfloat16*)score, pos, ratio, Tc, k, offset, out);
   return (int)cudaGetLastError();
 }
+// cand (Bool [T, Tc] or null): the scores of the non-candidate keys are -inf (the per-row kernel skips whole tiles of
+// them: index_score_kt); the tiled kernel takes no cand (returns 2 then: the caller masks)
+static int g_index_kt_force = 0;   // (ds41-kernel-test)
+extern "C" void ds41_index_score_kt_force(int kt) { g_index_kt_force = kt; }
+extern "C" int ds41_index_score_cand(const void* q, const void* k, const void* w, const int64_t* pos, int ratio, const bool* cand, void* out, int T, int Tc, cudaStream_t st);
 extern "C" int ds41_index_score(const void* q, const void* k, const void* w, const int64_t* pos, int ratio, void* out, int T, int Tc, cudaStream_t st) {
+  return ds41_index_score_cand(q, k, w, pos, ratio, nullptr, out, T, Tc, st);
+}
+extern "C" int ds41_index_score_cand(const void* q, const void* k, const void* w, const int64_t* pos, int ratio, const bool* cand, void* out, int T, int Tc, cudaStream_t st) {
   if (T < 1 || Tc < 1) return 0;
   // many rows (prefill, verify): shared key tiles (DS41_INDEX_TILED=0 the per-row kernel); the same values either way
   static const bool tiled = !(std::getenv("DS41_INDEX_TILED") && std::getenv("DS41_INDEX_TILED")[0] == '0');
   if (tiled && T >= 8) {
+    if (cand) return 2;
     index_score_tiled_kernel<<<dim3((T + 7) / 8, (Tc + IS_KS - 1) / IS_KS), 256, 0, st>>>((const __nv_bfloat16*)q, (const __nv_bfloat16*)k,
         (const __nv_bfloat16*)w, pos, ratio, (__nv_bfloat16*)out, T, Tc);
     return (int)cudaGetLastError();
   }
-  index_score_kernel<<<dim3((Tc + 63) / 64, T), 128, 0, st>>>((const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)w, pos, ratio,
-                                                            (__nv_bfloat16*)out, Tc);
+  // DS41_INDEX_KT (1; 2 / 4 / 8: index_score_kt, bitwise, measured within noise: the kernel is at ~150 GB/s at 131k keys)
+  static const int kt_env = std::getenv("DS41_INDEX_KT") ? std::atoi(std::getenv("DS41_INDEX_KT")) : 1;
+  const int kt0 = g_index_kt_force ? g_index_kt_force : kt_env;
+  const int kt = cand && kt0 < 2 ? 4 : kt0;
+  const auto qq = (const __nv_bfloat16*)q; const auto kq = (const __nv_bfloat16*)k; const auto wq = (const __nv_bfloat16*)w; const auto oq = (__nv_bfloat16*)out;
+  switch (kt) {
+    case 2: index_score_kt<2><<<dim3((Tc + 127) / 128, T), 128, 0, st>>>(qq, kq, wq, pos, ratio, oq, Tc, cand); break;
+    case 4: index_score_kt<4><<<dim3((Tc + 255) / 256, T), 128, 0, st>>>(qq, kq, wq, pos, ratio, oq, Tc, cand); break;
+    case 8: index_score_kt<8><<<dim3((Tc + 511) / 512, T), 128, 0, st>>>(qq, kq, wq, pos, ratio, oq, Tc, cand); break;
+    default: index_score_kernel<<<dim3((Tc + 63) / 64, T), 128, 0, st>>>(qq, kq, wq, pos, ratio, oq, Tc);
+  }
   return (int)cudaGetLastError();
 }

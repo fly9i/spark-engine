@@ -39,6 +39,23 @@ fn ar_bf16(y: Tensor) -> Tensor {
     ar_prefill(&y);
     bf16(y)
 }
+/// DS41_WO_A_MMA=1 (L1, default off): prefill rows (> 64) of the grouped low-rank output projection wo_a on the
+/// block-scaled MMA GEMM, all groups in one launch (kern::fp8_gemm_mx_grouped_bf16). With DS41_COMP_TF32: 32k prefill
+/// 5579 -> 5483 ms (-1.7%), but the service decode ABBA -0.75% (geomean of 12 workloads; greedy text changes): off.
+fn wo_a_mma() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_WO_A_MMA").is_ok_and(|v| v == "1")) }
+/// DS41_AR_B16_WIRE (default on; 0 off): the TP sum of a BF16 layer output of decode / verify rows (<= 64, outside the
+/// deferred encoder sums) with BF16 on the wire (shim rs_allreduce_b16): the rank-ordered FP32 sum of the same values
+/// rounded to BF16 -- ar_bf16 of its FP32 copy bit for bit, half the bytes. None: not eligible.
+fn ar_b16_wire(y: &Tensor) -> Option<Tensor> {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    extern "C" { fn rs_allreduce_b16(i: *const std::ffi::c_void, o: *mut std::ffi::c_void, numel: i64) -> i32; }
+    if !*E.get_or_init(|| std::env::var("DS41_AR_B16_WIRE").map_or(true, |v| v != "0")) || !crate::tp::is_tp() { return None; }
+    if y.kind() != Kind::BFloat16 || y.size()[0] > 64 || DEFER_AR.with(|d| d.get()) || y.numel() % 8 != 0 || y.numel() * 2 > (1 << 20) { return None; }
+    let y = y.contiguous();
+    let out = Tensor::empty_like(&y);
+    if y.data_ptr() as usize % 16 != 0 { return None; }
+    (prof("allreduce", || unsafe { rs_allreduce_b16(y.data_ptr(), out.data_ptr(), y.numel() as i64) }) == 0).then_some(out)
+}
 /// DS41_SP (default on; 0 off): prefill chunks of at least DS41_SP_ROWS (256: the last rank keeps > 64 real rows, the row GEMMs their many-row path) rows run the encoder sequence-parallel
 /// (Model::encoder_sp2 / encoder_sp; bitwise the TP paths encoder_two_batch / layer_forward; 8k prefill -8%).
 fn sp_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_SP").map_or(true, |v| v != "0")) }
@@ -71,6 +88,7 @@ fn sp_ag(x: &Tensor, t: i64) -> Tensor {
     assert_eq!(rc, 0, "rs_sp_all_gather");
     out.narrow(0, 0, t)
 }
+pub(super) fn sp_ag_pub(x: &Tensor, t: i64) -> Tensor { sp_ag(x, t) }
 /// A sequence-parallel collective in flight on the communication stream (comm mode): `finish` makes the current
 /// stream wait and returns the result (sp_rs / sp_ag's); the input is kept alive until then.
 struct SpPending { out: Tensor, _input: Vec<Tensor>, handle: i32 }
@@ -90,11 +108,11 @@ impl SpPending {
     /// `rs` of rows [a, a + n) of a routed-expert call's combine (kern::MoeRows with its add, the whole call's [R, 5120]),
     /// computed in the reduce-scatter's send (bitwise mr.combine then rs; no FP32 rows written and read back)
     fn rs_comb(mr: &super::kern::MoeRows, add: &Tensor, a: i64, n: i64, l: i64) -> SpPending {
-        extern "C" { fn rs_sp_reduce_scatter_comb(pout: *const f32, pairmap: *const i32, add: *const f32, topk: i32, hcols: i32, o: *mut std::ffi::c_void, blk_f: i64, n_valid: i64, async_: i32) -> i32; }
-        let (pout, pairmap, topk) = mr.ptrs();
+        extern "C" { fn rs_sp_reduce_scatter_comb(pout: *const std::ffi::c_void, pair_b16: i32, pairmap: *const i32, add: *const f32, topk: i32, hcols: i32, o: *mut std::ffi::c_void, blk_f: i64, n_valid: i64, async_: i32) -> i32; }
+        let (pout, pairmap, topk, b16) = mr.ptrs();
         assert!(add.kind() == Kind::Float && add.is_contiguous() && add.size()[1] == 5120, "rs_comb add");
         let out = Tensor::empty([l, 5120], (Kind::BFloat16, add.device()));
-        let handle = unsafe { rs_sp_reduce_scatter_comb(pout, pairmap.add((a * topk) as usize), (add.data_ptr() as *const f32).add((a * 5120) as usize), topk as i32, 5120,
+        let handle = unsafe { rs_sp_reduce_scatter_comb(pout, b16 as i32, pairmap.add((a * topk) as usize), (add.data_ptr() as *const f32).add((a * 5120) as usize), topk as i32, 5120,
                                                         out.data_ptr(), l * 5120, n * 5120, 1) };
         assert!(handle >= 0, "rs_sp_reduce_scatter_comb async");
         SpPending { out, _input: vec![mr.ws(), add.shallow_clone()], handle }
@@ -296,6 +314,9 @@ fn gemv_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock
 /// 2026-10-12, which the old golden was made with) instead of act_quant(o) (FP8 per 32, UE8M0), as official now does.
 /// DS41_WO_A_GROUPED (default on; 0 off): prefill wo_a in one grouped fp8_mm launch writing BF16 (bitwise the per-group
 /// fp8_mm on contiguous copies, then bf16 and cat)
+/// DS41_SP_END_SPARSE (default on; 0 off): the sequence-parallel encoder gathers hc_pre(h) and only the rows of h
+/// ced_finish reads (encoder_sp_parts), not all of h.
+fn sp_end_sparse() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_SP_END_SPARSE").map_or(true, |v| v != "0")) }
 fn sp_defer() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_SP_DEFER").map_or(true, |v| v != "0")) }
 fn moe_rs_comb() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_MOE_RS_COMB").map_or(true, |v| v != "0")) }
 fn wo_a_grouped() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_WO_A_GROUPED").map_or(true, |v| v != "0")) }
@@ -347,6 +368,12 @@ impl Fp8W {
         let (m, k) = (xq.size()[0], xq.size()[1]);
         (gemv_on() && !mx_gemv_ok(m, k, self.n()) && m > 64 && moe_mx_on() && k % 64 == 0)
             .then(|| super::kern::fp8_gemm_mx_q(xq, xs, &self.w, &self.s))
+    }
+    /// `mm_f32_q` rounded to BF16 in the GEMM's epilogue (bitwise bf16(mm_f32_q)): no FP32 rows written and read back.
+    pub fn mm_bf16_q(&self, xq: &Tensor, xs: &Tensor) -> Option<Tensor> {
+        let (m, k) = (xq.size()[0], xq.size()[1]);
+        (gemv_on() && !mx_gemv_ok(m, k, self.n()) && m > 64 && moe_mx_on() && k % 64 == 0)
+            .then(|| super::kern::fp8_gemm_mx_q_bf16(xq, xs, &self.w, &self.s))
     }
     /// x [m, k] BF16 -> act_quant(x) . W^T FP32 [m, n] (no output rounding: TP partial sums). The MMA paths quantize
     /// inside; act_quant is idempotent, so an already quantized x gives the same result.
@@ -976,6 +1003,19 @@ impl Model {
         crate::tp::allreduce(&e);
         bf16(e)
     }
+    /// The sequence-parallel encoder's input rows (encoder_sp_parts): this rank's rows of every part, [l, hc, dim] each
+    /// (rows past the part: zeros), from a BF16 row reduce-scatter of every rank's vocabulary-slice partial instead of
+    /// embed's FP32 all-reduce of all rows and their copies (one rank holds each row, so both sums are the row exactly;
+    /// the same partials summed in rank order). DS41_SP_EMBED_RS=0: embed of all rows as before.
+    fn sp_embed_parts(&self, ids: &Tensor, parts: &[(i64, i64, i64, i64, i64)]) -> Option<Vec<Tensor>> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("DS41_SP_EMBED_RS").map_or(true, |v| v != "0")) { return None; }
+        let local = ids - self.sp.v0;
+        let ok = local.ge(0).logical_and(&local.lt(self.sp.v1 - self.sp.v0));
+        let rows = self.embed.index_select(0, &local.clamp(0, self.sp.v1 - self.sp.v0 - 1));
+        let e = (rows * ok.unsqueeze(-1).to_kind(Kind::BFloat16)).contiguous();
+        Some(parts.iter().map(|&(a, n, l, _, _)| sp_rs(&e.narrow(0, a, n), l).unsqueeze(1).repeat([1, self.c.hc, 1])).collect())
+    }
 
     /// Logits [T, vocab] FP32 of the final hidden states x [T, dim] (rank slices assembled by a zero-padded sum).
     pub fn logits(&self, x: &Tensor) -> Tensor { self.logits_full(&self.logits_local(x)) }
@@ -983,7 +1023,7 @@ impl Model {
     pub fn logits_local(&self, x: &Tensor) -> Tensor {
         let m = x.size()[0];
         if gemv_on() && m <= 64 {
-            let parts: Vec<Tensor> = (0..m).step_by(8).map(|r| super::kern::bf16_gemv(&x.narrow(0, r, 8.min(m - r)), &self.head)).collect();
+            let parts: Vec<Tensor> = (0..m).step_by(16).map(|r| super::kern::bf16_gemv(&x.narrow(0, r, 16.min(m - r)), &self.head)).collect();
             if parts.len() == 1 { parts.into_iter().next().unwrap() } else { Tensor::cat(&parts, 0) }
         } else { x.to_kind(Kind::Float).matmul(&self.head.to_kind(Kind::Float).tr()) }
     }
@@ -1120,7 +1160,7 @@ impl Model {
         let starts: Vec<i64> = seqs.iter().zip(&key).map(|(s, &n)| { assert!(s.pos + n as i64 <= s.cap, "sequence capacity {} exceeded", s.cap); s.pos }).collect();
         let hashes: Vec<Vec<Vec<i64>>> = seqs.iter_mut().zip(ids).map(|(s, r)| self.push_hashes(s, r)).collect();
         let flat: Vec<i64> = ids.iter().flatten().copied().collect();
-        let e = self.embed(&Tensor::from_slice(&flat).to_device(dev));                  // [R, dim]
+        let e = self.embed(&super::kern::upload_i64(&flat, dev));                  // [R, dim]
         let engram_layers: Vec<usize> = self.hash.as_ref().map_or(vec![], |h| h.layer_ids.iter().copied().filter(|l| self.layers.iter().any(|x| x.id == *l)).collect());
         // the engram rows of every engram layer gathered (host) on background threads from here on, so the reads overlap
         // this call's set-up and the layers before them (engram_rows takes them; the same bytes)
@@ -1141,7 +1181,7 @@ impl Model {
             self.engram_rows(l, &all, total)
         };
         let posv: Vec<i64> = starts.iter().zip(&key).flat_map(|(&s, &n)| s..s + n as i64).collect();
-        let pos_now = Tensor::from_slice(&posv).to_device(dev);
+        let pos_now = super::kern::upload_i64(&posv, dev);
         let want_hid = self.mtp.is_some();
         let mut graphs = self.graph.borrow_mut();
         let mut run_mid = |layer: &Layer, mid: &[Tensor; 4], pos: &Tensor, obuf: Option<&Tensor>, sh: &mut Vec<Shared>, seqs: &mut [&mut Seq]| -> Option<Tensor> {
@@ -1583,7 +1623,11 @@ impl Model {
                 }
             }
         }
-        let mut h = self.embed_vis(&Tensor::from_slice(ids).to_device(dev), seq.vis.take()).unsqueeze(1).repeat([1, c.hc, 1]);
+        let ids_t = Tensor::from_slice(ids).to_device(dev);
+        let two = overlap_rows() > 0 && t >= 2 * overlap_rows();
+        // the two-micro-batch sequence-parallel encoder without image rows embeds this rank's rows only (sp_embed_parts)
+        let sp_ids = (self.sp_eligible(t, enc) && two && seq.vis.is_none()).then_some(&ids_t);
+        let mut h = if sp_ids.is_some() { Tensor::new() } else { self.embed_vis(&ids_t, seq.vis.take()).unsqueeze(1).repeat([1, c.hc, 1]) };
         let vl = vl_set(self.image_rows(seq, start, start + t));
         let mut pre_mix = Tensor::zeros([t, c.hc], (Kind::Float, dev));
         let _ = pre_mix.narrow(1, 0, 1).fill_(1.0);
@@ -1592,9 +1636,9 @@ impl Model {
         // The fused clamp carries each micro-batch's row base in the offset count pointer (norm_args_off), so the
         // two-micro-batch overlap stays on; only an UNFUSED active clamp (STATS mode / FUSE < 2) must disable it
         // (per-batch z rows would then be locally indexed in the row kernel).
-        let two = overlap_rows() > 0 && t >= 2 * overlap_rows();
+        let mut z = None;
         if self.sp_eligible(t, enc) && two {
-            self.encoder_sp2(&mut h, &mut pre_mix, seq, &pos, start, &hashes, enc);
+            z = self.encoder_sp2(&mut h, &mut pre_mix, seq, &pos, start, &hashes, enc, sp_ids);
         } else if self.sp_eligible(t, enc) {
             self.encoder_sp(&mut h, &mut pre_mix, seq, &pos, start, &hashes, enc);
         } else if overlap_rows() > 0 && t >= 2 * overlap_rows() && self.sp.world > 1 && !crate::ablate::unfused_active() {
@@ -1604,7 +1648,7 @@ impl Model {
                 self.layer_forward(layer, &mut h, &mut pre_mix, seq, &pos, start, &mut sh, &hashes, &mut hid);
             }
         }
-        self.ced_finish(seq, &h, &pre_mix, start, t, last, inner, vl, sh)
+        self.ced_finish(seq, &h, &pre_mix, z, start, t, last, inner, vl, sh)
     }
 
     /// prefill_ced_one on a, then on b, bit for bit, both taking the sequence-parallel two-micro-batch encoder: the
@@ -1638,31 +1682,34 @@ impl Model {
         }
         let _ = seq.vis.take();
         let emb = |ids: &[i64]| self.embed_vis(&Tensor::from_slice(ids).to_device(dev), None).unsqueeze(1).repeat([1, c.hc, 1]);
-        let mut h = Tensor::cat(&[emb(a), emb(b)], 0);
+        let hs0 = self.sp_embed_parts(&Tensor::from_slice(&[a, b].concat()).to_device(dev), &parts);
+        let mut h = if hs0.is_some() { Tensor::new() } else { Tensor::cat(&[emb(a), emb(b)], 0) };
         let vl = vl_set(None);
         let mut pre_mix = Tensor::zeros([ta + tb, c.hc], (Kind::Float, dev));
         let _ = pre_mix.narrow(1, 0, 1).fill_(1.0);
-        self.encoder_sp_parts(&mut h, &mut pre_mix, seq, &pos, &parts, &[sa, sa + ta / 2, sb, sb + tb / 2], &hashes, enc, &[(0, ta), (ta, tb)]);
+        let z = self.encoder_sp_parts(&mut h, &mut pre_mix, seq, &pos, &parts, &[sa, sa + ta / 2, sb, sb + tb / 2], &hashes, enc, &[(0, ta), (ta, tb)], hs0);
         // the clamp's count gate: b's counters where b alone leaves them (from row 0; the decoder replay reads them)
         if let Some(cnt) = crate::ablate::clamp().and_then(|c| c.gate_counts()) {
             let bc = cnt.narrow(0, ta, tb).copy();
             let _ = cnt.narrow(0, 0, tb).copy_(&bc);
         }
-        let _ = self.ced_finish(seq, &h.narrow(0, 0, ta), &pre_mix.narrow(0, 0, ta), sa, ta, false, true, vl, Shared::default());
-        self.ced_finish(seq, &h.narrow(0, ta, tb), &pre_mix.narrow(0, ta, tb), sb, tb, last, inner, vl_set(None), Shared::default())
+        let _ = self.ced_finish(seq, &h.narrow(0, 0, ta), &pre_mix.narrow(0, 0, ta), z.as_ref().map(|z| z.narrow(0, 0, ta)), sa, ta, false, true, vl, Shared::default());
+        self.ced_finish(seq, &h.narrow(0, ta, tb), &pre_mix.narrow(0, ta, tb), z.as_ref().map(|z| z.narrow(0, ta, tb)), sb, tb, last, inner, vl_set(None), Shared::default())
     }
 
     /// The end of a CED prefill chunk after its encoder layers (h / pre_mix the chunk's encoder output): the decoder's
     /// KV source over the chunk, the encoder tail and the checkpoints inside it, and with `last` the decoder replay.
     /// `sh`: the chunk's shared state after its encoder layers (the KV source's compressor reads it).
     #[allow(clippy::too_many_arguments)]
-    fn ced_finish(&self, seq: &mut Seq, h: &Tensor, pre_mix: &Tensor, start: i64, t: i64, last: bool, inner: bool, vl: VlGuard, mut sh: Shared) -> Option<Tensor> {
+    /// `z`: hc_pre(h, pre_mix) when the encoder computed it (encoder_sp_parts: then h holds only the rows read below).
+    #[allow(clippy::too_many_arguments)]
+    fn ced_finish(&self, seq: &mut Seq, h: &Tensor, pre_mix: &Tensor, z: Option<Tensor>, start: i64, t: i64, last: bool, inner: bool, vl: VlGuard, mut sh: Shared) -> Option<Tensor> {
         let c = &self.c;
         let dev = self.dev;
         let enc = (c.n_layers / 2) as usize;
         // the decoder's global KV: its KV source compresses the encoder output (the source's attention input)
         for layer in self.layers.iter().filter(|l| l.id >= enc && c.is_kv_source(l.id)) {
-            let x = rmsn(&Self::hc_pre(h, pre_mix), &layer.attn_norm, c.norm_eps);
+            let x = rmsn(&match &z { Some(z) => z.shallow_clone(), None => Self::hc_pre(h, pre_mix) }, &layer.attn_norm, c.norm_eps);
             prof("attn.compress", || self.compress(layer, &x, seq, start, &x, &mut sh));
         }
         let w = c.window;
@@ -1812,11 +1859,10 @@ impl Model {
     /// by the whole wkv, rounded to BF16, padded with zero rows to l -- the BF16 all-reduce of the zero-padded column
     /// shares gives each element its one rank's BF16 value plus zeros, i.e. that value with -0 turned into +0 (the + 0).
     fn sp_engram_kv(&self, e: &Engram, er: &ERows, r0: i64, nr: i64, l: i64) -> Tensor {
-        let part = match er {
-            ERows::Bf16(r) => e.full.mm_f32(&r.narrow(0, r0, nr)),
-            ERows::Q(q, s) => { let (q, s) = (q.narrow(0, r0, nr), s.narrow(0, r0, nr)); e.full.mm_f32_q(&q, &s).unwrap_or_else(|| e.full.mm_f32(&engram::dequant(&q, &s))) }
-        };
-        let kv = bf16(part) + 0.0;
+        let kv = match er {
+            ERows::Bf16(r) => bf16(e.full.mm_f32(&r.narrow(0, r0, nr))),
+            ERows::Q(q, s) => { let (q, s) = (q.narrow(0, r0, nr), s.narrow(0, r0, nr)); e.full.mm_bf16_q(&q, &s).unwrap_or_else(|| bf16(e.full.mm_f32(&engram::dequant(&q, &s)))) }
+        } + 0.0;
         if nr == l { return kv; }
         let out = Tensor::zeros([l, kv.size()[1]], (Kind::BFloat16, self.dev));
         let _ = out.narrow(0, 0, nr).copy_(&kv);
@@ -1962,11 +2008,12 @@ impl Model {
     ///   A: front, gather, attention, scatter.. | B: (FFN scatter of the last layer) front, gather, attention, scatter..
     ///   | A: post, FFN front, gather | B: post, FFN front, gather | MoE, scatter A.., scatter B.. | A: post.
     #[allow(clippy::too_many_arguments)]
-    fn encoder_sp2(&self, h: &mut Tensor, pre_mix: &mut Tensor, seq: &mut Seq, pos: &Tensor, start: i64, hashes: &[Vec<i64>], enc: usize) {
-        let t = h.size()[0];
+    fn encoder_sp2(&self, h: &mut Tensor, pre_mix: &mut Tensor, seq: &mut Seq, pos: &Tensor, start: i64, hashes: &[Vec<i64>], enc: usize, ids: Option<&Tensor>) -> Option<Tensor> {
+        let t = pre_mix.size()[0];
         let ta = t / 2;
         let parts = [self.sp_part(0, ta), self.sp_part(ta, t - ta)];
-        self.encoder_sp_parts(h, pre_mix, seq, pos, &parts, &[start, start + ta], hashes, enc, &[(0, t)]);
+        let hs0 = ids.and_then(|ids| self.sp_embed_parts(ids, &parts));
+        self.encoder_sp_parts(h, pre_mix, seq, pos, &parts, &[start, start + ta], hashes, enc, &[(0, t)], hs0)
     }
 
     /// The sequence-parallel share of the part of `n` rows at row `a` of a pass: (a, n, rows per rank l, this rank's
@@ -1984,11 +2031,12 @@ impl Model {
     /// shared expert per MoE group `groups` (row ranges: the calls a group's rows alone would make) -- and the
     /// reduce-scatters back, the last part's under the next layer's fronts.
     #[allow(clippy::too_many_arguments)]
+    /// `hs0`: this rank's input rows of every part (sp_embed_parts; then h is not read).
     fn encoder_sp_parts(&self, h: &mut Tensor, pre_mix: &mut Tensor, seq: &mut Seq, pos: &Tensor, parts: &[(i64, i64, i64, i64, i64)], starts: &[i64],
-                        hashes: &[Vec<i64>], enc: usize, groups: &[(i64, i64)]) {
+                        hashes: &[Vec<i64>], enc: usize, groups: &[(i64, i64)], hs0: Option<Vec<Tensor>>) -> Option<Tensor> {
         extern "C" { fn rs_comm_mode(on: i32) -> i32; }
         let c = &self.c;
-        let t = h.size()[0];
+        let t = pre_mix.size()[0];
         let np = parts.len();
         let local = |x: &Tensor, b: usize| -> Tensor {
             let (a, _, l, lo, nr) = parts[b];
@@ -2001,7 +2049,7 @@ impl Model {
         };
         static NOTE: std::sync::Once = std::sync::Once::new();
         NOTE.call_once(|| if self.sp.rank == 0 { eprintln!("[ds41] sequence-parallel encoder, micro-batches: {t} rows, {:?} per rank", parts.iter().map(|p| p.2).collect::<Vec<_>>()); });
-        let mut hs: Vec<Tensor> = (0..np).map(|b| local(h, b)).collect();
+        let mut hs: Vec<Tensor> = match hs0 { Some(v) => v, None => (0..np).map(|b| local(h, b)).collect() };
         let mut pms: Vec<Tensor> = (0..np).map(|b| local(pre_mix, b)).collect();
         *h = Tensor::new();   // (the whole stream is rebuilt at the end: not held through the layers)
         let img: Vec<Option<Tensor>> = (0..np).map(|b| vl_rows(0, t, true).map(|m| local(&m, b))).collect();
@@ -2117,11 +2165,60 @@ impl Model {
         }
         DEFER_AR.with(|d| d.set(false)); SP_B16.with(|f| f.set(false));
         self.sp_gather_counts(parts);
-        let hg: Vec<Tensor> = (0..np).map(|b| sp_ag(&hs[b], parts[b].1)).collect();
         let pg: Vec<Tensor> = (0..np).map(|b| sp_ag(&pms[b], parts[b].1)).collect();
+        if !sp_end_sparse() {
+            let hg: Vec<Tensor> = (0..np).map(|b| sp_ag(&hs[b], parts[b].1)).collect();
+            assert_eq!(unsafe { rs_comm_mode(0) }, 0, "rs_comm_mode");
+            *h = Tensor::cat(&hg, 0);
+            *pre_mix = Tensor::cat(&pg, 0);
+            return None;
+        }
+        // what ced_finish reads of the encoder output: the KV sources' input hc_pre(h) of every row (gathered: a quarter
+        // of h's bytes) and h itself only in the rows of the encoder tail and the checkpoint windows of each chunk (the
+        // MoE groups; gathered row by row: every rank's needed rows of every part in one call); the other rows of h are
+        // left unwritten (DS41_SP_GATHER_CANARY=1: NaN)
+        let zg: Vec<Tensor> = (0..np).map(|b| sp_ag(&prof("hc", || Self::hc_pre(&hs[b], &pms[b])), parts[b].1)).collect();
+        let w = c.window;
+        let mut need = vec![false; t as usize];
+        for &(g0, gn) in groups {
+            let b0 = parts.iter().position(|p| p.0 == g0).expect("a MoE group not at a part");
+            let s0 = starts[b0];
+            for r in (g0 + gn - gn.min(w))..(g0 + gn) { need[r as usize] = true; }
+            for &p in &seq.ck_req {
+                if p > s0 && p <= s0 + gn { let e = p - s0; for r in (g0 + (e - w).max(0))..(g0 + e) { need[r as usize] = true; } }
+            }
+        }
+        let wd = self.sp.world as i64;
+        let owned = |b: usize, r: i64| { let (a, n, l, _, _) = parts[b]; let lo = r * l; (a + lo, (n - lo).clamp(0, l)) };
+        let cnt = |b: usize, r: i64| { let (r0, nr) = owned(b, r); (r0..r0 + nr).filter(|&x| need[x as usize]).count() as i64 };
+        let k = (0..np).flat_map(|b| (0..wd).map(move |r| (b, r))).map(|(b, r)| cnt(b, r)).max().unwrap_or(0).max(1);
+        let me = self.sp.rank as i64;
+        // this rank's slots [b k, b k + its count): its needed rows of part b, in order
+        let (hc, dim) = (c.hc, c.dim);
+        let buf = Tensor::zeros([np as i64 * k, hc, dim], (Kind::BFloat16, self.dev));
+        for b in 0..np {
+            let (r0, nr) = owned(b, me);
+            let rows: Vec<i64> = (r0..r0 + nr).filter(|&x| need[x as usize]).map(|x| x - r0).collect();
+            if rows.is_empty() { continue; }
+            let _ = buf.narrow(0, b as i64 * k, rows.len() as i64).copy_(&hs[b].index_select(0, &Tensor::from_slice(&rows).to_device(self.dev)));
+        }
+        let gat = sp_ag(&buf, wd * np as i64 * k);   // [w np k, hc, dim]: rank r's slots at r np k
         assert_eq!(unsafe { rs_comm_mode(0) }, 0, "rs_comm_mode");
-        *h = Tensor::cat(&hg, 0);
+        let mut full = if std::env::var("DS41_SP_GATHER_CANARY").is_ok_and(|v| v == "1") { Tensor::full([t, hc, dim], f64::NAN, (Kind::BFloat16, self.dev)) }
+                   else { Tensor::empty([t, hc, dim], (Kind::BFloat16, self.dev)) };
+        let (mut dst, mut from) = (Vec::new(), Vec::new());
+        for r in 0..wd {
+            for b in 0..np {
+                let (r0, nr) = owned(b, r);
+                for (i, x) in (r0..r0 + nr).filter(|&x| need[x as usize]).enumerate() { dst.push(x); from.push(r * np as i64 * k + b as i64 * k + i as i64); }
+            }
+        }
+        if !dst.is_empty() {
+            let _ = full.index_copy_(0, &Tensor::from_slice(&dst).to_device(self.dev), &gat.index_select(0, &Tensor::from_slice(&from).to_device(self.dev)));
+        }
+        *h = full;
         *pre_mix = Tensor::cat(&pg, 0);
+        Some(Tensor::cat(&zg, 0))
     }
 
     /// DS41_FFN_AG_FP8 (default on; 0 off): the sequence-parallel encoder gathers the FFN input as the act_quant operands
@@ -2225,11 +2322,20 @@ impl Model {
         let c = &self.c;
         let t = h.size()[0];
         // this rank's output rows, zero-padded and summed over the ranks (exact), then rounded like the full Linear
-        let full = Tensor::zeros([t, (c.hc + 1) * c.dim], (Kind::Float, self.dev));
-        let _ = full.narrow(1, e.row0, part.size()[1]).copy_(&part);
-        // (prefill: BF16 transport, the same bits here: every element has one nonzero part and is rounded to BF16)
-        if self.sp.world > 1 { ar_prefill(&full); }
-        let kv = bf16(full);                                             // [T, (hc+1) dim]
+        // decode / verify rows: the BF16-wire sum of the BF16-rounded parts (ar_b16_wire: one nonzero part per element,
+        // summed in rank order like the FP32 path -- the same bits, half the bytes)
+        let wire = (self.sp.world > 1 && t <= 64).then(|| {
+            let fb = Tensor::zeros([t, (c.hc + 1) * c.dim], (Kind::BFloat16, self.dev));
+            let _ = fb.narrow(1, e.row0, part.size()[1]).copy_(&part);
+            ar_b16_wire(&fb)
+        }).flatten();
+        let kv = match wire { Some(kv) => kv, None => {
+            let full = Tensor::zeros([t, (c.hc + 1) * c.dim], (Kind::Float, self.dev));
+            let _ = full.narrow(1, e.row0, part.size()[1]).copy_(&part);
+            // (prefill: BF16 transport, the same bits here: every element has one nonzero part and is rounded to BF16)
+            if self.sp.world > 1 { ar_prefill(&full); }
+            bf16(full)                                                   // [T, (hc+1) dim]
+        } };
         if ops_fused() && h.kind() == Kind::BFloat16 { return super::kern::engram_gate(h, &kv, &e.qk, c.norm_eps); }
         let key = kv.narrow(1, 0, c.hc * c.dim).to_kind(Kind::Float).view([t, c.hc, c.dim]);
         let value = kv.narrow(1, c.hc * c.dim, c.dim);
@@ -2397,6 +2503,10 @@ impl Model {
             let o3 = o.view([t, gl, -1]);
             let oa = if gemv_on() && t <= super::kern::grouped_max_rows() {
                 bf16(super::kern::fp8_gemv_grouped(&o3.reshape([t, -1]), &a.wo_a.w, &a.wo_a.s, c.o_lora))
+            } else if gemv_on() && t > 64 && wo_a_mma() && wo_a_act() && moe_mx_on() && (o3.size()[2] % 64) == 0 {
+                // prefill rows: each group on the block-scaled MMA GEMM (o is already act_quant'ed, so its E4M3 + UE8M0
+                // operands are exactly o's values: the products are the BF16 einsum's, only the FP32 sum order differs)
+                super::kern::fp8_gemm_mx_grouped_bf16(&o3.reshape([t, -1]), &a.wo_a.w, &a.wo_a.s, c.o_lora, gl)
             } else if gemv_on() && t > 8 && wo_a_grouped() {
                 super::kern::fp8_mm_grouped_bf16(&o3.reshape([t, -1]), &a.wo_a.w, &a.wo_a.s, c.o_lora, gl)
             } else {
@@ -2406,6 +2516,7 @@ impl Model {
             a.wo_b.mm(&oa)
         });
         if SP_B16.with(|f| f.get()) && DEFER_AR.with(|d| d.get()) && y.kind() == Kind::BFloat16 { return y; }
+        if let Some(o) = ar_b16_wire(&y) { return o; }
         ar_bf16(y.to_kind(Kind::Float).contiguous())
     }
 
@@ -2482,10 +2593,17 @@ impl Model {
             return if gemv { bf16(super::kern::bf16_gemv(x, &cm.wkv)) } else { x.matmul(&cm.wkv.tr()) };
         }
         if let (Some(w2), true) = (&cm.w2, gemv) { return super::kern::bf16_gemv(x, w2); }
-        // (prefill: the two FP32 matmuls of the checkpoint's shapes)
+        // (prefill: the two FP32 matmuls of the checkpoint's shapes; DS41_COMP_TF32=1 (L1, default off): on the TF32
+        // tensor cores -- x and the weights are BF16 values, exact in TF32, so the products are the FP32 ones and only
+        // the sum order differs; attn.compress 127 -> 67 ms of a 32k prefill, but see wo_a_mma: off)
+        static TF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let tf = *TF.get_or_init(|| std::env::var("DS41_COMP_TF32").is_ok_and(|v| v == "1")) && !crate::tp::graph::capturing();
         let xf = x.to_kind(Kind::Float);
+        if tf { crate::tp::set_tf32(true); }
         let f = |w: &Tensor| xf.matmul(&w.to_kind(Kind::Float).tr());
-        Tensor::cat(&[f(&cm.wkv), f(cm.wgate.as_ref().unwrap())], 1)
+        let y = Tensor::cat(&[f(&cm.wkv), f(cm.wgate.as_ref().unwrap())], 1);
+        if tf { crate::tp::set_tf32(false); }
+        y
     }
 
     /// The indexer's per-row inputs: (queries [T, nh, id] (rotated, FP4-rounded), head weights [T, nh] BF16); row by
@@ -2570,7 +2688,13 @@ impl Model {
         let (nh, id) = (c.index_heads, c.index_dim);
         // score[t, c] = sum_h relu(q[t,h] . k[c]) w[t,h]   (BF16 like the official einsum); -inf where not reachable
         let lens = (pos + 1).floor_divide_scalar(ratio);                                                          // [T]
-        let mut score = if attn_fused() && nh == 32 && id == 128 { super::kern::index_score(q, k, wts, pos, ratio) } else {
+        // DS41_INDEX_CAND (default on; 0: score every key, then mask): later index layers score their candidate keys only
+        static CAND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let cand_k = *CAND.get_or_init(|| std::env::var("DS41_INDEX_CAND").map_or(true, |v| v != "0"));
+        let fused = attn_fused() && nh == 32 && id == 128;
+        let pre = match (cand, fused && cand_k && !is_cand) { (Some(cd), true) => super::kern::index_score_cand(q, k, wts, pos, ratio, cd), _ => None };
+        let masked = pre.is_some();
+        let mut score = if let Some(s) = pre { s } else if fused { super::kern::index_score(q, k, wts, pos, ratio) } else {
             let s = q.matmul(&k.tr().unsqueeze(0)).relu();                                                      // [T, nh, Tc]
             let score = (s * wts.unsqueeze(-1)).sum_dim_intlist([1].as_slice(), false, Kind::BFloat16);         // [T, Tc]
             let cpos = Tensor::arange(clen.max(1), (Kind::Int64, self.dev));
@@ -2579,7 +2703,7 @@ impl Model {
         let mut cand_out = None;
         if is_cand {
             cand_out = Some(select_candidate_blocks(&score, &lens, c.candidate_topk_blocks, c.candidate_block));
-        } else if let Some(cand) = cand {
+        } else if let (Some(cand), false) = (cand, masked) {
             score = score.masked_fill(&cand.logical_not(), f64::NEG_INFINITY);
         }
         if k_top == 0 { return (Tensor::full([t, 0], -1, (Kind::Int64, self.dev)), cand_out); }
@@ -2595,10 +2719,10 @@ impl Model {
         let c = &self.c;
         let t = x.size()[0];
         {
-            // FP32 router logits: the BF16 GEMV in chunks of 8 rows up to 64 rows (no cuBLAS inside the decode / verify
+            // FP32 router logits: the BF16 GEMV in chunks of 16 rows up to 64 rows (no cuBLAS inside the decode / verify
             // graphs: every capture stream would get its own cuBLAS workspace), FP32 matmul for prefill chunks
             let logits = if gemv_on() && t <= 64 {
-                let parts: Vec<Tensor> = (0..t).step_by(8).map(|r| super::kern::bf16_gemv(&x.narrow(0, r, 8.min(t - r)), &m.gate)).collect();
+                let parts: Vec<Tensor> = (0..t).step_by(16).map(|r| super::kern::bf16_gemv(&x.narrow(0, r, 16.min(t - r)), &m.gate)).collect();
                 if parts.len() == 1 { parts.into_iter().next().unwrap() } else { Tensor::cat(&parts, 0) }
             } else { x.to_kind(Kind::Float).matmul(&m.gate.to_kind(Kind::Float).tr()) };
             let pick = |bias: &Tensor| {
@@ -2724,6 +2848,16 @@ thread_local! {
 pub fn profiling() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_PROFILE").as_deref() == Ok("1")) }
 /// Runs `f`, adding its time to section `name` when profiling.
 pub fn prof<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+    // DS41_NVTX=1: each section an NVTX range instead (no synchronization; nsys attributes the kernels)
+    static NV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NV.get_or_init(|| std::env::var("DS41_NVTX").as_deref() == Ok("1")) {
+        extern "C" { fn rs_nvtx_push(n: *const std::ffi::c_char); fn rs_nvtx_pop(); }
+        let c = std::ffi::CString::new(name).unwrap();
+        unsafe { rs_nvtx_push(c.as_ptr()) };
+        let r = f();
+        unsafe { rs_nvtx_pop() };
+        return r;
+    }
     if !profiling() || crate::tp::graph::capturing() { return f(); }
     tch::Cuda::synchronize(0);
     let t = std::time::Instant::now();

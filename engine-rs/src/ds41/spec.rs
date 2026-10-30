@@ -135,10 +135,10 @@ pub struct Rollback { pos0: i64, n: i64, ring: Vec<Tensor>, saved: Option<Tensor
 /// a speculative round in one launch each (kern::ring_save / ring_restore; the same bytes).
 fn ring_fused_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_RING_FUSED").map_or(true, |v| v != "0")) }
 
-/// FP32 rows [m, n] = x [m, k] . W^T for BF16 W (the BF16 GEMV in chunks of 8 rows).
+/// FP32 rows [m, n] = x [m, k] . W^T for BF16 W (the BF16 GEMV in chunks of 16 rows).
 fn head_rows(x: &Tensor, w: &Tensor) -> Tensor {
     let m = x.size()[0];
-    let parts: Vec<Tensor> = (0..m).step_by(8).map(|r| super::kern::bf16_gemv(&x.narrow(0, r, 8.min(m - r)), w)).collect();
+    let parts: Vec<Tensor> = (0..m).step_by(16).map(|r| super::kern::bf16_gemv(&x.narrow(0, r, 16.min(m - r)), w)).collect();
     Tensor::cat(&parts, 0)
 }
 impl Model {
@@ -189,6 +189,25 @@ impl Model {
         }).collect()
     }
 
+    /// main_proj.mm(hidden) with the output rows split over the ranks (DS41_MTP_SEED_SPLIT, default on; 0: every rank
+    /// all of them): rank r computes 32-row blocks [r B / w, (r + 1) B / w) (each output row's GEMV is the same alone:
+    /// bitwise) and one all-gather assembles them -- a third of the 79 MB weight read per round at TP3.
+    fn mtp_main_proj(&self, w: &super::model::Fp8W, hidden: &Tensor) -> Tensor {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let (world, rank) = (self.sp.world as i64, self.sp.rank as i64);
+        let n = hidden.size()[0];
+        if !*ON.get_or_init(|| std::env::var("DS41_MTP_SEED_SPLIT").map_or(true, |v| v != "0")) || world < 2 || n > 16 || crate::tp::graph::capturing() {
+            return w.mm(hidden);
+        }
+        let blocks = w.n() / 32;
+        let b0 = |r: i64| blocks * r / world;
+        let bmax = (0..world).map(|r| b0(r + 1) - b0(r)).max().unwrap();
+        let mine = w.rows(b0(rank) * 32, (b0(rank + 1) - b0(rank)) * 32).mm(hidden);           // [n, my rows] BF16
+        let pad = Tensor::zeros([n, bmax * 32], (Kind::BFloat16, self.dev));
+        let _ = pad.narrow(1, 0, mine.size()[1]).copy_(&mine);
+        let all = super::model::sp_ag_pub(&pad, world * n).view([world, n, bmax * 32]);
+        Tensor::cat(&(0..world).map(|r| all.select(0, r).narrow(1, 0, (b0(r + 1) - b0(r)) * 32)).collect::<Vec<_>>(), 1)
+    }
     /// The DSpark stages' window KV for main positions [pos0, pos0 + n) from their target hidden rows [n, 3 dim].
     pub fn mtp_seed(&self, seq: &mut Seq, hidden: &Tensor, pos0: i64) {
         let Some(mt) = &self.mtp else { return };
@@ -197,7 +216,7 @@ impl Model {
         let keep = n.min(c.window);
         let (hidden, pos0) = (hidden.narrow(0, n - keep, keep), pos0 + n - keep);
         let pos = Tensor::arange_start(pos0, pos0 + keep, (Kind::Int64, self.dev));
-        let main_x = rmsn(&mt.main_proj.mm(&hidden), &mt.main_norm, c.norm_eps);
+        let main_x = rmsn(&self.mtp_main_proj(&mt.main_proj, &hidden), &mt.main_norm, c.norm_eps);
         for (i, layer) in mt.layers.iter().enumerate() {
             let a = &layer.attn;
             let kv = super::kern::act_quant(&rot(&rmsn(&a.wkv.mm(&main_x), &a.kv_norm, c.norm_eps), &a.rope, &pos, c.rope_dim, false));
@@ -221,8 +240,8 @@ impl Model {
             ids.extend(std::iter::repeat(c.dspark_noise).take(blk as usize - 1));
             posv.extend(s.pos..s.pos + blk);
         }
-        let pos = Tensor::from_slice(&posv).to_device(dev);
-        let e = self.embed(&Tensor::from_slice(&ids).to_device(dev));                        // [R, dim]
+        let pos = super::kern::upload_i64(&posv, dev);
+        let e = self.embed(&super::kern::upload_i64(&ids, dev));                        // [R, dim]
         if graph_on() && draft_graph_on() && self.draft_debug.borrow().is_none() {
             let out = self.mtp_draft_graph(seqs, &e, &pos, toks, temps, seeds);
             if std::env::var("DS41_DRAFT_GRAPH_CHECK").as_deref() == Ok("1") {
@@ -261,9 +280,9 @@ impl Model {
         let conf_m = mt.conf.narrow(0, c.dim, c.dspark_markov_rank);
         let mut qs = Vec::new();
         for j in 0..blk {
-            let emb = mt.markov_embed.index_select(0, &Tensor::from_slice(&prev).to_device(dev));     // [B, rank]
+            let emb = mt.markov_embed.index_select(0, &super::kern::upload_i64(&prev, dev));     // [B, rank]
             let bias = super::kern::bf16_gemv(&emb, &mt.markov_head);                                 // [B, v1 - v0]
-            let rows = Tensor::from_slice(&(0..bsz as i64).map(|b| b * blk + j).collect::<Vec<_>>()).to_device(dev);
+            let rows = super::kern::upload_i64(&(0..bsz as i64).map(|b| b * blk + j).collect::<Vec<_>>(), dev);
             let lg = logits.index_select(0, &rows) + bias;
             if let Some(v) = self.draft_debug.borrow_mut().as_mut() {
                 let full = Tensor::zeros([bsz as i64, c.vocab], (Kind::Float, dev));
@@ -312,7 +331,7 @@ pub fn rs_tokens(lg: &Tensor, q: &Tensor, drafts: &[i64], temp: f32, seed: u64, 
         let t = temp as f64;
         let lp = (lg.narrow(0, 0, d).to_kind(Kind::Float) / t).log_softmax(-1, Kind::Float);
         let lq = (q.narrow(0, 0, d).to_kind(Kind::Float) / t).log_softmax(-1, Kind::Float);
-        let di = Tensor::from_slice(drafts).to_device(lg.device()).view([d, 1]);
+        let di = super::kern::upload_i64(drafts, lg.device()).view([d, 1]);
         let lr = (lp.gather(1, &di, false) - lq.gather(1, &di, false)).view([d]);   // log p(d) / q(d)
         let r = (lp.exp() - lq.exp()).clamp_min(0.0);
         let noise = Tensor::zeros_like(&r);
@@ -356,7 +375,7 @@ pub fn spec_ranks(lg: &Tensor, q: &Tensor, drafts: &[i64], ys: &[i64], temp: f32
         assert_eq!(unsafe { rs_gumbel_noise(noise.data_ptr().cast(), noise.stride()[0], d as i32, qd.size()[1] as i32, 0, temps.as_ptr(), keys.as_ptr()) }, 0);
     }
     let sc = &qd + &noise;
-    let yt = Tensor::from_slice(&ys[..d as usize]).to_device(qd.device()).view([d, 1]);
+    let yt = super::kern::upload_i64(&ys[..d as usize], qd.device()).view([d, 1]);
     let sy = sc.gather(1, &yt, false);
     let rank = (sc.gt_tensor(&sy).sum_dim_intlist(&[1i64][..], false, Kind::Int64) + 1).clamp_max(64);
     let py = (lg.narrow(0, 0, d).to_kind(Kind::Float) / (temp.max(1.0) as f64)).softmax(-1, Kind::Float).gather(1, &yt, false).view([d]);
@@ -458,9 +477,9 @@ impl Model {
             super::mem::occupy();
         }
         let mk = g.mk.as_mut().unwrap();
-        let _ = mk.prev.copy_(&Tensor::from_slice(toks));
-        let _ = mk.temps.copy_(&Tensor::from_slice(&tv));
-        let _ = mk.keys.copy_(&Tensor::from_slice(&kv));
+        super::kern::upload_into(&mk.prev, toks);
+        super::kern::upload_into(&mk.temps, &tv);
+        super::kern::upload_into(&mk.keys, &kv);
         mk.g.replay();
         match &mk.qloc { Some(ql) => self.keep_draft_q(ql, temps), None => *self.draft_q.borrow_mut() = None }
         let host: Vec<f32> = Vec::<f32>::try_from(mk.out.to_device(Device::Cpu).view(-1)).unwrap();   // [blk, B, 2]

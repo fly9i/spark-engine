@@ -18,6 +18,7 @@ extern "C" {
     fn ds41_requant_fp8(wq: *const std::ffi::c_void, ws: *const std::ffi::c_void, q: *mut std::ffi::c_void, s: *mut std::ffi::c_void, numel: i64, st: *mut std::ffi::c_void) -> i32;
     fn ds41_fp8_gemm_mx_ex(aq: *const std::ffi::c_void, as_: *const std::ffi::c_void, w: *const std::ffi::c_void, ws: *const std::ffi::c_void, y: *mut std::ffi::c_void,
                            m: i32, n: i32, k: i32, bf16out: i32, st: *mut std::ffi::c_void) -> i32;
+    fn ds41_fp8_gemm_mx_grouped(aq: *const std::ffi::c_void, as_: *const std::ffi::c_void, w: *const std::ffi::c_void, ws: *const std::ffi::c_void, y: *mut std::ffi::c_void, m: i32, n: i32, k: i32, groups: i32, bf16out: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_fp8_gemm_mx(aq: *const std::ffi::c_void, as_: *const std::ffi::c_void, w: *const std::ffi::c_void, ws: *const std::ffi::c_void, y: *mut f32,
                         m: i32, n: i32, k: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_fp8_gemv_mx_q(x: *const std::ffi::c_void, aq: *const std::ffi::c_void, as_: *const std::ffi::c_void, w: *const std::ffi::c_void,
@@ -37,6 +38,7 @@ extern "C" {
     fn ds41_moe_mx_combine_rows(ws: *mut std::ffi::c_void, r: i32, i: i32, topk: i32, e: i32, add: *const f32, y: *mut f32, r0: i32, nr: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_moe_mx_col_passes(r: i32, topk: i32, e: i32) -> i32;
     fn ds41_moe_mx_ws_ptrs(ws: *mut std::ffi::c_void, r: i32, i: i32, topk: i32, e: i32, out: *mut *mut f32, pairmap: *mut *mut i32) -> i32;
+    fn ds41_moe_mx_pair_b16(r: i32, topk: i32, e: i32) -> i32;
     fn ds41_moe_mx_combine(ws: *mut std::ffi::c_void, r: i32, i: i32, topk: i32, e: i32, add: *const f32, y: *mut f32, st: *mut std::ffi::c_void) -> i32;
     fn rs_stream_fork(n: i32) -> i32;
     fn rs_stream_set(i: i32) -> i32;
@@ -54,6 +56,7 @@ extern "C" {
                    part: *mut f32, t: i32, d: i32, norm_eps: f32, eps: f32, iters: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_hc_pre(h: *const std::ffi::c_void, pre: *const f32, out: *mut std::ffi::c_void, t: i32, d: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_hc_post(x: *const std::ffi::c_void, res: *const std::ffi::c_void, post: *const f32, comb: *const f32, y: *mut std::ffi::c_void, t: i32, d: i32, st: *mut std::ffi::c_void) -> i32;
+    fn ds41_index_score_cand(q: *const std::ffi::c_void, k: *const std::ffi::c_void, w: *const std::ffi::c_void, pos: *const i64, ratio: i32, cand: *const bool, out: *mut std::ffi::c_void, t: i32, tc: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_index_score(q: *const std::ffi::c_void, k: *const std::ffi::c_void, w: *const std::ffi::c_void, pos: *const i64, ratio: i32, out: *mut std::ffi::c_void,
                         t: i32, tc: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_sparse_attn(q: *const std::ffi::c_void, a: *const std::ffi::c_void, na: i32, b: *const std::ffi::c_void, nb: i32, c: *const std::ffi::c_void,
@@ -94,7 +97,7 @@ pub fn fp8_gemv(x: &Tensor, w: &Tensor, ws: &Tensor) -> Tensor {
     y
 }
 
-/// y [m, n] FP32 = x [m, k] . W^T for BF16 W [n, k] and m <= 8 (FP32 products and sums, as the official FP32 head).
+/// y [m, n] FP32 = x [m, k] . W^T for BF16 W [n, k] and m <= 16 (FP32 products and sums, as the official FP32 head).
 /// A weight registered with `c12_register` is read from its C12 coding (shim/c12.cu c12_gemv_f32: 12 of 16 bits, the
 /// same FMA sequence and reduction as ds41_bf16_gemv on the exact BF16 values: bitwise equal, L0).
 pub fn bf16_gemv(x: &Tensor, w: &Tensor) -> Tensor {
@@ -102,6 +105,11 @@ pub fn bf16_gemv(x: &Tensor, w: &Tensor) -> Tensor {
     let n = w.size()[0];
     let x = x.to_kind(Kind::BFloat16).contiguous();
     let y = Tensor::empty([m, n], (Kind::Float, x.device()));
+    if m > 8 && c12_lookup(w).is_none() {
+        // (the BF16 kernel takes up to 8 rows)
+        let parts: Vec<Tensor> = (0..m).step_by(8).map(|r| bf16_gemv(&x.narrow(0, r, 8.min(m - r)), w)).collect();
+        return Tensor::cat(&parts, 0);
+    }
     if let Some(c) = c12_lookup(w) {
         extern "C" { fn glm53_c12_gemv_f32_cuda(x: *const std::ffi::c_void, m8: *const std::ffi::c_void, e4: *const std::ffi::c_void, eb: *const std::ffi::c_void,
             ptr: *const i32, col: *const i32, val: *const std::ffi::c_void, y: *mut f32, m: i32, n: i32, k: i32, pdl: i32, st: *mut std::ffi::c_void) -> i32;
@@ -520,6 +528,65 @@ pub fn staged_upload(src: &[u8], dev: tch::Device) -> Tensor {
     });
     dst
 }
+/// i64 values -> a device Int64 tensor through `staged_upload` (no host-blocking pageable copy; DS41_STAGED_SMALL=0:
+/// the blocking copy). Decode / verify / draft rounds upload their token ids and positions this way.
+pub fn upload_i64(v: &[i64], dev: tch::Device) -> Tensor {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("DS41_STAGED_SMALL").map_or(true, |v| v != "0")) || crate::tp::graph::capturing() || v.len() * 8 > (1 << 20) {
+        return Tensor::from_slice(v).to_device(dev);
+    }
+    let b = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8) };
+    staged_upload(b, dev).view_dtype(Kind::Int64)
+}
+/// Host values into an existing contiguous device tensor (graph input buffers) through a staged pinned slot, without
+/// blocking the host (DS41_STAGED_SMALL=0: the blocking copy_).
+pub fn upload_into<T: tch::kind::Element>(dst: &Tensor, v: &[T]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let bytes = std::mem::size_of_val(v);
+    assert!(dst.is_contiguous() && dst.numel() == v.len() && dst.kind().elt_size_in_bytes() == std::mem::size_of::<T>(), "upload_into");
+    if !*ON.get_or_init(|| std::env::var("DS41_STAGED_SMALL").map_or(true, |v| v != "0")) || crate::tp::graph::capturing() || bytes > (1 << 20) {
+        let _ = dst.shallow_clone().copy_(&Tensor::from_slice(v));
+        return;
+    }
+    let src = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, bytes) };
+    STAGED.with(|s| {
+        let mut s = s.borrow_mut();
+        let i = s.0;
+        s.0 = (i + 1) % 8;
+        while s.1.len() <= i { s.1.push((HostBuf::new(1 << 16), Event::new())); }
+        let (buf, ev) = &mut s.1[i];
+        ev.sync();
+        if buf.len() < bytes { *buf = HostBuf::new(bytes.next_power_of_two()); }
+        buf.as_mut()[..bytes].copy_from_slice(src);
+        h2d(dst.data_ptr(), &buf.as_mut()[..bytes]);
+        ev.record();
+    });
+}
+/// `staged_upload` for prefill-sized bytes (engram rows, ~17 MB a layer): two pinned slots of their own (each reused
+/// after its previous copy ran), so the upload neither blocks the host until the queue drains (a pageable copy does:
+/// the GPU then idles while the host queues the next work) nor pins 8 large slots. DS41_STAGED_BIG=0: pageable.
+pub fn staged_upload_big(src: &[u8], dev: tch::Device) -> Tensor {
+    thread_local! { static BIG: std::cell::RefCell<(usize, Vec<(HostBuf, Event)>)> = const { std::cell::RefCell::new((0, Vec::new())) }; }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("DS41_STAGED_BIG").map_or(true, |v| v != "0")) || crate::tp::graph::capturing() {
+        return unsafe { Tensor::from_blob(src.as_ptr(), &[src.len() as i64], &[], Kind::Uint8, tch::Device::Cpu) }.to_device(dev);
+    }
+    let dst = Tensor::empty([src.len() as i64], (Kind::Uint8, dev));
+    if src.is_empty() { return dst; }
+    BIG.with(|s| {
+        let mut s = s.borrow_mut();
+        let i = s.0;
+        s.0 = (i + 1) % 2;
+        while s.1.len() <= i { s.1.push((HostBuf::new(1 << 20), Event::new())); }
+        let (buf, ev) = &mut s.1[i];
+        ev.sync();
+        if buf.len() < src.len() { *buf = HostBuf::new(src.len().next_power_of_two()); }
+        buf.as_mut()[..src.len()].copy_from_slice(src);
+        h2d(dst.data_ptr(), &buf.as_mut()[..src.len()]);
+        ev.record();
+    });
+    dst
+}
 /// Host bytes -> device memory on the current stream (async: a pinned source must stay put until the copy has run).
 pub fn h2d(dst: *mut std::ffi::c_void, src: &[u8]) {
     assert_eq!(unsafe { ds41_h2d(dst, src.as_ptr().cast(), src.len(), rs_current_stream()) }, 0, "ds41_h2d");
@@ -549,6 +616,22 @@ pub fn index_score(q: &Tensor, k: &Tensor, w: &Tensor, pos: &Tensor, ratio: i64)
     out
 }
 
+/// `index_score` with the non-candidate keys -inf (cand Bool [T, Tc]: score.masked_fill(!cand, -inf) bit for bit; tiles
+/// with no candidate are not scored). None: the kernel takes no candidates for these rows (the caller masks).
+pub fn index_score_cand(q: &Tensor, k: &Tensor, w: &Tensor, pos: &Tensor, ratio: i64, cand: &Tensor) -> Option<Tensor> {
+    let (t, tc) = (q.size()[0], k.size()[0]);
+    assert_eq!((q.size()[1], q.size()[2], k.size()[1]), (32, 128, 128), "index_score: shapes");
+    let q = q.to_kind(Kind::BFloat16).contiguous();
+    let k = k.to_kind(Kind::BFloat16).contiguous();
+    let w = w.to_kind(Kind::BFloat16).contiguous();
+    let pos = pos.to_kind(Kind::Int64).contiguous();
+    let cand = cand.to_kind(Kind::Bool).contiguous();
+    assert_eq!(cand.size(), [t, tc], "index_score_cand: cand");
+    let out = Tensor::empty([t, tc], (Kind::BFloat16, q.device()));
+    match unsafe { ds41_index_score_cand(q.data_ptr(), k.data_ptr(), w.data_ptr(), pos.data_ptr() as *const i64, ratio as i32, cand.data_ptr() as *const bool, out.data_ptr(), t as i32, tc as i32, rs_current_stream()) } {
+        0 => Some(out), 2 => None, rc => panic!("ds41_index_score_cand {rc}"),
+    }
+}
 /// RMSNorm of BF16 rows (last dim) with a BF16 weight -> BF16 (ops::rms_norm semantics).
 pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Tensor {
     let n = *x.size().last().unwrap();
@@ -785,6 +868,25 @@ pub fn fp8_gemm_mx_bf16(x: &Tensor, w: &Tensor, ws: &Tensor) -> Tensor {
     y
 }
 
+/// `fp8_gemm_mx_q` rounded to BF16 in the epilogue (bitwise its FP32 output rounded).
+pub fn fp8_gemm_mx_q_bf16(xq: &Tensor, xs: &Tensor, w: &Tensor, ws: &Tensor) -> Tensor {
+    let (xq, xs) = (xq.contiguous(), xs.contiguous());
+    let (m, k) = (xq.size()[0], xq.size()[1]);
+    let y = Tensor::empty([m, w.size()[0]], (Kind::BFloat16, xq.device()));
+    assert_eq!(unsafe { ds41_fp8_gemm_mx_ex(xq.data_ptr(), xs.data_ptr(), w.data_ptr(), ws.data_ptr(), y.data_ptr(), m as i32, w.size()[0] as i32, k as i32, 1, rs_current_stream()) }, 0, "ds41_fp8_gemm_mx");
+    y
+}
+/// `groups` block-scaled MMA GEMMs rounded to BF16 (wo_a): x BF16 [m, groups k] quantized once, W [groups n, k] ->
+/// [m, groups n], group g's columns = fp8_gemm_mx_bf16(x[:, g k .. +k], W[g n .. +n]) bit for bit (no input copies or cat)
+pub fn fp8_gemm_mx_grouped_bf16(x: &Tensor, w: &Tensor, ws: &Tensor, n: i64, groups: i64) -> Tensor {
+    let (xq, xs) = act_quant_fp8(&x.to_kind(Kind::BFloat16).contiguous());
+    let (m, k) = (xq.size()[0], xq.size()[1] / groups);
+    assert!(w.size() == [groups * n, k] && n % 32 == 0, "fp8_gemm_mx_grouped_bf16");
+    let y = Tensor::empty([m, groups * n], (Kind::BFloat16, xq.device()));
+    assert_eq!(unsafe { ds41_fp8_gemm_mx_grouped(xq.data_ptr(), xs.data_ptr(), w.data_ptr(), ws.data_ptr(), y.data_ptr(), m as i32, n as i32, k as i32, groups as i32, 1, rs_current_stream()) }, 0, "ds41_fp8_gemm_mx_grouped");
+    y
+}
+
 /// Routed experts on the block-scaled tensor-core MMA (shim/ds41_mx.cu): x BF16 [R, 5120] (quantized inside, like the
 /// official act_quant), weights in the mx layout; otherwise the contract of `moe`.
 pub fn moe_mx(x: &Tensor, idx: &Tensor, rw: &Tensor, w: [&Tensor; 6], add: Option<&Tensor>) -> Tensor {
@@ -835,11 +937,12 @@ pub fn moe_mx_q_rows(xq: &Tensor, xs: &Tensor, idx: &Tensor, rw: &Tensor, w: [&T
     Some(MoeRows { ws, y, r, i, topk, e })
 }
 impl MoeRows {
-    /// (out [P, 5120] FP32 of the down passes, pairmap [P], topk) inside the workspace
-    pub fn ptrs(&self) -> (*const f32, *const i32, i64) {
+    /// (out [P, 5120] of the down passes, FP32 or BF16 (the last field: DS41_MOE_PAIR_BF16), pairmap [P], topk) inside the workspace
+    pub fn ptrs(&self) -> (*const std::ffi::c_void, *const i32, i64, bool) {
         let (mut o, mut p) = (std::ptr::null_mut(), std::ptr::null_mut());
         assert_eq!(unsafe { ds41_moe_mx_ws_ptrs(self.ws.data_ptr(), self.r as i32, self.i as i32, self.topk as i32, self.e as i32, &mut o, &mut p) }, 0);
-        (o as *const f32, p as *const i32, self.topk)
+        let b16 = unsafe { ds41_moe_mx_pair_b16(self.r as i32, self.topk as i32, self.e as i32) } != 0;
+        (o as *const std::ffi::c_void, p as *const i32, self.topk, b16)
     }
     /// the workspace (kept by whoever reads it later)
     pub fn ws(&self) -> Tensor { self.ws.shallow_clone() }
@@ -1423,6 +1526,59 @@ pub fn test(ckpt: &std::path::Path) {
     }
     if std::env::var("DS41_KT_ONLY").as_deref() == Ok("s2") { s2_test(&ck, dev); return; }
     if std::env::var("DS41_KT_ONLY").as_deref() == Ok("rs") { rs_test(dev); return; }
+    if std::env::var("DS41_KT_ONLY").as_deref() == Ok("idx") {
+        // the per-row indexer score kernel: key groups per CTA (DS41_INDEX_KT read once per process: here the launches
+        // through ds41_index_score_kt_force) and candidate tiles, bitwise against KT = 1 + mask, at real long-context shapes
+        extern "C" { fn ds41_index_score_kt_force(kt: i32); }
+        for &tc in &[8192i64, 32768, 131072] {
+            for &t in &[1i64, 4] {
+                let q = (Tensor::randn([t, 32, 128], (Kind::Float, dev)) * 0.5).to_kind(Kind::BFloat16);
+                let k = (Tensor::randn([tc, 128], (Kind::Float, dev)) * 0.5).to_kind(Kind::BFloat16);
+                let w = Tensor::randn([t, 32], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+                let pos = Tensor::full([t], tc * 4 - 1, (Kind::Int64, dev));
+                let cand = Tensor::rand([t, tc / 8], (Kind::Float, dev)).lt((16384.0 / tc as f64).min(1.0)).repeat_interleave_self_int(8, 1, None);
+                let time = |f: &dyn Fn() -> Tensor| { for _ in 0..5 { let _ = f(); } tch::Cuda::synchronize(0);
+                    let t0 = std::time::Instant::now(); for _ in 0..50 { let _ = f(); } tch::Cuda::synchronize(0); t0.elapsed().as_secs_f64() * 1e6 / 50.0 };
+                unsafe { ds41_index_score_kt_force(1) };
+                let base = index_score(&q, &k, &w, &pos, 4);
+                let masked = base.masked_fill(&cand.logical_not(), f64::NEG_INFINITY);
+                let mut line = format!("Tc={tc} T={t}:");
+                for kt in [1, 2, 4, 8] {
+                    unsafe { ds41_index_score_kt_force(kt) };
+                    let same = index_score(&q, &k, &w, &pos, 4).equal(&base);
+                    line += &format!(" kt{kt} {:.1}us{}", time(&|| index_score(&q, &k, &w, &pos, 4)), if same { "" } else { " DIFF" });
+                }
+                for kt in [2, 4] {
+                    unsafe { ds41_index_score_kt_force(kt) };
+                    let same = index_score_cand(&q, &k, &w, &pos, 4, &cand).unwrap().equal(&masked);
+                    line += &format!(" cand-kt{kt} {:.1}us{}", time(&|| index_score_cand(&q, &k, &w, &pos, 4, &cand).unwrap()), if same { "" } else { " DIFF" });
+                }
+                eprintln!("[ds41-kernel-test] index_score {line}");
+            }
+        }
+        return;
+    }
+    if std::env::var("DS41_KT_ONLY").as_deref() == Ok("c12") {
+        // the C12 coding: 9..16 rows in one call are bitwise the 8-row calls (head slice and a router-sized weight)
+        {
+            let wr = ck.get("layers.10.ffn.gate.weight", Kind::BFloat16).contiguous();
+            for (name, ww) in [("head", ck.get("head.weight", Kind::BFloat16).narrow(0, 0, 43136).contiguous()), ("router", wr)] {
+                assert!(c12_register(&ww) > 0, "c12_register {name}");
+                for m in 9i64..=16 {
+                    let x = (Tensor::randn([m, 5120], (Kind::Float, dev)) * 2.0).to_kind(Kind::BFloat16);
+                    let one = bf16_gemv(&x, &ww);
+                    let two = Tensor::cat(&[bf16_gemv(&x.narrow(0, 0, 8), &ww), bf16_gemv(&x.narrow(0, 8, m - 8), &ww)], 0);
+                    let same = one.equal(&two);
+                    let time = |f: &dyn Fn() -> Tensor| { for _ in 0..5 { let _ = f(); } tch::Cuda::synchronize(0);
+                        let t0 = std::time::Instant::now(); for _ in 0..50 { let _ = f(); } tch::Cuda::synchronize(0); t0.elapsed().as_secs_f64() * 1e6 / 50.0 };
+                    let (u1, u2) = (time(&|| bf16_gemv(&x, &ww)), time(&|| { bf16_gemv(&x.narrow(0, 0, 8), &ww); bf16_gemv(&x.narrow(0, 8, m - 8), &ww) }));
+                    eprintln!("[ds41-kernel-test] c12 {name} m={m}: one call {u1:.1} us, 8 + {} rows {u2:.1} us (bitwise: {same})", m - 8);
+                    assert!(same, "c12 16-row GEMV differs from the 8-row calls");
+                }
+            }
+        }
+        return;
+    }
     // act_quant
     let x = Tensor::randn([8, 5120], (Kind::Float, dev)) * 3.0;
     let a = act_quant(&x.to_kind(Kind::BFloat16));

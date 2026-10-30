@@ -50,14 +50,14 @@ GLM-5.3-Flash（decode 与 prefill）：2026-10-08 在 DGX OS 7.5.0、GPU 时钟
 
 ### DeepSeek-V4.1-Flash，3× DGX Spark（TP3）
 
-解码（聚合 tok/s；括号内为每路）。服务同时解码 4 个请求（`DS41_SERVE_STORES=4`）。更多数据（代码提示、预填）见 [ds41.zh-CN.md](ds41.zh-CN.md#7-性能)。
+解码（聚合 tok/s；括号内为每路；2026-10-30，v0.3.9）。服务同时解码 4 个请求（`DS41_SERVE_STORES=4`）。更多数据（代码提示、预填）见 [ds41.zh-CN.md](ds41.zh-CN.md#7-性能)。
 
 | 流数 | Prose，贪心、关思考 | Structured，贪心、关思考 | Prose，T 1、开思考 | Structured，T 1、开思考 |
 | --- | --- | --- | --- | --- |
-| 1 | 67.3 tok/s（TTFT 172 ms） | 126.0 tok/s（TTFT 162 ms） | 58.0 tok/s（TTFT 236 ms） | 100.4 tok/s（TTFT 229 ms） |
-| 2 | 91.7（每路 47.9，TTFT 292 ms） | 177.2（每路 91.0，TTFT 280 ms） | 80.8（每路 42.5，TTFT 355 ms） | 157.5（每路 81.1，TTFT 360 ms） |
-| 3 | 108.4（每路 37.0，TTFT 389 ms） | 190.5（每路 66.2，TTFT 384 ms） | 94.2（每路 33.0，TTFT 486 ms） | 157.8（每路 59.6，TTFT 482 ms） |
-| 4 | 122.7（每路 32.4，TTFT 498 ms） | 222.3（每路 58.8，TTFT 491 ms） | 103.6（每路 27.0，TTFT 620 ms） | 165.2（每路 48.8，TTFT 615 ms） |
+| 1 | 67.4 tok/s（TTFT 171 ms） | 126.6 tok/s（TTFT 162 ms） | 57.2 tok/s（TTFT 245 ms） | 109.2 tok/s（TTFT 218 ms） |
+| 2 | 92.8（每路 49.2，TTFT 287 ms） | 181.9（每路 93.5，TTFT 281 ms） | 82.2（每路 41.8，TTFT 370 ms） | 153.3（每路 81.6，TTFT 356 ms） |
+| 3 | 109.3（每路 37.4，TTFT 395 ms） | 194.8（每路 67.7，TTFT 381 ms） | 95.0（每路 33.5，TTFT 504 ms） | 153.5（每路 59.7，TTFT 485 ms） |
+| 4 | 124.7（每路 32.4，TTFT 495 ms） | 226.0（每路 59.9，TTFT 493 ms） | 105.5（每路 27.8，TTFT 636 ms） | 180.9（每路 51.5，TTFT 610 ms） |
 
 ### Qwen3.8-Flash-Next，1× DGX Spark
 

@@ -1,43 +1,42 @@
-spark-engine v0.3.8 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
+spark-engine v0.3.9 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
 
-Changes since v0.3.7: Qwen3.8-Flash-Next engine changes, a DeepSeek start-script fix and re-measured numbers. GLM-5.3-Flash
-and DeepSeek-V4.1-Flash engine code is unchanged; their outputs were checked identical (DeepSeek release goldens and
-paired-prefill checks bitwise identical, GLM teacher-forced logits identical to an earlier export: KL 0.00000, top-1
-1.0000 over 167,943 positions). Every Qwen change keeps the verified output unchanged: greedy replies bitwise identical,
-sampled replies identical per seed.
+Changes since v0.3.8: DeepSeek-V4.1-Flash data-flow changes that cut memory and network traffic in prefill and decode.
+Every change that is on by default keeps the output bitwise identical: DeepSeek release goldens and paired-prefill checks
+identical, a 128K-context decode dump byte-identical with and without the indexer change. GLM-5.3-Flash and
+Qwen3.8-Flash-Next share the binary and were checked unchanged (greedy replies bitwise identical, 20 / 20 each).
 
-**Fix — DeepSeek start script**: `engine-rs/serve/start-ds41.sh` waited for every background job, including the rank 0
-engine, which runs until stopped, so the front end was never started (since v0.3.3). It now waits only for the two ssh
-launches of ranks 1 and 2.
+**DeepSeek prefill** (all bitwise identical):
+- `DS41_SP_EMBED_RS`: each rank embeds only its own sequence-parallel rows; the rows are reduce-scattered instead of
+  all-reduced.
+- `DS41_SP_END_SPARSE`: at the encoder's exit only the rows the decoder reads are gathered.
+- `GLM53_RDMA_ARN_COMB_VEC8`: the MoE combine fused into the RDMA reduce-scatter reads 8 elements per thread.
+- Engram projection writes BF16 straight from the GEMM epilogue; prefill Engram rows and decode / draft inputs are
+  uploaded through pinned staging buffers without blocking the host (`DS41_STAGED_BIG`, `DS41_STAGED_SMALL`).
+- Offline 32K prefill −2.1%. Served, side by side with v0.3.8 (two fresh starts each, alternated): 4K 4,748 → 4,738,
+  8K 5,439 → 5,467, 32K 5,545 → 5,646 tok/s (+1.8%).
 
-**Qwen prefill** (all bitwise identical): 12K-token prompt 6.155 → 5.83 s (−5.3%), 64K 33.29 → 31.42 s (−5.6%).
-- QSA attention: fp8 K/V shared-memory row stride 256 → 272 bytes (the 8 rows of a fragment load hit one bank, an
-  8-way conflict), in the prefill flash kernel and the decode / verify kernels.
-- QSA prefill attention: K and V share one tile buffer (V's `cp.async` issued after scoring, overlapping the softmax),
-  shared memory 40 → 22.7 KB, 4 blocks per SM.
-- HC prefill: the residual-stream reads of the upmix tail are issued before the GEMM main loop, hiding DRAM latency.
+**DeepSeek decode** (all bitwise identical):
+- `DS41_INDEX_CAND`: past the candidate source layer, the indexer scores only the candidate blocks (16,384 compressed
+  keys); blocks without a candidate are not loaded. A decode step at 128K context 28.4 → 27.0 ms (−5.0%); no change up
+  to 64K, more saved at longer contexts.
+- `DS41_AR_B16_WIRE`: BF16 all-reduces send BF16 and sum in FP32 in rank order (half the bytes, same result).
+- `DS41_MTP_SEED_SPLIT`: the draft's seed projection split by rows over the ranks.
+- C12 GEMV up to 16 rows, logits / router computed in 16-row chunks.
+- `bench/ds41_decode_bench.py`, greedy, side by side with v0.3.8 (median of 6 runs over two fresh starts each):
+  1 stream prose / structured / code 68.5 / 125.1 / 111.2 → 69.5 / 129.2 / 114.2 tok/s, 4 streams 121.7 / 215.6 /
+  166.5 → 125.3 / 221.3 / 167.8.
 
-**Qwen decode scheduling**:
-- `QWEN_SPEC_COST_ONLINE` (default on): the rate rule's round-time model is fitted online (recursive least squares per
-  batch size and round type, the static `QWEN_SPEC_COST` as prior, slopes bounded to 0.5–2.5× of it). It only changes
-  which verify width is chosen; sampled 4-stream decode +0.7–2.9%, greedy unchanged.
-- `QWEN_SPEC_RAGGED` (default off): per-sequence verify widths inside a batch; output unchanged but slower in the
-  service, kept for experiments.
+**Experiments, off by default** (they change rounding or summation order): `DS41_MOE_PAIR_BF16` (routed-expert pair
+outputs in BF16), `DS41_WO_A_MMA` (grouped `wo_a` on the block-scaled MMA), `DS41_COMP_TF32` (compressor projection on
+tensor cores). They make prefill 1.7–2.1% faster, but the encoder output feeds the draft, which then accepts fewer tokens:
+served decode was 0.75–1.8% slower.
 
-**Test system and numbers**: the measuring nodes were updated to DGX OS 7.6.0 (kernel 7.0.0-1019, driver 580.178.04,
-new EC / UEFI / ConnectX-7 firmware), and a leftover service that had locked the GPU clock at 2,200 MHz was removed;
-earlier numbers were measured with that lock. All DeepSeek and Qwen tables in the README, `docs/benchmarks.md` and
-`docs/ds41.md` were re-measured on the updated system at default clocks (sustained runs, clock sampled every second, no
-throttling recorded). `bench/decode_bench.py`, greedy, thinking off, 1 / 2 / 3 / 4 streams, median of 5:
+**Numbers** (`bench/decode_bench.py`, 400 tokens, median of 5, 1 / 2 / 3 / 4 streams, DeepSeek-V4.1-Flash on 3× DGX
+Spark, default GPU clocks):
 
 | | Prose | Structured |
 | --- | --- | --- |
-| DeepSeek-V4.1-Flash (3× DGX Spark) | 67.3 / 91.7 / 108.4 / 122.7 tok/s | 126.0 / 177.2 / 190.5 / 222.3 tok/s |
-| Qwen3.8-Flash-Next (1× DGX Spark) | 68.4 / 98.0 / 122.4 / 139.2 tok/s | 157.8 / 230.7 / 280.1 / 310.3 tok/s |
+| Greedy, thinking off | 67.4 / 92.8 / 109.3 / 124.7 tok/s | 126.6 / 181.9 / 194.8 / 226.0 tok/s |
+| T 1, thinking on | 57.2 / 82.2 / 95.0 / 105.5 tok/s | 109.2 / 153.3 / 153.5 / 180.9 tok/s |
 
-Prefill: DeepSeek ~5,550 tok/s for 8K–64K prompts of new text (4K ~4,750), Qwen 2,056 / 2,084 tok/s at 13K and
-1,994 / 1,976 tok/s at 77K tokens.
-
-**Docs**: README sections "Test system and GPU clock" (component versions, default clocks vs a 2,200 MHz lock),
-"Measured by other users" and an FAQ (context below 1M, slow prefill and RDMA link checks, startup time, decode
-differences, node hangs); new switch rows in `docs/qwen-switches.md`.
+Prefill ~5,570 tok/s for 8K–64K prompts (4K ~4,760). Switch descriptions: `docs/ds41.md` §5.

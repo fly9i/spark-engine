@@ -124,6 +124,45 @@ __global__ void arn_kernel(float* data,long long n,int rank,int world,Host* h,De
   if(threadIdx.x==0&&atomicAdd(&st->done,1u)==gridDim.x-1){st->done=0;st->seq=s;st->fseq=s;}
 }
 
+// arn_kernel<true> of a BF16 partial (in: BF16 values, n % 8 == 0, 16-byte aligned) with BF16 on the wire: out = BF16
+// of the FP32 rank-ordered sum, bitwise arn_kernel on the partial's FP32 copy then rounding (glm53_rdma_arn_b16_cuda)
+__global__ void arn_b16_kernel(const __nv_bfloat16* in,__nv_bfloat16* out,long long n,int rank,int world,Host* h,DevState* st,unsigned long long split){
+  const unsigned long long s=st->seq+1;const int slot=(int)(s%NSLOT);
+  uint4* snd=reinterpret_cast<uint4*>(h->send[slot]);
+  const long long stride=(long long)gridDim.x*blockDim.x,first=(long long)blockIdx.x*blockDim.x+threadIdx.x,n8=n/8;
+  for(long long i=first;i<n8;i+=stride)snd[i]=reinterpret_cast<const uint4*>(in)[i];
+  __threadfence_system();__syncthreads();
+  if(threadIdx.x==0){
+    if(atomicAdd(&st->arrive,1u)==gridDim.x-1){st->arrive=0;h->ready_bytes[slot]=(unsigned long long)n*2;__threadfence_system();h->ready_seq[slot]=s;__threadfence_system();}
+    const bool two=split&&(unsigned long long)n*2>=split;
+    for(int r=0;r<world;++r){
+      if(r==rank)continue;
+      long long spins=0;
+      while(h->recv_flag[r][0][slot]!=s||(two&&h->recv_flag[r][1][slot]!=s)){if(++spins>(1ll<<34))__trap();}
+    }
+  }
+  __syncthreads();
+  for(long long i=first;i<n8;i+=stride){
+    uint4 x[MAXW];
+#pragma unroll
+    for(int r=0;r<MAXW;++r)if(r<world)x[r]=r==rank?reinterpret_cast<const uint4*>(in)[i]:__ldcv(reinterpret_cast<const uint4*>(h->recv[r][slot])+i);
+    float acc[8];
+#pragma unroll
+    for(int r=0;r<MAXW;++r)if(r<world){
+      const unsigned* w=reinterpret_cast<const unsigned*>(&x[r]);
+#pragma unroll
+      for(int e=0;e<4;++e){const float2 f=__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w[e]));
+        if(r==0){acc[2*e]=f.x;acc[2*e+1]=f.y;}else{acc[2*e]=__fadd_rn(acc[2*e],f.x);acc[2*e+1]=__fadd_rn(acc[2*e+1],f.y);}}
+    }
+    uint4 o;unsigned* ow=reinterpret_cast<unsigned*>(&o);
+#pragma unroll
+    for(int e=0;e<4;++e){const __nv_bfloat162 b=__floats2bfloat162_rn(acc[2*e],acc[2*e+1]);ow[e]=*reinterpret_cast<const unsigned*>(&b);}
+    reinterpret_cast<uint4*>(out)[i]=o;
+  }
+  __threadfence();__syncthreads();
+  if(threadIdx.x==0&&atomicAdd(&st->done,1u)==gridDim.x-1){st->done=0;st->seq=s;st->fseq=s;}
+}
+
 // Pipelined large allreduce (glm53_rdma_arn_big_cuda): the send half (copy into the next slot, publish it) and the
 // finish half (wait for every peer's part of the oldest unfinished call, sum in rank order) as separate kernels, so
 // several slot-sized calls are on the network at once. Same per-element order as arn_kernel.
@@ -380,12 +419,34 @@ __global__ void arn_rows_finish_bf16_kernel(float* out,const float* own,long lon
 // T = Comb: the partial is a routed-expert call's combine computed here (y = add + sum_k out[pair (r, k)], each element
 // with combine_kernel's adds in its order, ds41_mx.cu): no FP32 y written and read back, and a chunk's combine runs
 // while the earlier chunks are on the wire
-struct Comb { const float* out; const int* pairmap; const float* add; int topk; int hcols; };
+// (b16: the pairs are BF16, ds41_moe_mx_pair_b16; vec8: 8 elements a thread, comb8_bf16)
+struct Comb { const void* out; const int* pairmap; const float* add; int topk; int hcols; int b16; int vec8; };
 __device__ __forceinline__ float comb1(const Comb& cb,long long g){
   const long long r=g/cb.hcols;const int c=(int)(g%cb.hcols);
   float acc=cb.add?cb.add[g]:0.f,s=0.f;
-  for(int k=0;k<cb.topk;++k)s+=cb.out[(long long)cb.pairmap[r*cb.topk+k]*cb.hcols+c];
+  if(cb.b16)for(int k=0;k<cb.topk;++k)s+=__bfloat162float(static_cast<const __nv_bfloat16*>(cb.out)[(long long)cb.pairmap[r*cb.topk+k]*cb.hcols+c]);
+  else for(int k=0;k<cb.topk;++k)s+=static_cast<const float*>(cb.out)[(long long)cb.pairmap[r*cb.topk+k]*cb.hcols+c];
   return acc+s;
+}
+// comb1 of the 8 elements [g, g + 8) (one row: hcols % 8 == 0, g % 8 == 0), each with comb1's adds in its order: one
+// pairmap read per pair and 16- / 32-byte loads instead of one scalar load per element and pair
+__device__ __forceinline__ uint4 comb8_bf16(const Comb& cb,long long g){
+  const long long r=g/cb.hcols;const int c=(int)(g%cb.hcols);
+  float acc[8],s[8];
+  if(cb.add){const float4 a=*reinterpret_cast<const float4*>(cb.add+g),b=*reinterpret_cast<const float4*>(cb.add+g+4);
+    acc[0]=a.x;acc[1]=a.y;acc[2]=a.z;acc[3]=a.w;acc[4]=b.x;acc[5]=b.y;acc[6]=b.z;acc[7]=b.w;}
+  else for(int e=0;e<8;++e)acc[e]=0.f;
+  for(int e=0;e<8;++e)s[e]=0.f;
+  for(int k=0;k<cb.topk;++k){
+    const long long o=(long long)cb.pairmap[r*cb.topk+k]*cb.hcols+c;
+    if(cb.b16){const uint4 u=*reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(cb.out)+o);const unsigned w[4]={u.x,u.y,u.z,u.w};
+      for(int e=0;e<4;++e){const float2 f=__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w[e]));s[2*e]+=f.x;s[2*e+1]+=f.y;}}
+    else{const float4 a=*reinterpret_cast<const float4*>(static_cast<const float*>(cb.out)+o),b=*reinterpret_cast<const float4*>(static_cast<const float*>(cb.out)+o+4);
+      s[0]+=a.x;s[1]+=a.y;s[2]+=a.z;s[3]+=a.w;s[4]+=b.x;s[5]+=b.y;s[6]+=b.z;s[7]+=b.w;}
+  }
+  uint4 q;unsigned* w=reinterpret_cast<unsigned*>(&q);
+  for(int e=0;e<4;++e){const __nv_bfloat162 h=__floats2bfloat162_rn(acc[2*e]+s[2*e],acc[2*e+1]+s[2*e+1]);w[e]=*reinterpret_cast<const unsigned*>(&h);}
+  return q;
 }
 // T = __nv_bfloat16: the partial is already BF16 (its FP32 rounding is the value itself: the same bytes on the wire)
 template<class T>
@@ -395,6 +456,11 @@ __global__ void arn_rows_send_bf16v_kernel(typename std::conditional<std::is_sam
   __nv_bfloat16* snd=reinterpret_cast<__nv_bfloat16*>(h->send[slot]);
   const long long stride=(long long)gridDim.x*blockDim.x,first=(long long)blockIdx.x*blockDim.x+threadIdx.x;
   for(int j=0;j<world;++j){const long long base=(long long)j*blk_f+off_f;__nv_bfloat16* d=snd+(long long)j*m_f;
+    if constexpr(std::is_same<T,Comb>::value)if(data.vec8&&(data.hcols%8)==0&&(m_f%8)==0&&(n_valid%8)==0){
+      for(long long i=first;i<m_f/8;i+=stride){const long long g=base+8*i;
+        reinterpret_cast<uint4*>(d)[i]=g<n_valid?comb8_bf16(data,g):make_uint4(0u,0u,0u,0u);}
+      continue;
+    }
     for(long long i=first;i<m_f/2;i+=stride){
       if constexpr(std::is_same<T,Comb>::value){const long long g=base+2*i;
         const float v0=g<n_valid?comb1(data,g):0.f,v1=g+1<n_valid?comb1(data,g+1):0.f;
@@ -690,6 +756,11 @@ extern "C" int glm53_rdma_arn_send_cuda(float* data,long long n,cudaStream_t s){
   arn_kernel<false><<<arn_blocks(n),256,0,s>>>(data,n,g_rank,g_world,g_host_dev,g_state,g_split);
   return (int)cudaGetLastError();
 }
+extern "C" int glm53_rdma_arn_b16_cuda(const void* in,void* out,long long n,cudaStream_t s){
+  if(!g_host||n<8||n%8||(size_t)n*2>SLOT_BYTES||((size_t)in&15)||((size_t)out&15))return 1;
+  arn_b16_kernel<<<arn_blocks(n/2),256,0,s>>>((const __nv_bfloat16*)in,(__nv_bfloat16*)out,n,g_rank,g_world,g_host_dev,g_state,g_split);
+  return (int)cudaGetLastError();
+}
 // Large allreduce: slot-sized chunks, each a reduce-scatter call and an all-gather call. Iteration t publishes RS(t)
 // and (inside rs_finish) AG(t - K), finishes RS(t - K) and AG(t - 2K): the finishes of iteration t are exactly the
 // publications of iteration t - K in the same order, so the device counters stay monotonic. Slot reuse: a slot is
@@ -812,9 +883,11 @@ extern "C" int glm53_rdma_arn_rows_bf16r_cuda(const float* in,void* out,long lon
 // the same with a BF16 partial (`in` BF16 values: bitwise the FP32 call on their FP32 copy)
 extern "C" int glm53_rdma_arn_rows_bf16r_b16_cuda(const void* in,void* out,long long blk_f,long long n_valid,cudaStream_t s){ return rows_bf16r<__nv_bfloat16>((const __nv_bfloat16*)in,out,blk_f,n_valid,s); }
 // the same of a routed-expert combine (Comb: `pairmap` / `add` at the part's first row, out [P, hcols] FP32)
-extern "C" int glm53_rdma_arn_rows_bf16r_comb_cuda(const float* pout,const int* pairmap,const float* add,int topk,int hcols,void* out,long long blk_f,long long n_valid,cudaStream_t s){
+extern "C" int glm53_rdma_arn_rows_bf16r_comb_cuda(const void* pout,int pair_b16,const int* pairmap,const float* add,int topk,int hcols,void* out,long long blk_f,long long n_valid,cudaStream_t s){
   if(hcols%2)return 1;
-  return rows_bf16r<Comb>(Comb{pout,pairmap,add,topk,hcols},out,blk_f,n_valid,s);
+  // GLM53_RDMA_ARN_COMB_VEC8=0: comb1 per element pair (the same sums)
+  static const int vec8=[]{const char* e=std::getenv("GLM53_RDMA_ARN_COMB_VEC8");return e&&e[0]=='0'?0:1;}();
+  return rows_bf16r<Comb>(Comb{pout,pairmap,add,topk,hcols,pair_b16,vec8},out,blk_f,n_valid,s);
 }
 extern "C" int glm53_rdma_arn_materialize_cuda(float* data,long long n,int round,cudaStream_t s){
   if(!g_host||n<1||(size_t)n*4>SLOT_BYTES)return 1;

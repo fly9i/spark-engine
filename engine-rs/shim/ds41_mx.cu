@@ -291,8 +291,16 @@ __global__ __launch_bounds__(128) void down_mx(const uint8_t* __restrict__ hq, c
     }
 }
 
-// (columns [c0, c0 + hn) of y; out holds those columns of every pair, hn per row)
-__global__ void combine_kernel(const float* __restrict__ out, const int* __restrict__ pairmap, const float* __restrict__ add,
+// (columns [c0, c0 + hn) of y; out holds those columns of every pair, hn per row; P = __nv_bfloat16: the pairs rounded
+// to BF16 by down_gemm, DS41_MOE_PAIR_BF16)
+__device__ __forceinline__ float4 ld_pair4(const float* p) { return *reinterpret_cast<const float4*>(p); }
+__device__ __forceinline__ float4 ld_pair4(const __nv_bfloat16* p) {
+  const uint2 u = *reinterpret_cast<const uint2*>(p);
+  const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x)), b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+  return make_float4(a.x, a.y, b.x, b.y);
+}
+template <class P>
+__global__ void combine_kernel(const P* __restrict__ out, const int* __restrict__ pairmap, const float* __restrict__ add,
                                float* __restrict__ y, int R, int topk, int c0, int hn) {
   pdl_entry();
   const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -301,7 +309,7 @@ __global__ void combine_kernel(const float* __restrict__ out, const int* __restr
   float4 acc = add ? *reinterpret_cast<const float4*>(add + (long long)r * H + c) : make_float4(0.f, 0.f, 0.f, 0.f);
   float4 s = make_float4(0.f, 0.f, 0.f, 0.f);
   for (int k = 0; k < topk; ++k) {
-    const float4 v = *reinterpret_cast<const float4*>(out + (long long)pairmap[r * topk + k] * hn + (c - c0));
+    const float4 v = ld_pair4(out + (long long)pairmap[r * topk + k] * hn + (c - c0));
     s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w;
   }
   acc.x += s.x; acc.y += s.y; acc.z += s.z; acc.w += s.w;
@@ -537,8 +545,15 @@ __global__ __launch_bounds__(32 * WMW * WNW) void fp8_gemm_mx2(const uint8_t* __
 // warp's rows g = 0..3 then cover banks 0-7, 16-23, 8-15, 24-31 (conflict-free), a third less shared memory than 96.
 template <bool B16, int WMW, int WNW, int NT, int NS, int PB>
 __global__ __launch_bounds__(32 * WMW * WNW) void fp8_gemm_mx3(const uint8_t* __restrict__ aq, const uint8_t* __restrict__ as_,
-    const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, void* __restrict__ yv, int M, int N, int K) {
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, void* __restrict__ yv, int M, int N, int K, int lda, int ldy) {
   constexpr int BM = 64 * WMW, BN = 8 * NT * WNW, NTH = 32 * WMW * WNW, NB = NT / 4, RB = PB ? PB : GK;
+  // (grouped calls, blockIdx.z = group g: A columns [g K, +K) of rows lda bytes apart, weight g's [N, K] block, output
+  // columns [g N, +N) of rows ldy apart; one group: lda = K, ldy = N)
+  {
+    const int gz = blockIdx.z;
+    aq += (long long)gz * K; as_ += (long long)gz * (K / 32); w += (long long)gz * N * K; ws += (long long)gz * (N / 32) * (K / 32);
+    yv = B16 ? (void*)(reinterpret_cast<__nv_bfloat16*>(yv) + (long long)gz * N) : (void*)(reinterpret_cast<float*>(yv) + (long long)gz * N);
+  }
   // byte offset of (row r, byte c of the K step) in a stage
   auto at = [](int r, int c) { return PB ? r * PB + c : r * GK + ((((c >> 4) ^ (((r >> 1) & 1) << 1))) << 4) + (c & 15); };
   extern __shared__ __align__(16) uint8_t g3_smem[];
@@ -553,7 +568,7 @@ __global__ __launch_bounds__(32 * WMW * WNW) void fp8_gemm_mx3(const uint8_t* __
     uint8_t* sb = sb0 + stage * BN * RB;
     for (int i = tid; i < BM * GK / 16; i += NTH) {
       const int r = i >> 2, c = (i & 3) * 16, gm = m0 + r;
-      cp16(&sa[at(r, c)], aq + (long long)(gm < M ? gm : 0) * K + k0 + c, gm < M);
+      cp16(&sa[at(r, c)], aq + (long long)(gm < M ? gm : 0) * lda + k0 + c, gm < M);
     }
     for (int i = tid; i < BN * GK / 16; i += NTH) {
       const int r = i >> 2, c = (i & 3) * 16, gn = n0 + r;
@@ -569,7 +584,7 @@ __global__ __launch_bounds__(32 * WMW * WNW) void fp8_gemm_mx3(const uint8_t* __
       for (int c = 0; c < 4; ++c) acc[a][b][c] = 0.f;
   const uint16_t* pa[4];
 #pragma unroll
-  for (int mt = 0; mt < 4; ++mt) pa[mt] = reinterpret_cast<const uint16_t*>(as_ + (long long)min(m0 + wm * 64 + mt * 16 + g + 8 * (lane & 1), M - 1) * kb);
+  for (int mt = 0; mt < 4; ++mt) pa[mt] = reinterpret_cast<const uint16_t*>(as_ + (long long)min(m0 + wm * 64 + mt * 16 + g + 8 * (lane & 1), M - 1) * (lda / 32));
   const uint16_t* pb[NB];
 #pragma unroll
   for (int j = 0; j < NB; ++j) pb[j] = reinterpret_cast<const uint16_t*>(ws + (long long)(min(n0 + wn * 8 * NT + j * 32 + g, N - 1) >> 5) * kb);
@@ -633,21 +648,21 @@ __global__ __launch_bounds__(32 * WMW * WNW) void fp8_gemm_mx3(const uint8_t* __
       for (int nt = 0; nt < NT; ++nt) {
         const int c = n0 + wn * 8 * NT + nt * 8 + 2 * q;
         if (c < N) {
-          if (B16) *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(yv) + (long long)r * N + c) = __floats2bfloat162_rn(acc[mt][nt][hh * 2], acc[mt][nt][hh * 2 + 1]);
-          else *reinterpret_cast<float2*>(reinterpret_cast<float*>(yv) + (long long)r * N + c) = make_float2(acc[mt][nt][hh * 2], acc[mt][nt][hh * 2 + 1]);
+          if (B16) *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(yv) + (long long)r * ldy + c) = __floats2bfloat162_rn(acc[mt][nt][hh * 2], acc[mt][nt][hh * 2 + 1]);
+          else *reinterpret_cast<float2*>(reinterpret_cast<float*>(yv) + (long long)r * ldy + c) = make_float2(acc[mt][nt][hh * 2], acc[mt][nt][hh * 2 + 1]);
         }
       }
     }
 }
 template <int WMW, int WNW, int NT, int NS, int PB>
-int launch_g3(const void* aq, const void* as_, const void* w, const void* ws, void* y, int M, int N, int K, int bf16out, cudaStream_t st) {
+int launch_g3(const void* aq, const void* as_, const void* w, const void* ws, void* y, int M, int N, int K, int bf16out, cudaStream_t st, int groups = 1) {
   constexpr int BM = 64 * WMW, BN = 8 * NT * WNW, SM = NS * (BM + BN) * (PB ? PB : GK);
   static const bool attr = cudaFuncSetAttribute(fp8_gemm_mx3<true, WMW, WNW, NT, NS, PB>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM) == cudaSuccess &&
                            cudaFuncSetAttribute(fp8_gemm_mx3<false, WMW, WNW, NT, NS, PB>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM) == cudaSuccess;
   if (!attr) return 3;
-  const dim3 gr((M + BM - 1) / BM, (N + BN - 1) / BN);
-  if (bf16out) fp8_gemm_mx3<true, WMW, WNW, NT, NS, PB><<<gr, 32 * WMW * WNW, SM, st>>>((const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, M, N, K);
-  else fp8_gemm_mx3<false, WMW, WNW, NT, NS, PB><<<gr, 32 * WMW * WNW, SM, st>>>((const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, M, N, K);
+  const dim3 gr((M + BM - 1) / BM, (N + BN - 1) / BN, groups);
+  if (bf16out) fp8_gemm_mx3<true, WMW, WNW, NT, NS, PB><<<gr, 32 * WMW * WNW, SM, st>>>((const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, M, N, K, groups * K, groups * N);
+  else fp8_gemm_mx3<false, WMW, WNW, NT, NS, PB><<<gr, 32 * WMW * WNW, SM, st>>>((const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, M, N, K, groups * K, groups * N);
   return (int)cudaGetLastError();
 }
 
@@ -810,9 +825,9 @@ __global__ __launch_bounds__(256, 1) void up_gemm(const uint8_t* __restrict__ xq
 // down_mx<4> reads the item's A rows from global memory in every warp and the weights into registers without prefetch;
 // here each block loads both once per step. Same MMA sequence per output as down_mx (bitwise equal).
 template <int RT> struct DgStageT { uint8_t a[RT][UG_AP]; uint32_t as[RT]; uint4 b[16][32]; uint32_t bs[16][8]; uint8_t bc[16][8]; };
-template <int RT, int NS, bool C2>
+template <int RT, int NS, bool C2, class OT = float>
 __global__ __launch_bounds__(256, 1) void down_gemm(const uint8_t* __restrict__ hq, const uint8_t* __restrict__ hs, const uint8_t* __restrict__ w2,
-    const ScaleV s2, int I, const int* __restrict__ G, const Item* __restrict__ items, float* __restrict__ out, int c0, int ldo) {
+    const ScaleV s2, int I, const int* __restrict__ G, const Item* __restrict__ items, OT* __restrict__ out, int c0, int ldo) {
   constexpr int WMR = RT / 32, WNC = 8 / WMR, TPW = 16 / WNC, AJ = RT * 8 / 256;
   pdl_entry();
   if ((int)blockIdx.y >= *G) return;
@@ -908,8 +923,11 @@ __global__ __launch_bounds__(256, 1) void down_gemm(const uint8_t* __restrict__ 
     for (int hh = 0; hh < 2; ++hh) {
       const int r = wm * 32 + m * 16 + hh * 8 + g;
       if (r >= it.n) continue;
-      float* o = out + (long long)(it.off + r) * ldo + (n0 - c0) + 2 * q;
-      for (int t = 0; t < TPW; ++t) *reinterpret_cast<float2*>(o + 8 * t) = make_float2(acc[m][t][hh * 2], acc[m][t][hh * 2 + 1]);
+      OT* o = out + (long long)(it.off + r) * ldo + (n0 - c0) + 2 * q;
+      for (int t = 0; t < TPW; ++t) {
+        if constexpr (std::is_same<OT, float>::value) *reinterpret_cast<float2*>(o + 8 * t) = make_float2(acc[m][t][hh * 2], acc[m][t][hh * 2 + 1]);
+        else *reinterpret_cast<__nv_bfloat162*>(o + 8 * t) = __floats2bfloat162_rn(acc[m][t][hh * 2], acc[m][t][hh * 2 + 1]);
+      }
     }
 }
 
@@ -1198,6 +1216,19 @@ inline int gemm_rows() { static const int r = std::getenv("DS41_MOE_ROWS") && st
 inline int gr_of(int R, int topk, int E) { (void)topk; (void)E; return R <= 8 ? 16 : moe_gemm(R) ? gemm_rows() : 32; }   // (64-row up_mx items: register-bound, 2.4x slower)
 inline int gmax_of(int R, int topk, int E) { const int P = R * topk; return (P < E ? P : E) + P / gr_of(R, topk, E) + 1; }
 inline size_t al(size_t b) { return (b + 255) & ~(size_t)255; }
+// DS41_DOWN_GEMM=0: down_mx<4> instead of down_gemm for one-pass 64-row items (the same MMA sequence per output)
+inline bool down_gemm_on() { static const bool dg = !(std::getenv("DS41_DOWN_GEMM") && std::getenv("DS41_DOWN_GEMM")[0] == '0'); return dg; }
+// DS41_MOE_PAIR_BF16=1 (L1, default off): the grouped-GEMM calls (prefill, R > 64) keep every pair's down output as
+// BF16 (rounded from the FP32 MMA sum) instead of FP32: half the bytes down_gemm writes and the combine reads (8192
+// rows: 1 GB of each per layer); each sum still in FP32 in the same order. p2 golden KL vs reference 0.0236 -> 0.0213,
+// top-1 0.957 -> 0.956 (noise floor 0.0224 / 0.955); 32k prefill 5713 -> 5400 ms; but the drafter verifies more per
+// round (ds41-spec p2: 2.91 -> 3.22 drafts, also with only the encoder's calls) and the service decode ABBA loses
+// 1.8% (geomean of 12 workloads, greedy text identical): kept off (2026-10-30)
+inline bool pair_b16(int R, int topk, int E) {
+  static const bool on = std::getenv("DS41_MOE_PAIR_BF16") && std::getenv("DS41_MOE_PAIR_BF16")[0] == '1';
+  return on && down_gemm_on() && (gr_of(R, topk, E) == 64 || gr_of(R, topk, E) == 128);
+}
+inline size_t pair_bytes(int R, int topk, int E) { return pair_b16(R, topk, E) ? 2 : 4; }
 } // namespace
 
 // DS41_MX_S2: the routed-expert scales handed to ds41_moe_mx* are 2-bit coded blobs (set by the loader)
@@ -1206,7 +1237,8 @@ static int g_s2 = 0;
 template <bool C2>
 int moe_launch(const uint8_t* X, const uint8_t* XS, int R, const float* rw, const uint8_t* W1, ScaleV S1, const uint8_t* W3, ScaleV S3,
                const uint8_t* W2, ScaleV S2, int I, const float* add, float* y, int topk, int GR, int Gm, int np, int hn, const int* G,
-               const Item* items, const int* pairmap, const int* prow, uint8_t* hq, uint8_t* hs, float* out, cudaStream_t st) {
+               const Item* items, const int* pairmap, const int* prow, uint8_t* hq, uint8_t* hs, void* outv, int pb16, cudaStream_t st) {
+  float* out = (float*)outv;
   // R = 1: 8 warps per block split K (decode 31.8 -> 31.3 ms; DS41_UP_KS=4 the earlier 4)
   static const int up_ks = std::getenv("DS41_UP_KS") ? std::atoi(std::getenv("DS41_UP_KS")) : 8;
   if (GR == 16 && up_ks == 8) {
@@ -1217,17 +1249,20 @@ int moe_launch(const uint8_t* X, const uint8_t* XS, int R, const float* rw, cons
     pdl_launch((down_mx<1, C2>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out);
   } else if (GR == 64 || GR == 128) {
     // DS41_DOWN_GEMM=0: down_mx<4> (the same MMA sequence per output, bitwise equal; 64-row items only)
-    static const bool dg = !(std::getenv("DS41_DOWN_GEMM") && std::getenv("DS41_DOWN_GEMM")[0] == '0');
+    const bool dg = down_gemm_on();
 #define MOE_GEMM(RT, UNS, DNS) do { \
       const int usm = UNS * (int)sizeof(UgStageT<RT>), dsm = DNS * (int)sizeof(DgStageT<RT>); \
       static const bool attr = cudaFuncSetAttribute(up_gemm<RT, UNS, C2>, cudaFuncAttributeMaxDynamicSharedMemorySize, usm) == cudaSuccess && \
-                               cudaFuncSetAttribute(down_gemm<RT, DNS, C2>, cudaFuncAttributeMaxDynamicSharedMemorySize, dsm) == cudaSuccess; \
+                               cudaFuncSetAttribute(down_gemm<RT, DNS, C2>, cudaFuncAttributeMaxDynamicSharedMemorySize, dsm) == cudaSuccess && \
+                               cudaFuncSetAttribute(down_gemm<RT, DNS, C2, __nv_bfloat16>, cudaFuncAttributeMaxDynamicSharedMemorySize, dsm) == cudaSuccess; \
       if (!attr) return 3; \
       pdl_launch((up_gemm<RT, UNS, C2>), dim3(dim3(I / 128, Gm)), dim3(256), usm, st, X, XS, W1, S1, W3, S3, I, rw, G, items, prow, hq, hs, topk); \
       if (np > 1 || dg || RT != 64) { \
         for (int pc = 0; pc < np; ++pc) { \
-          pdl_launch((down_gemm<RT, DNS, C2>), dim3(dim3(hn / 128, Gm)), dim3(256), dsm, st, hq, hs, W2, S2, I, G, items, out, pc * hn, hn); \
-          if (np > 1) pdl_launch(combine_kernel, dim3((unsigned)(((long long)R * (hn / 4) + 255) / 256)), dim3(256), 0, st, (const float*)out, (const int*)pairmap, add, y, R, topk, pc * hn, hn); } } \
+          if (pb16) pdl_launch((down_gemm<RT, DNS, C2, __nv_bfloat16>), dim3(dim3(hn / 128, Gm)), dim3(256), dsm, st, hq, hs, W2, S2, I, G, items, (__nv_bfloat16*)outv, pc * hn, hn); \
+          else pdl_launch((down_gemm<RT, DNS, C2>), dim3(dim3(hn / 128, Gm)), dim3(256), dsm, st, hq, hs, W2, S2, I, G, items, out, pc * hn, hn); \
+          if (np > 1 && pb16) pdl_launch(combine_kernel<__nv_bfloat16>, dim3((unsigned)(((long long)R * (hn / 4) + 255) / 256)), dim3(256), 0, st, (const __nv_bfloat16*)outv, (const int*)pairmap, add, y, R, topk, pc * hn, hn); \
+          else if (np > 1) pdl_launch(combine_kernel<float>, dim3((unsigned)(((long long)R * (hn / 4) + 255) / 256)), dim3(256), 0, st, (const float*)out, (const int*)pairmap, add, y, R, topk, pc * hn, hn); } } \
       else pdl_launch((down_mx<4, C2>), dim3(dim3(H / 128, Gm)), dim3(128), 0, st, hq, hs, W2, S2, I, G, items, out); } while (0)
     if (GR == 128) MOE_GEMM(128, 2, 3); else MOE_GEMM(64, 3, 3);
 #undef MOE_GEMM
@@ -1274,6 +1309,14 @@ int ds41_fp8_gemm_mx_ex(const void* aq, const void* as_, const void* w, const vo
   return (int)cudaGetLastError();
 }
 int ds41_gemm_version(int v) { g_gemm_version = v; return 0; }
+// `groups` independent fp8_gemm_mx3 GEMMs in one launch: A [M, groups K] (E4M3 + UE8M0 [M, groups K / 32]), W [groups N,
+// K] (+ scales [groups N / 32, K / 32]), y [M, groups N] with group g's columns [g N, +N) = A[:, g K, +K] . W[g]^T --
+// each group's MMA sequence that of its own ds41_fp8_gemm_mx_ex call (N % 32 == 0)
+int ds41_fp8_gemm_mx_grouped(const void* aq, const void* as_, const void* w, const void* ws, void* y, int M, int N, int K, int groups, int bf16out, cudaStream_t st) {
+  if (M < 1 || K % GK || N % 32 || groups < 1) return 1;
+  return M <= 256 ? launch_g3<1, 4, 4, 3, 0>(aq, as_, w, ws, y, M, N, K, bf16out, st, groups)
+                  : launch_g3<2, 4, 4, 3, 0>(aq, as_, w, ws, y, M, N, K, bf16out, st, groups);
+}
 int ds41_fp8_gemm_mx(const void* aq, const void* as_, const void* w, const void* ws, float* y, int M, int N, int K, cudaStream_t st) {
   return ds41_fp8_gemm_mx_ex(aq, as_, w, ws, y, M, N, K, 0, st);
 }
@@ -1351,14 +1394,14 @@ inline int col_passes(int R, int topk, int E) {
   // combine can run inside the reduce-scatter (Model moe_rs)
   static const size_t cap = (size_t)(std::getenv("DS41_MOE_OUT_MB") ? std::atoi(std::getenv("DS41_MOE_OUT_MB")) : 512) << 20;
   int n = 1;
-  while (4 * P * H / n > cap && n < 4) n *= 2;
+  while (pair_bytes(R, topk, E) * P * H / n > cap && n < 4) n *= 2;
   return n;
 }
 void ds41_moe_mx_set_s2(int on) { g_s2 = on; }
 int ds41_moe_mx_get_s2() { return g_s2; }
 size_t ds41_moe_mx_ws_bytes(int R, int I, int topk, int E) {
   const size_t P = (size_t)R * topk;
-  return al(16) + al(sizeof(Item) * gmax_of(R, topk, E)) + 2 * al(4 * P) + al(P * I) + al(P * I / 32) + al(4 * P * H / col_passes(R, topk, E));
+  return al(16) + al(sizeof(Item) * gmax_of(R, topk, E)) + 2 * al(4 * P) + al(P * I) + al(P * I / 32) + al(pair_bytes(R, topk, E) * P * H / col_passes(R, topk, E));
 }
 // xq [R, H] E4M3 bytes + xs [R, H/32] UE8M0 (act_quant of x), idx / rw [R, topk], weights in the mx tile layout,
 // add [R, H] FP32 or null; y [R, H] FP32.
@@ -1384,11 +1427,12 @@ int ds41_moe_mx_ex(const void* xq, const void* xs, int R, const int64_t* idx, co
   const ScaleV S1 = scale_v(s1, g_s2, (long long)E * I / 8, H / 128), S3 = scale_v(s3, g_s2, (long long)E * I / 8, H / 128);
   const ScaleV S2 = scale_v(s2, g_s2, (long long)E * H / 8, I / 128);
   const int lrc = (g_s2 ? moe_launch<true> : moe_launch<false>)(X, XS, R, rw, (const uint8_t*)w1, S1, (const uint8_t*)w3, S3, (const uint8_t*)w2, S2, I,
-                                                             add, y, topk, GR, Gm, np, hn, G, items, pairmap, prow, hq, hs, out, st);
+                                                             add, y, topk, GR, Gm, np, hn, G, items, pairmap, prow, hq, hs, out, pair_b16(R, topk, E), st);
   if (lrc) return lrc;
   if (skip_combine || np > 1) return (int)cudaGetLastError();
   const long long n4 = (long long)R * (H / 4);
-  pdl_launch(combine_kernel, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, out, pairmap, add, y, R, topk, 0, H);
+  if (pair_b16(R, topk, E)) pdl_launch(combine_kernel<__nv_bfloat16>, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, (const __nv_bfloat16*)(const void*)out, (const int*)pairmap, add, y, R, topk, 0, H);
+  else pdl_launch(combine_kernel<float>, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, (const float*)out, (const int*)pairmap, add, y, R, topk, 0, H);
   return (int)cudaGetLastError();
 }
 int ds41_moe_mx(const void* xq, const void* xs, int R, const int64_t* idx, const float* rw, const void* w1, const void* s1, const void* w3,
@@ -1410,11 +1454,16 @@ int ds41_moe_mx_combine_rows(void* ws, int R, int I, int topk, int E, const floa
   p += al((size_t)P * I / 32);
   float* out = (float*)p;
   const long long n4 = (long long)nr * (H / 4);
-  pdl_launch(combine_kernel, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, (const float*)out, (const int*)pairmap + (long long)r0 * topk,
+  if (pair_b16(R, topk, E)) pdl_launch(combine_kernel<__nv_bfloat16>, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, (const __nv_bfloat16*)(const void*)out, (const int*)pairmap + (long long)r0 * topk,
+             add ? add + (long long)r0 * H : nullptr, y + (long long)r0 * H, nr, topk, 0, H);
+  else pdl_launch(combine_kernel<float>, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, (const float*)out, (const int*)pairmap + (long long)r0 * topk,
              add ? add + (long long)r0 * H : nullptr, y + (long long)r0 * H, nr, topk, 0, H);
   return (int)cudaGetLastError();
 }
-// the down outputs out [P, H] FP32 and pairmap [P] in a call's workspace (a combine done elsewhere: the reduce-scatter)
+// whether a call's down outputs are BF16 (DS41_MOE_PAIR_BF16), else FP32
+int ds41_moe_mx_pair_b16(int R, int topk, int E) { return pair_b16(R, topk, E) ? 1 : 0; }
+// the down outputs out [P, H] FP32 (ds41_moe_mx_pair_b16: BF16) and pairmap [P] in a call's workspace (a combine done
+// elsewhere: the reduce-scatter)
 int ds41_moe_mx_ws_ptrs(void* ws, int R, int I, int topk, int E, float** out, int** pairmap) {
   const int P = R * topk, Gm = gmax_of(R, topk, E);
   char* p = (char*)ws;
@@ -1440,7 +1489,8 @@ int ds41_moe_mx_combine(void* ws, int R, int I, int topk, int E, const float* ad
   p += al((size_t)P * I / 32);
   float* out = (float*)p;
   const long long n4 = (long long)R * (H / 4);
-  pdl_launch(combine_kernel, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, (const float*)out, (const int*)pairmap, add, y, R, topk, 0, H);
+  if (pair_b16(R, topk, E)) pdl_launch(combine_kernel<__nv_bfloat16>, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, (const __nv_bfloat16*)(const void*)out, (const int*)pairmap, add, y, R, topk, 0, H);
+  else pdl_launch(combine_kernel<float>, dim3((unsigned)((n4 + 255) / 256)), dim3(256), 0, st, (const float*)out, (const int*)pairmap, add, y, R, topk, 0, H);
   return (int)cudaGetLastError();
 }
 }

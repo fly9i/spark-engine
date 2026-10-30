@@ -156,7 +156,7 @@ pub fn rows_q(ck: &Checkpoint, layer: usize, rows: &[i64], head_dim: i64) -> (Te
 /// The gathered bytes uploaded and requantized on the device (kern::requant_fp8): the bytes act_quant gives `upload`'s
 /// BF16 rows, with no FP32 / BF16 copy of them; the buffers go back to the pool.
 pub fn upload_q(wbuf: Vec<u8>, sbuf: Vec<u8>, dev: tch::Device) -> (Tensor, Tensor) {
-    let dev_bytes = |b: &Vec<u8>| unsafe { Tensor::from_blob(b.as_ptr(), &[b.len() as i64], &[], Kind::Uint8, tch::Device::Cpu) }.to_device(dev);
+    let dev_bytes = |b: &Vec<u8>| super::kern::staged_upload_big(b, dev);
     let (wd, sd) = (dev_bytes(&wbuf), dev_bytes(&sbuf));
     give(wbuf);
     give(sbuf);

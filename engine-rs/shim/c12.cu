@@ -239,9 +239,16 @@ __global__ void __launch_bounds__(256) c12_gemv_f32(const __nv_bfloat16* __restr
 }
 extern "C" int glm53_c12_gemv_f32_cuda(const void* x,const void* m8,const void* e4,const void* eb,const int* ptr,const int* col,const void* val,
                                        float* y,int m,int n,int k,int pdl,cudaStream_t st){
-  if(m<1||m>8||k%256!=0||n%16!=0)return int(cudaErrorInvalidValue);
+  if(m<1||m>16||k%256!=0||n%16!=0)return int(cudaErrorInvalidValue);
   const C12View w{(const uint8_t*)m8,(const uint8_t*)e4,(const uint8_t*)eb,ptr,col,(const uint16_t*)val,n,k};
   const __nv_bfloat16* xx=(const __nv_bfloat16*)x;const dim3 g((n+7)/8),b(256);const bool p=pdl!=0;
+  // 9..16 rows (multi-sequence verify): one read of the weight for all of them; each row's FMA sequence and reduction
+  // are M's and m's own (bitwise the 8-row calls)
+  if(m>8){
+    if(n<=(std::getenv("DS41_C12_DEEP_ROWS")?std::atoi(std::getenv("DS41_C12_DEEP_ROWS")):4096)&&k==5120)pdl_launch_if(p,c12_gemv_f32<16,10>,g,b,0,st,xx,w,y,m);
+    else pdl_launch_if(p,c12_gemv_f32<16,4>,g,b,0,st,xx,w,y,m);
+    return int(cudaGetLastError());
+  }
   // few rows (routers [384 or 128, 5120]): one warp per row leaves too few loads in flight (3.9 MB in 33 us), so
   // every lane loads all 20 of its steps up front (U = 20; the FMA sequence is the same)
   static const int deep_rows=std::getenv("DS41_C12_DEEP_ROWS")?std::atoi(std::getenv("DS41_C12_DEEP_ROWS")):4096;

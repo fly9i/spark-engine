@@ -57,14 +57,14 @@ speed depend on the text, so other prompts give other numbers.
 
 ### DeepSeek-V4.1-Flash, 3× DGX Spark (TP3)
 
-Decode (aggregate tok/s; per request in parentheses). The service decodes 4 requests at once (`DS41_SERVE_STORES=4`). More numbers (code prompt, prefill): [ds41.md](ds41.md#7-performance).
+Decode (aggregate tok/s; per request in parentheses; 2026-10-30, v0.3.9). The service decodes 4 requests at once (`DS41_SERVE_STORES=4`). More numbers (code prompt, prefill): [ds41.md](ds41.md#7-performance).
 
 | Streams | Prose, greedy, thinking off | Structured, greedy, thinking off | Prose, T 1, thinking on | Structured, T 1, thinking on |
 | --- | --- | --- | --- | --- |
-| 1 | 67.3 tok/s (TTFT 172 ms) | 126.0 tok/s (TTFT 162 ms) | 58.0 tok/s (TTFT 236 ms) | 100.4 tok/s (TTFT 229 ms) |
-| 2 | 91.7 (47.9 each, TTFT 292 ms) | 177.2 (91.0 each, TTFT 280 ms) | 80.8 (42.5 each, TTFT 355 ms) | 157.5 (81.1 each, TTFT 360 ms) |
-| 3 | 108.4 (37.0 each, TTFT 389 ms) | 190.5 (66.2 each, TTFT 384 ms) | 94.2 (33.0 each, TTFT 486 ms) | 157.8 (59.6 each, TTFT 482 ms) |
-| 4 | 122.7 (32.4 each, TTFT 498 ms) | 222.3 (58.8 each, TTFT 491 ms) | 103.6 (27.0 each, TTFT 620 ms) | 165.2 (48.8 each, TTFT 615 ms) |
+| 1 | 67.4 tok/s (TTFT 171 ms) | 126.6 tok/s (TTFT 162 ms) | 57.2 tok/s (TTFT 245 ms) | 109.2 tok/s (TTFT 218 ms) |
+| 2 | 92.8 (49.2 each, TTFT 287 ms) | 181.9 (93.5 each, TTFT 281 ms) | 82.2 (41.8 each, TTFT 370 ms) | 153.3 (81.6 each, TTFT 356 ms) |
+| 3 | 109.3 (37.4 each, TTFT 395 ms) | 194.8 (67.7 each, TTFT 381 ms) | 95.0 (33.5 each, TTFT 504 ms) | 153.5 (59.7 each, TTFT 485 ms) |
+| 4 | 124.7 (32.4 each, TTFT 495 ms) | 226.0 (59.9 each, TTFT 493 ms) | 105.5 (27.8 each, TTFT 636 ms) | 180.9 (51.5 each, TTFT 610 ms) |
 
 ### Qwen3.8-Flash-Next, 1× DGX Spark
 
