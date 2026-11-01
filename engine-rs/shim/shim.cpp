@@ -441,6 +441,13 @@ extern "C" int rs_kda_correction_commit(const void* entries,int layers,int steps
 
 static c10::intrusive_ptr<c10d::ProcessGroupNCCL> g_pg;
 static c10::intrusive_ptr<c10d::ProcessGroupNCCL> g_pg_small;
+// GLM53_TP_NCCL=0 (TP3: profiles/tp3-rdma.env, serve/ds41-rank.sh): no NCCL group at all; every collective must take the
+// N-way RDMA (rdma_arn) path. Three Sparks are a mesh of point-to-point links, so NCCL's socket bootstrap (one address
+// that every peer reaches) could only run over a shared LAN; a collective that would fall back to NCCL is an error here.
+static c10d::ProcessGroupNCCL& nccl_pg(const char* what, int64_t numel, int dtype) {
+    TORCH_CHECK(g_pg, what, " (numel ", numel, ", dtype ", dtype, ") has no RDMA path and needs NCCL, which is off (GLM53_TP_NCCL=0)");
+    return *g_pg;
+}
 
 extern "C" {
 
@@ -737,16 +744,27 @@ extern "C" int rs_pg_init(int rank, int world, const char* master_addr, int port
         auto store = c10::make_intrusive<c10d::TCPStore>(std::string(master_addr), so);
         g_store = store;
         g_world = world;
+        const char* nccl_env = std::getenv("GLM53_TP_NCCL");
+        const bool use_nccl = !(nccl_env && std::strcmp(nccl_env, "0") == 0);
+        if (!use_nccl) {
+            const char* arn = std::getenv("GLM53_RDMA_ARN_INIT"); const char* ar = std::getenv("GLM53_RDMA_AR");
+            TORCH_CHECK(arn && std::strcmp(arn, "1") == 0 && ar && std::strcmp(ar, "1") == 0,
+                        "GLM53_TP_NCCL=0 needs GLM53_RDMA_ARN_INIT=1 and GLM53_RDMA_AR=1 (rdma_arn carries every collective)");
+            fprintf(stderr, "[shim] rank%d: no NCCL group (GLM53_TP_NCCL=0); collectives over rdma_arn only\n", rank);
+        }
         auto opts = c10d::ProcessGroupNCCL::Options::create();
         opts->timeout = std::chrono::seconds(std::getenv("GLM53_NCCL_TIMEOUT_S")?std::atoi(std::getenv("GLM53_NCCL_TIMEOUT_S")):180);
-        g_pg = c10::make_intrusive<c10d::ProcessGroupNCCL>(store, rank, world, opts);
-        // 暖场:一次小张量 allreduce 触发 NCCL 建连
         auto t = at::zeros({8}, at::TensorOptions().device(at::kCUDA).dtype(at::kFloat));
         std::vector<at::Tensor> v = {t};
-        g_pg->allreduce(v)->wait();
-        cudaDeviceSynchronize();
+        if (use_nccl) {
+            g_pg = c10::make_intrusive<c10d::ProcessGroupNCCL>(store, rank, world, opts);
+            // 暖场:一次小张量 allreduce 触发 NCCL 建连
+            g_pg->allreduce(v)->wait();
+            cudaDeviceSynchronize();
+        }
         const char* small = std::getenv("GLM53_TP_SMALL_COMM");
         if (small && std::strcmp(small, "1") == 0) {
+            TORCH_CHECK(use_nccl, "GLM53_TP_SMALL_COMM needs NCCL (GLM53_TP_NCCL=0)");
             TORCH_CHECK(world == 2, "small-message communicator is qualified for TP2 only");
             for (const char* key : {"NCCL_MIN_CTAS", "NCCL_MAX_CTAS", "NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS"})
                 TORCH_CHECK(!std::getenv(key), "unset ", key, " when using the mixed-size communicator policy");
@@ -937,7 +955,7 @@ extern "C" int rs_allreduce(void* p, int64_t numel, int dtype) {
         const char* active = std::getenv("GLM53_TP_SMALL_COMM_ACTIVE");
         const bool use_small = g_pg_small && (!active || std::strcmp(active, "1") == 0)
             && t.numel() * t.element_size() <= 262144;
-        (use_small ? g_pg_small : g_pg)->allreduce(v)->wait();
+        (use_small ? *g_pg_small : nccl_pg("allreduce", numel, dtype)).allreduce(v)->wait();
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[shim] allreduce 异常: %s\n", e.what());
@@ -978,7 +996,7 @@ extern "C" int rs_reduce_scatter(void* in, void* out, int64_t numel_out, int dty
         }
         auto i = blob(in, {numel_out * g_world}, dtype);auto o = blob(out, {numel_out}, dtype);
         c10d::ReduceScatterOptions opts;opts.reduceOp=c10d::ReduceOp::SUM;
-        g_pg->_reduce_scatter_base(o, i, opts)->wait();return 0;
+        nccl_pg("reduce_scatter", numel_out, dtype)._reduce_scatter_base(o, i, opts)->wait();return 0;
     } catch (const std::exception& e) {fprintf(stderr, "[shim] reduce_scatter: %s\n", e.what());return 1;}
 }
 // GLM53_PREFILL_SP_RS_SPLIT: reduce-scatter issued on NCCL's stream without making the current stream wait yet, so
@@ -989,7 +1007,7 @@ extern "C" int rs_reduce_scatter_async(void* in, void* out, int64_t numel_out, i
     try {
         auto i = blob(in, {numel_out * g_world}, dtype);auto o = blob(out, {numel_out}, dtype);
         c10d::ReduceScatterOptions opts;opts.reduceOp=c10d::ReduceOp::SUM;
-        g_works.push_back(g_pg->_reduce_scatter_base(o, i, opts));g_works_open++;return (int)g_works.size()-1;
+        g_works.push_back(nccl_pg("reduce_scatter_async", numel_out, dtype)._reduce_scatter_base(o, i, opts));g_works_open++;return (int)g_works.size()-1;
     } catch (const std::exception& e) {fprintf(stderr, "[shim] reduce_scatter_async: %s\n", e.what());return -1;}
 }
 extern "C" int rs_work_wait(int h) {
@@ -1003,7 +1021,7 @@ extern "C" int rs_work_wait(int h) {
 extern "C" int rs_all_gather_async(void* in, void* out, int64_t numel_in, int dtype) {
     try {
         auto i = blob(in, {numel_in}, dtype);auto o = blob(out, {numel_in * g_world}, dtype);
-        g_works.push_back(g_pg->_allgather_base(o, i));g_works_open++;return (int)g_works.size()-1;
+        g_works.push_back(nccl_pg("all_gather_async", numel_in, dtype)._allgather_base(o, i));g_works_open++;return (int)g_works.size()-1;
     } catch (const std::exception& e) {fprintf(stderr, "[shim] all_gather_async: %s\n", e.what());return -1;}
 }
 extern "C" int rs_all_gather(void* in, void* out, int64_t numel_in, int dtype) {
@@ -1016,7 +1034,7 @@ extern "C" int rs_all_gather(void* in, void* out, int64_t numel_in, int dtype) {
             return glm53_rdma_arn_rows_cuda(in, out, numel_in * esize, 1, at::cuda::getCurrentCUDAStream());
         }
         auto i = blob(in, {numel_in}, dtype);auto o = blob(out, {numel_in * g_world}, dtype);
-        g_pg->_allgather_base(o, i)->wait();return 0;
+        nccl_pg("all_gather", numel_in, dtype)._allgather_base(o, i)->wait();return 0;
     } catch (const std::exception& e) {fprintf(stderr, "[shim] all_gather: %s\n", e.what());return 1;}
 }
 

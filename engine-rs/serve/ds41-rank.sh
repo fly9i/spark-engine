@@ -8,8 +8,10 @@ rank=${1:?rank 0, 1 or 2}; socket=${2:?socket path}; master=${3:?address of rank
 export SPARK_PYTHON=$py
 source "$SPARK_HOME/scripts/env.sh"
 export GLM53_TP_RANK=$rank GLM53_TP_WORLD=3 GLM53_MASTER_ADDR=$master GLM53_MASTER_PORT=${DS41_MASTER_PORT:-29961}
-# transport: NCCL only bootstraps over sockets; every collective goes over the engine's N-way RDMA (subnet-paired links)
-export NCCL_SOCKET_IFNAME=${SPARK_TP3_IFNAME:?set SPARK_TP3_IFNAME in spark.env} NCCL_IB_DISABLE=1 GLM53_RDMA_ARN_INIT=1 GLM53_RDMA_AR=1
+# transport: every collective goes over the engine's N-way RDMA (subnet-paired links); no NCCL group (GLM53_TP_NCCL=0:
+# the ranks meet at rank 0's TCP store over the direct links). GLM53_TP_NCCL=1 (debugging) needs SPARK_TP3_IFNAME.
+export GLM53_TP_NCCL=${GLM53_TP_NCCL:-0} NCCL_IB_DISABLE=1 GLM53_RDMA_ARN_INIT=1 GLM53_RDMA_AR=1
+if [[ -n ${SPARK_TP3_IFNAME:-} ]]; then export NCCL_SOCKET_IFNAME=$SPARK_TP3_IFNAME; fi
 # prefill: RDMA row reduce-scatter / all-gather depth 12 in flight, the communication stream at the highest priority,
 # MoE down-projection output buffer up to 1024 MiB (8192-row chunks in one pass, the combine fused into the scatter)
 export GLM53_RDMA_ARN_ROWS_PIPE=${GLM53_RDMA_ARN_ROWS_PIPE:-12} GLM53_COMM_STREAM_PRIO=${GLM53_COMM_STREAM_PRIO:-1} DS41_MOE_OUT_MB=${DS41_MOE_OUT_MB:-1024}

@@ -1571,13 +1571,16 @@ impl Model {
         let sub = ced_sub();
         if sub == 0 || ids.len() <= sub { return self.prefill_ced_one(seq, ids, last, false); }
         let vis = seq.vis.take();
+        // image rows anywhere in the chunk: from the salted placeholders, which every rank holds (the rows themselves, `vis`,
+        // exist on rank 0 only; a branch on them would let the ranks issue different collectives and hang)
+        let has_img = ids.iter().any(|&x| crate::mm_canvas::is_salted(x));
         let pieces: Vec<&[i64]> = ids.chunks(sub).collect();
         let enc = self.c.n_layers / 2;
         let pairable = |p: &[i64]| { let t = p.len() as i64; self.sp_eligible(t, enc) && overlap_rows() > 0 && t >= 2 * overlap_rows() && !p.iter().any(|&x| crate::mm_canvas::is_salted(x)) };
         let (mut out, mut i, mut off) = (None, 0, 0i64);
         while i < pieces.len() {
             let a = pieces[i];
-            if vis.is_none() && pair_on() && i + 1 < pieces.len() && pairable(a) && pairable(pieces[i + 1]) {
+            if !has_img && pair_on() && i + 1 < pieces.len() && pairable(a) && pairable(pieces[i + 1]) {
                 let b = pieces[i + 1];
                 out = self.prefill_ced_pair(seq, a, b, last && i + 2 == pieces.len(), i + 2 < pieces.len());
                 off += (a.len() + b.len()) as i64;
@@ -1625,8 +1628,11 @@ impl Model {
         }
         let ids_t = Tensor::from_slice(ids).to_device(dev);
         let two = overlap_rows() > 0 && t >= 2 * overlap_rows();
-        // the two-micro-batch sequence-parallel encoder without image rows embeds this rank's rows only (sp_embed_parts)
-        let sp_ids = (self.sp_eligible(t, enc) && two && seq.vis.is_none()).then_some(&ids_t);
+        // the two-micro-batch sequence-parallel encoder without image rows embeds this rank's rows only (sp_embed_parts);
+        // with image rows every rank takes embed_vis's all-reduce (rank 0 adds the rows). Decided from the salted
+        // placeholders, not seq.vis (rank 0 only): the ranks must issue the same collectives
+        let has_img = ids.iter().any(|&x| crate::mm_canvas::is_salted(x));
+        let sp_ids = (self.sp_eligible(t, enc) && two && !has_img).then_some(&ids_t);
         let mut h = if sp_ids.is_some() { Tensor::new() } else { self.embed_vis(&ids_t, seq.vis.take()).unsqueeze(1).repeat([1, c.hc, 1]) };
         let vl = vl_set(self.image_rows(seq, start, start + t));
         let mut pre_mix = Tensor::zeros([t, c.hc], (Kind::Float, dev));

@@ -309,4 +309,4 @@ checkpoint 验证过）、`GLM53_DEPTH_TABLE`（重新标定的投机深度表�
 | `GLM53_PREFILL_SP_PAIR`、`GLM53_SERVE_CHUNK_SOLO` | `1`、`8192` | 单独一个请求时 prefill 按 8192 行一个单元下发；每个单元拆成两个 4096 行的块逐层交替执行（第一块的第 i 层、再第二块的第 i 层），所有集合通信都走通信流、只在用到结果处等待，一块的 gather / reduce-scatter 与另一块的注意力、MoE 重叠。计算与连续两个 4096 行块相同；无法配对的单元（第二块不足 128 行）按两块依次执行。8K / 32K prefill +3.5% / +3.3%。 | L0 |
 | `GLM53_RDMA_ARN_WAIT_SPLIT` | `1` | 按行 reduce-scatter / all-gather 的 finish 内核等待对端改由单独的 1 CTA 内核完成，不再由各自（最多 96 个）CTA 原地自旋；否则成对调度下提前发出的 finish 内核长时间占着 SM，拖慢计算。结果不变。 | L0 |
 | `GLM53_COMM_STREAM_PRIO` | `1` | 通信流设为最高优先级。 | L0 |
-| `NCCL_SOCKET_IFNAME`、`NCCL_IB_DISABLE=1` | 取自 `SPARK_TP3_IFNAME` | NCCL 只通过 socket 引导进程组。 | — |
+| `GLM53_TP_NCCL` | `0` | 不建 NCCL 组：各 rank 经直连链路在 rank 0 的 TCP store 会合，所有集合通信走 N 路 RDMA；没有 RDMA 路径的集合通信直接报错。`1`（排查用）重新建 NCCL 组，经 `SPARK_TP3_IFNAME`（`NCCL_SOCKET_IFNAME`）引导。 | — |

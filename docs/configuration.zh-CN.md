@@ -20,7 +20,7 @@
 | `GLM_DRAFTER` | `/models/GLM-5.3-Flash-DFlash2` | DFlash2 草稿模型目录（两个节点）。 |
 | `SPARK_WORKERS` | `"root@10.0.1.1 root@10.0.3.2"` | rank 1 和 rank 2 的 ssh 目标（需从 rank 0 所在节点以密钥登录）；两节点运行时用第一个。取代 `GLM_WORKER`（仍然可用）。 |
 | `SPARK_MASTER_ADDRS` | `"10.0.1.2 10.0.1.2 10.0.3.1"` | 从 rank 0、1、2 看到的 rank 0 地址（每个工作节点经各自的 RoCE 链路）。取代 `GLM_MASTER_ADDR`（所有 rank 用同一地址，仍然可用）。 |
-| `SPARK_TP3_IFNAME` | — | 三节点：三台互相可达的接口（仅用于 NCCL 引导；数据走 RDMA）。 |
+| `SPARK_TP3_IFNAME` | — | 可选（三节点）。v0.3.11 起 TP3 不建 NCCL 组（`GLM53_TP_NCCL=0`），不需要三台共享的网络；只有 `GLM53_TP_NCCL=1` 排查时用这个接口引导 NCCL。 |
 | `GLM_WORLD` | `2` | GLM 的节点数：2 或 3（`start.sh glm3` 总是用 3）。 |
 | `GLM_MASTER_PORT` | `29931` | 汇合存储（rendezvous store）的 TCP 端口。 |
 | `GLM_PROFILE` | `$SPARK_HOME/engine-rs/profiles/glm.env` | GLM 的引擎开关 profile（TP2 与 TP3 通用；各 world size 的传输设置在 `profiles/tp<world>-rdma.env`）。 |

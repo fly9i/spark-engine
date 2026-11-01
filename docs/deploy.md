@@ -52,9 +52,9 @@ nodes**; the launcher refuses to start if the two engine binaries differ.
 GLM-5.3-Flash also runs over three Sparks with the same binary, checkpoint and profile (`GLM_WORLD=3` or
 `start.sh glm3`): KDA heads split 22/21/21, MLA heads 32/16/16, each routed expert 6/5/5 of its 16 Hadamard blocks, and
 prefill is sequence-parallel. The three nodes need a full mesh of the ConnectX-7 ports (one cable per pair, each
-function on its own /30) and a LAN on which all three reach each other; the layout and how the engine pairs links is
-in [ds41.md](ds41.md) §2, which uses the same cluster. Set `SPARK_WORKERS`, `SPARK_MASTER_ADDRS` and `SPARK_TP3_IFNAME`
-in `spark.env`.
+function on its own /30); the engine itself uses only those links (since v0.3.11 no NCCL group, so the LAN carries just
+ssh and the HTTP front end). The layout and how the engine pairs links is in [ds41.md](ds41.md) §2, which uses the same
+cluster. Set `SPARK_WORKERS` and `SPARK_MASTER_ADDRS` in `spark.env`.
 
 TP3 was developed and accepted with the project's own SPX1 checkpoint of GLM-5.3-Flash (revision V1.2, not published;
 V1.1 is [fly9i/GLM-5.3-Flash-SPX1-V1.1](https://huggingface.co/fly9i/GLM-5.3-Flash-SPX1-V1.1)): spec decode
@@ -134,7 +134,8 @@ Logs: `/tmp/spark-glm-rank0.log`, `/tmp/spark-glm-rank<r>.log` (on the worker no
 | --- | --- |
 | `engine binary differs on rank N` | Install the same release on every node (same `SPARK_BIN` path). |
 | `no address of rank 0 for rank N` / `no node for rank N` | `SPARK_MASTER_ADDRS` / `SPARK_WORKERS` in `spark.env` list fewer nodes than the world size. |
-| `SPARK_TP3_IFNAME` error, or rank 0 waits forever under TP3 | Set `SPARK_TP3_IFNAME` to an interface on which all three nodes reach each other. |
+| rank 0 waits forever under TP3 | Check `SPARK_MASTER_ADDRS` (rank 0's address as seen from each rank over its direct link) and that every node pair shares a RoCE subnet. |
+| `QP ... transition to RTR failed` | Older releases fixed the RDMA path MTU at 4096; since v0.3.11 it follows the ports' active MTU. Use MTU 9000 on the direct links for full speed (`ibv_devinfo` `active_mtu` 4096). |
 | `rank 0 exited` with NCCL errors | Check the fabric addresses, `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`, `ibv_devinfo` port state, and that rank 1 started (`/tmp/spark-glm-rank1.log` on node B). |
 | Out of memory at start | Another process holds GPU memory, or the other model is still releasing memory: `start.sh stop`, wait, start again. Lower `GLM_KV_TOKENS` (or `QWEN_KV_TOKENS`) to shrink the KV pool. |
 | `libexllamav3_ext.so` / `libtorch_cuda.so` not found | Source `scripts/env.sh` with `SPARK_PYTHON` pointing at the environment that has torch 2.13 cu130. |

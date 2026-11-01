@@ -45,9 +45,9 @@ NCCL 和引擎自带的 RDMA all-reduce 会同时使用两个 RDMA 设备。
 
 GLM-5.3-Flash 也可以用同一个二进制、同一个检查点和同一个 profile 在三台 Spark 上运行（`GLM_WORLD=3` 或
 `start.sh glm3`）：KDA 头按 22/21/21 切分，MLA 头按 32/16/16，每个路由专家的 16 个 Hadamard 块按 6/5/5 切分，prefill
-为序列并行。三个节点需要 ConnectX-7 端口全互连（每对节点一根线缆，每个 function 各用一个 /30），以及一个三台互相可达的
-局域网；布局以及引擎如何配对链路见 [ds41.zh-CN.md](ds41.zh-CN.md) §2，它使用同一个集群。在 `spark.env` 中设置
-`SPARK_WORKERS`、`SPARK_MASTER_ADDRS` 和 `SPARK_TP3_IFNAME`。
+为序列并行。三个节点需要 ConnectX-7 端口全互连（每对节点一根线缆，每个 function 各用一个 /30）；引擎只使用这些直连链路
+（v0.3.11 起不建 NCCL 组，局域网只承载 ssh 与 HTTP 前端）。布局以及引擎如何配对链路见 [ds41.zh-CN.md](ds41.zh-CN.md) §2，
+它使用同一个集群。在 `spark.env` 中设置 `SPARK_WORKERS` 和 `SPARK_MASTER_ADDRS`。
 
 TP3 是用本项目自己的 GLM-5.3-Flash SPX1 检查点开发和验收的（V1.2 版本，未公开；V1.1 见 [fly9i/GLM-5.3-Flash-SPX1-V1.1](https://huggingface.co/fly9i/GLM-5.3-Flash-SPX1-V1.1)）：投机解码比 TP2 快 21%（在本项目的混合基准上
 60.2 对 49.7 tok/s），prefill 快 4%（v0.3.10 的成对 prefill 调度再快 3.5% / 3.3%：8K 1,779 → 1,841、32K 1,694 → 1,754 tok/s，交替 A/B，输出逐位不变），对 FP8 参考的 KL 不变（0.01370 对 0.01364）。使用公开的 EXL3 检查点时，TP3 走相同的
@@ -120,7 +120,8 @@ Qwen 还接受 `"reasoning_effort": "none" | "low" | "medium" | "high"`。图像
 | --- | --- |
 | `engine binary differs on rank N` | 在每个节点上安装同一个发布版本（相同的 `SPARK_BIN` 路径）。 |
 | `no address of rank 0 for rank N` / `no node for rank N` | `spark.env` 中 `SPARK_MASTER_ADDRS` / `SPARK_WORKERS` 列出的节点少于 world size。 |
-| `SPARK_TP3_IFNAME` 报错，或 TP3 下 rank 0 一直等待 | 把 `SPARK_TP3_IFNAME` 设为三个节点互相可达的接口。 |
+| TP3 下 rank 0 一直等待 | 检查 `SPARK_MASTER_ADDRS`（各 rank 经自己直连链路看到的 rank 0 地址），以及每对节点是否共享一个 RoCE 子网。 |
+| `QP ... transition to RTR failed` | 旧版本把 RDMA path MTU 写死为 4096；v0.3.11 起按端口 active MTU 协商。直连口设 MTU 9000 可获得完整速度（`ibv_devinfo` 的 `active_mtu` 为 4096）。 |
 | `rank 0 exited` 并伴有 NCCL 错误 | 检查互连网络地址、`NCCL_SOCKET_IFNAME`、`NCCL_IB_HCA`、`ibv_devinfo` 端口状态，以及 rank 1 是否已启动（节点 B 上的 `/tmp/spark-glm-rank1.log`）。 |
 | 启动时内存不足 | 有其他进程占用 GPU 内存，或另一个模型仍在释放内存：执行 `start.sh stop`，等待后再启动。调低 `GLM_KV_TOKENS`（或 `QWEN_KV_TOKENS`）以缩小 KV 池。 |
 | 找不到 `libexllamav3_ext.so` / `libtorch_cuda.so` | 在 `SPARK_PYTHON` 指向装有 torch 2.13 cu130 的环境时 source `scripts/env.sh`。 |
