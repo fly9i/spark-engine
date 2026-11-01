@@ -149,15 +149,15 @@ void proxy_loop(){
 int g_gid[NLINK]={-1,-1};   // each link's GID index (rdma_ipv4_v2_gid; GLM53_RDMA_AR_GID overrides)
 bool qp_to_rts(int l){
   const int gid_index=g_gid[l];
-  ibv_qp* g_qp_l=g_qp[l];
+  ibv_qp* g_qp_l=g_qp[l];const ibv_mtu mtu=rdma_path_mtu(g_ctx[l],"rdma_ar");
   ibv_qp_attr a{};a.qp_state=IBV_QPS_INIT;a.pkey_index=0;a.port_num=1;a.qp_access_flags=IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_LOCAL_WRITE;
-  if(ibv_modify_qp(g_qp_l,&a,IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS))return false;
-  ibv_qp_attr r{};r.qp_state=IBV_QPS_RTR;r.path_mtu=IBV_MTU_4096;r.dest_qp_num=g_peer.qpn[l];r.rq_psn=g_peer.psn[l];
+  if(!rdma_modify_qp(g_qp_l,&a,IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS,"rdma_ar",l,"INIT",mtu))return false;
+  ibv_qp_attr r{};r.qp_state=IBV_QPS_RTR;r.path_mtu=mtu;r.dest_qp_num=g_peer.qpn[l];r.rq_psn=g_peer.psn[l];
   r.max_dest_rd_atomic=1;r.min_rnr_timer=12;r.ah_attr.is_global=1;r.ah_attr.port_num=1;
   memcpy(r.ah_attr.grh.dgid.raw,g_peer.gid[l],16);r.ah_attr.grh.sgid_index=gid_index;r.ah_attr.grh.hop_limit=1;
-  if(ibv_modify_qp(g_qp_l,&r,IBV_QP_STATE|IBV_QP_AV|IBV_QP_PATH_MTU|IBV_QP_DEST_QPN|IBV_QP_RQ_PSN|IBV_QP_MAX_DEST_RD_ATOMIC|IBV_QP_MIN_RNR_TIMER))return false;
+  if(!rdma_modify_qp(g_qp_l,&r,IBV_QP_STATE|IBV_QP_AV|IBV_QP_PATH_MTU|IBV_QP_DEST_QPN|IBV_QP_RQ_PSN|IBV_QP_MAX_DEST_RD_ATOMIC|IBV_QP_MIN_RNR_TIMER,"rdma_ar",l,"RTR",mtu))return false;
   ibv_qp_attr t{};t.qp_state=IBV_QPS_RTS;t.timeout=14;t.retry_cnt=7;t.rnr_retry=7;t.sq_psn=0;t.max_rd_atomic=1;
-  return ibv_modify_qp(g_qp_l,&t,IBV_QP_STATE|IBV_QP_TIMEOUT|IBV_QP_RETRY_CNT|IBV_QP_RNR_RETRY|IBV_QP_SQ_PSN|IBV_QP_MAX_QP_RD_ATOMIC)==0;
+  return rdma_modify_qp(g_qp_l,&t,IBV_QP_STATE|IBV_QP_TIMEOUT|IBV_QP_RETRY_CNT|IBV_QP_RNR_RETRY|IBV_QP_SQ_PSN|IBV_QP_MAX_QP_RD_ATOMIC,"rdma_ar",l,"RTS",mtu);
 }
 } // namespace
 
@@ -189,7 +189,7 @@ extern "C" int glm53_rdma_ar_init(int rank){
   ibv_free_device_list(list);
   if(!sock_exchange(mine,g_peer)){fprintf(stderr,"[rdma_ar] exchange failed\n");return 10;}
   if(g_peer.nlink!=mine.nlink){fprintf(stderr,"[rdma_ar] link count differs between ranks (%u vs %u): set GLM53_RDMA_AR_DUAL alike\n",mine.nlink,g_peer.nlink);return 12;}
-  for(int l=0;l<g_nlink;++l)if(!qp_to_rts(l)){fprintf(stderr,"[rdma_ar] QP %d transition failed\n",l);return 11;}
+  for(int l=0;l<g_nlink;++l)if(!qp_to_rts(l))return 11;
   g_proxy=std::thread(proxy_loop);
   {// Pin the spinning proxy to one big core (default cpu19); -1 leaves it unpinned.
    const char* c=std::getenv("GLM53_RDMA_AR_CPU");const int cpu=c?std::atoi(c):19;
@@ -207,8 +207,10 @@ extern "C" int glm53_rdma_ar_init(int rank){
       fprintf(stderr,"[rdma_ar] rank%d allreduce stamps -> %s\n",rank,path.c_str());
     }else{g_stats=nullptr;g_stats_dev=nullptr;}
   }
-  char gids[32];if(g_nlink==2)snprintf(gids,sizeof gids,"%d/%d",g_gid[0],g_gid[1]);else snprintf(gids,sizeof gids,"%d",g_gid[0]);
-  fprintf(stderr,"[rdma_ar] rank%d ready: dev=%s%s%s gid_index=%s slots=%d x %zu KiB split>=%llu B\n",rank,want,g_nlink==2?" + ":"",g_nlink==2?wants[1]:"",gids,NSLOT,SLOT_BYTES/1024,g_split);
+  char gids[32],mtus[32];
+  if(g_nlink==2){snprintf(gids,sizeof gids,"%d/%d",g_gid[0],g_gid[1]);snprintf(mtus,sizeof mtus,"%d/%d",rdma_mtu_bytes(rdma_path_mtu(g_ctx[0],"rdma_ar")),rdma_mtu_bytes(rdma_path_mtu(g_ctx[1],"rdma_ar")));}
+  else{snprintf(gids,sizeof gids,"%d",g_gid[0]);snprintf(mtus,sizeof mtus,"%d",rdma_mtu_bytes(rdma_path_mtu(g_ctx[0],"rdma_ar")));}
+  fprintf(stderr,"[rdma_ar] rank%d ready: dev=%s%s%s gid_index=%s mtu=%s slots=%d x %zu KiB split>=%llu B\n",rank,want,g_nlink==2?" + ":"",g_nlink==2?wants[1]:"",gids,mtus,NSLOT,SLOT_BYTES/1024,g_split);
   return 0;
 }
 extern "C" size_t glm53_rdma_ar_max_bytes(){return SLOT_BYTES;}

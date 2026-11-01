@@ -604,15 +604,16 @@ Dev* open_dev(const DevInfo& di){
   g_devs.push_back(d);return d;
 }
 
-bool qp_to_rts(Link& L){
+bool qp_to_rts(Link& L,int peer,int l){
+  const ibv_mtu mtu=rdma_path_mtu(L.dev->ctx,"rdma_arn");
   ibv_qp_attr a{};a.qp_state=IBV_QPS_INIT;a.pkey_index=0;a.port_num=1;a.qp_access_flags=IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_LOCAL_WRITE;
-  if(ibv_modify_qp(L.qp,&a,IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS))return false;
-  ibv_qp_attr r{};r.qp_state=IBV_QPS_RTR;r.path_mtu=IBV_MTU_4096;r.dest_qp_num=L.remote.qpn;r.rq_psn=L.remote.psn;
+  if(!rdma_modify_qp(L.qp,&a,IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS,"rdma_arn",l,"INIT",mtu,peer))return false;
+  ibv_qp_attr r{};r.qp_state=IBV_QPS_RTR;r.path_mtu=mtu;r.dest_qp_num=L.remote.qpn;r.rq_psn=L.remote.psn;
   r.max_dest_rd_atomic=1;r.min_rnr_timer=12;r.ah_attr.is_global=1;r.ah_attr.port_num=1;
   memcpy(r.ah_attr.grh.dgid.raw,L.remote.gid,16);r.ah_attr.grh.sgid_index=L.dev->gid_index;r.ah_attr.grh.hop_limit=1;
-  if(ibv_modify_qp(L.qp,&r,IBV_QP_STATE|IBV_QP_AV|IBV_QP_PATH_MTU|IBV_QP_DEST_QPN|IBV_QP_RQ_PSN|IBV_QP_MAX_DEST_RD_ATOMIC|IBV_QP_MIN_RNR_TIMER))return false;
+  if(!rdma_modify_qp(L.qp,&r,IBV_QP_STATE|IBV_QP_AV|IBV_QP_PATH_MTU|IBV_QP_DEST_QPN|IBV_QP_RQ_PSN|IBV_QP_MAX_DEST_RD_ATOMIC|IBV_QP_MIN_RNR_TIMER,"rdma_arn",l,"RTR",mtu,peer))return false;
   ibv_qp_attr t{};t.qp_state=IBV_QPS_RTS;t.timeout=14;t.retry_cnt=7;t.rnr_retry=7;t.sq_psn=0;t.max_rd_atomic=1;
-  return ibv_modify_qp(L.qp,&t,IBV_QP_STATE|IBV_QP_TIMEOUT|IBV_QP_RETRY_CNT|IBV_QP_RNR_RETRY|IBV_QP_SQ_PSN|IBV_QP_MAX_QP_RD_ATOMIC)==0;
+  return rdma_modify_qp(L.qp,&t,IBV_QP_STATE|IBV_QP_TIMEOUT|IBV_QP_RETRY_CNT|IBV_QP_RNR_RETRY|IBV_QP_SQ_PSN|IBV_QP_MAX_QP_RD_ATOMIC,"rdma_arn",l,"RTS",mtu,peer);
 }
 
 void post_write(Link& L,const void* local,size_t bytes,uint64_t remote,bool signaled){
@@ -732,7 +733,7 @@ extern "C" int glm53_rdma_arn_init(int rank,int world,KvSet kv_set,KvGet kv_get)
     if(!kv_take(kv_get,"arn/qp/"+std::to_string(j)+"/"+std::to_string(rank),&pi,sizeof pi))return 13;
     if((int)pi.nlink!=P.nlink){fprintf(stderr,"[rdma_arn] link count with rank%d differs (%d vs %u)\n",j,P.nlink,pi.nlink);return 14;}
     P.addr=pi.addr;
-    for(int l=0;l<P.nlink;++l){P.link[l].remote=pi.link[l];if(!qp_to_rts(P.link[l])){fprintf(stderr,"[rdma_arn] QP to rank%d link %d failed\n",j,l);return 15;}}
+    for(int l=0;l<P.nlink;++l){P.link[l].remote=pi.link[l];if(!qp_to_rts(P.link[l],j,l))return 15;}
   }
   // 4. barrier: every QP of every rank is RTS before anyone writes
   {const char ok='1';if(!kv_put(kv_set,"arn/ready/"+std::to_string(rank),&ok,1))return 16;
@@ -752,7 +753,7 @@ extern "C" int glm53_rdma_arn_init(int rank,int world,KvSet kv_set,KvGet kv_get)
   for(int j=0;j<world;++j){
     if(j==rank)continue;const Peer& P=g_peers[j];
     fprintf(stderr,"[rdma_arn] rank%d<->rank%d:",rank,j);
-    for(int l=0;l<P.nlink;++l)fprintf(stderr," %s(gid %d)",P.link[l].dev->name.c_str(),P.link[l].dev->gid_index);
+    for(int l=0;l<P.nlink;++l)fprintf(stderr," %s(gid %d, mtu %d)",P.link[l].dev->name.c_str(),P.link[l].dev->gid_index,rdma_mtu_bytes(rdma_path_mtu(P.link[l].dev->ctx,"rdma_arn")));
     fprintf(stderr,"\n");
   }
   fprintf(stderr,"[rdma_arn] rank%d/%d ready: slots=%d x %zu KiB split>=%llu B\n",rank,world,NSLOT,SLOT_BYTES/1024,g_split);
