@@ -66,11 +66,11 @@ __host__ __device__ inline long long part_lo(long long n,int k,int world){return
 struct DevState {unsigned long long seq;unsigned int arrive;unsigned int done;unsigned long long fseq;unsigned int fdone;};
 
 struct DevInfo {char name[32];uint32_t ip;uint32_t mask;};                   // ip/mask in network order
-struct LinkInfo {uint32_t qpn,psn,rkey;uint8_t gid[16];};
+struct LinkInfo {uint32_t qpn,psn,rkey,mtu;uint8_t gid[16];};   // mtu: rdma_port_mtu of the sender's device
 struct PeerInfo {uint64_t addr;uint32_t nlink;LinkInfo link[MAXL];};        // what rank r tells rank j about the j<->r QPs
 
 struct Dev {std::string name;ibv_context* ctx=nullptr;ibv_pd* pd=nullptr;ibv_mr* mr=nullptr;int gid_index=-1;uint32_t ip=0;};
-struct Link {Dev* dev=nullptr;ibv_cq* cq=nullptr;ibv_qp* qp=nullptr;LinkInfo remote{};};
+struct Link {Dev* dev=nullptr;ibv_cq* cq=nullptr;ibv_qp* qp=nullptr;LinkInfo remote{};uint32_t mtu_mine=0;int mtu=0;};   // mtu: programmed (both offers' smaller)
 struct Peer {int rank=-1;int nlink=0;Link link[MAXL];uint64_t addr=0;};
 
 Host* g_host=nullptr;Host* g_host_dev=nullptr;DevState* g_state=nullptr;
@@ -605,7 +605,7 @@ Dev* open_dev(const DevInfo& di){
 }
 
 bool qp_to_rts(Link& L,int peer,int l){
-  const ibv_mtu mtu=rdma_path_mtu(L.dev->ctx,"rdma_arn");
+  const ibv_mtu mtu=rdma_path_mtu(L.mtu_mine,L.remote.mtu);L.mtu=mtu;
   ibv_qp_attr a{};a.qp_state=IBV_QPS_INIT;a.pkey_index=0;a.port_num=1;a.qp_access_flags=IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_LOCAL_WRITE;
   if(!rdma_modify_qp(L.qp,&a,IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS,"rdma_arn",l,"INIT",mtu,peer))return false;
   ibv_qp_attr r{};r.qp_state=IBV_QPS_RTR;r.path_mtu=mtu;r.dest_qp_num=L.remote.qpn;r.rq_psn=L.remote.psn;
@@ -724,6 +724,7 @@ extern "C" int glm53_rdma_arn_init(int rank,int world,KvSet kv_set,KvGet kv_get)
     for(int l=0;l<P.nlink;++l){
       Link& L=P.link[l];ibv_gid gid;if(ibv_query_gid(L.dev->ctx,1,L.dev->gid_index,&gid))return 11;
       pi.link[l].qpn=L.qp->qp_num;pi.link[l].psn=0;pi.link[l].rkey=L.dev->mr->rkey;memcpy(pi.link[l].gid,gid.raw,16);
+      pi.link[l].mtu=L.mtu_mine=rdma_port_mtu(L.dev->ctx,"rdma_arn");
     }
     if(!kv_put(kv_set,"arn/qp/"+std::to_string(rank)+"/"+std::to_string(j),&pi,sizeof pi))return 12;
   }
@@ -753,7 +754,7 @@ extern "C" int glm53_rdma_arn_init(int rank,int world,KvSet kv_set,KvGet kv_get)
   for(int j=0;j<world;++j){
     if(j==rank)continue;const Peer& P=g_peers[j];
     fprintf(stderr,"[rdma_arn] rank%d<->rank%d:",rank,j);
-    for(int l=0;l<P.nlink;++l)fprintf(stderr," %s(gid %d, mtu %d)",P.link[l].dev->name.c_str(),P.link[l].dev->gid_index,rdma_mtu_bytes(rdma_path_mtu(P.link[l].dev->ctx,"rdma_arn")));
+    for(int l=0;l<P.nlink;++l)fprintf(stderr," %s(gid %d, mtu %d)",P.link[l].dev->name.c_str(),P.link[l].dev->gid_index,rdma_mtu_bytes(P.link[l].mtu));
     fprintf(stderr,"\n");
   }
   fprintf(stderr,"[rdma_arn] rank%d/%d ready: slots=%d x %zu KiB split>=%llu B\n",rank,world,NSLOT,SLOT_BYTES/1024,g_split);

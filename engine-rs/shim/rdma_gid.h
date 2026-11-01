@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Shared by the RDMA transports (rdma_ar, rdma_big, rdma_arn):
-//  - the GID index of a RoCE device's port 1 that holds its IPv4-mapped RoCE v2 address. The index is not the same
-//    on every node (one node 3, another 4 -- that node's index 3 is empty), so it is looked up instead of fixed.
-//  - the RC path MTU. RoCE reports the port active MTU from the netdev MTU (1500 -> IBV_MTU_1024, jumbo -> 4096);
-//    mlx5 rejects ibv_modify_qp(RTR) with EINVAL when path_mtu is larger, so it is queried and clamped to 4096.
+//  - the GID index of a RoCE device's port 1 that holds its IPv4-mapped RoCE v2 address. The index is not the same on
+//    every node (one node 3, another 4 -- that node's index 3 is empty), so it is looked up instead of fixed;
+//  - the RC path MTU: RoCE derives the port's active MTU from the netdev MTU (1500 -> IBV_MTU_1024, 9000 -> 4096) and
+//    with some driver / firmware versions mlx5 rejects the RTR transition (EINVAL) when path_mtu exceeds it (issue #2;
+//    others accept it). Each side sends its port's active MTU with its QP info and both program the smaller of the two,
+//    so ends with different netdev MTUs agree. A 1500-byte netdev MTU means 1024-byte RDMA packets: set the direct
+//    links to MTU 9000 for 4096 (640 KiB all-reduce over one 1024 link: ~80 us vs ~71 us).
 #pragma once
 #include <infiniband/verbs.h>
-#include <cstdint>
+#include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -30,65 +34,43 @@ inline int rdma_ipv4_v2_gid(ibv_context* ctx, const char* dev_name, uint32_t ip,
   return -1;
 }
 
-static_assert(IBV_MTU_256 < IBV_MTU_512 && IBV_MTU_512 < IBV_MTU_1024 && IBV_MTU_1024 < IBV_MTU_2048 &&
-              IBV_MTU_2048 < IBV_MTU_4096, "ibv_mtu enumerators increase with the payload size");
-
-// Payload bytes of an ibv_mtu enumerator. 0 when `m` is not one of them.
+// Payload bytes of an ibv_mtu enumerator (0 for anything else).
 inline int rdma_mtu_bytes(int m) {
   switch (m) {
-    case IBV_MTU_256: return 256;
-    case IBV_MTU_512: return 512;
-    case IBV_MTU_1024: return 1024;
-    case IBV_MTU_2048: return 2048;
-    case IBV_MTU_4096: return 4096;
-    default: return 0;
+    case IBV_MTU_256: return 256; case IBV_MTU_512: return 512; case IBV_MTU_1024: return 1024;
+    case IBV_MTU_2048: return 2048; case IBV_MTU_4096: return 4096; default: return 0;
   }
 }
-
-// `active` is a port's active_mtu enumerator. Outside 256..4096 it stays at 4096, which is what these QPs used
-// before the port was queried. A jumbo-frame link reports IBV_MTU_4096 and is unchanged.
-inline ibv_mtu rdma_clamp_mtu(int active) {
-  if (active < IBV_MTU_256 || active > IBV_MTU_4096) return IBV_MTU_4096;
-  return (ibv_mtu)active;
-}
-
-// Path MTU for an RC QP on `port` (the shims use port 1): that port's active MTU, never above 4096.
-// Both ends of a direct cable share the netdev MTU, so each side clamping locally picks the same value and the
-// peer exchange is left unchanged. `who` is the shim tag used if the query itself fails.
-inline ibv_mtu rdma_path_mtu(ibv_context* ctx, const char* who = "rdma", uint8_t port = 1) {
+// This side's offer: port 1's active MTU, at most IBV_MTU_4096 (what these QPs always used); 4096 when the query fails
+// or reports something outside 256..4096 (with a message naming `who`).
+inline uint32_t rdma_port_mtu(ibv_context* ctx, const char* who) {
   ibv_port_attr pa{};
-  if (!ctx) {
-    fprintf(stderr, "[%s] ibv_query_port(%u) failed: no device context; using path_mtu 4096\n", who, (unsigned)port);
-    return IBV_MTU_4096;
-  }
-  // Same return convention as ibv_modify_qp: 0, or a positive errno (older builds return -1 and set errno).
-  const int rc = ibv_query_port(ctx, port, &pa);
+  const int rc = ctx ? ibv_query_port(ctx, 1, &pa) : -1;
   if (rc) {
-    const int e = rc < 0 ? (errno > 0 ? errno : -rc) : rc;
-    fprintf(stderr, "[%s] ibv_query_port(%u) failed: errno %d (%s); using path_mtu 4096\n",
-            who, (unsigned)port, e, strerror(e));
+    const int e = rc < 0 ? (errno > 0 ? errno : EINVAL) : rc;
+    fprintf(stderr, "[%s] ibv_query_port(1) failed: errno %d (%s); offering path_mtu 4096\n", who, e, strerror(e));
     return IBV_MTU_4096;
   }
-  const ibv_mtu m = rdma_clamp_mtu((int)pa.active_mtu);
-  if (m == IBV_MTU_4096 && (int)pa.active_mtu != IBV_MTU_4096)
-    fprintf(stderr, "[%s] port %u active_mtu %d out of range; using path_mtu 4096\n",
-            who, (unsigned)port, (int)pa.active_mtu);
-  return m;
+  const int m = (int)pa.active_mtu;
+  if (m < IBV_MTU_256 || m > IBV_MTU_4096) {
+    fprintf(stderr, "[%s] port 1 active_mtu %d out of range; offering path_mtu 4096\n", who, m);
+    return IBV_MTU_4096;
+  }
+  return (uint32_t)m;
 }
-
-// ibv_modify_qp returns 0 or a positive errno (older builds return -1 and set errno). On failure, prints the
-// transition (`step` is INIT, RTR or RTS), the path MTU in bytes and as the enumerator, and errno.
-// `peer` < 0: "[who] QP <idx> ..."; `peer` >= 0: "[who] QP to rank<peer> link <idx> ...".
+// The path MTU both ends program: the smaller offer (an offer outside 256..4096, e.g. from a zeroed field, counts as 4096).
+inline ibv_mtu rdma_path_mtu(uint32_t mine, uint32_t peer) {
+  auto ok = [](uint32_t m) { return m >= IBV_MTU_256 && m <= IBV_MTU_4096 ? m : (uint32_t)IBV_MTU_4096; };
+  return (ibv_mtu)std::min(ok(mine), ok(peer));
+}
+// ibv_modify_qp with the failure named: the transition (`step` INIT / RTR / RTS), the path MTU and errno (ibv_modify_qp
+// returns 0 or a positive errno; older builds -1 with errno set). `peer` >= 0: "QP to rank<peer> link <idx>".
 inline bool rdma_modify_qp(ibv_qp* qp, ibv_qp_attr* attr, int mask, const char* who, int idx, const char* step,
-                          ibv_mtu mtu, int peer = -1) {
+                           ibv_mtu mtu, int peer = -1) {
   const int rc = ibv_modify_qp(qp, attr, mask);
   if (rc == 0) return true;
-  const int e = rc < 0 ? (errno > 0 ? errno : -rc) : rc;
-  if (peer < 0)
-    fprintf(stderr, "[%s] QP %d transition to %s failed: mtu %d (%d) errno %d (%s)\n",
-            who, idx, step, rdma_mtu_bytes(mtu), (int)mtu, e, strerror(e));
-  else
-    fprintf(stderr, "[%s] QP to rank%d link %d transition to %s failed: mtu %d (%d) errno %d (%s)\n",
-            who, peer, idx, step, rdma_mtu_bytes(mtu), (int)mtu, e, strerror(e));
+  const int e = rc < 0 ? (errno > 0 ? errno : EINVAL) : rc;
+  if (peer < 0) fprintf(stderr, "[%s] QP %d transition to %s failed: path_mtu %d errno %d (%s)\n", who, idx, step, rdma_mtu_bytes(mtu), e, strerror(e));
+  else fprintf(stderr, "[%s] QP to rank%d link %d transition to %s failed: path_mtu %d errno %d (%s)\n", who, peer, idx, step, rdma_mtu_bytes(mtu), e, strerror(e));
   return false;
 }

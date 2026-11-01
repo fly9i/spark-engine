@@ -55,7 +55,7 @@ struct DevState {unsigned long long seq;unsigned int arrive;unsigned int done;};
 constexpr int STAT_N=65536;
 struct Stamp {unsigned long long seq,t0,t1,t2,t3,n;};   // n: elements of the call
 constexpr int NLINK=2;
-struct Peer {uint32_t nlink,qpn[NLINK],psn[NLINK],rkey[NLINK];uint64_t addr;uint8_t gid[NLINK][16];};
+struct Peer {uint32_t nlink,qpn[NLINK],psn[NLINK],rkey[NLINK],mtu[NLINK];uint64_t addr;uint8_t gid[NLINK][16];};   // mtu: rdma_port_mtu
 
 Host* g_host=nullptr;Host* g_host_dev=nullptr;DevState* g_state=nullptr;int g_rank=-1;
 Stamp* g_stats=nullptr;Stamp* g_stats_dev=nullptr;
@@ -147,9 +147,11 @@ void proxy_loop(){
 }
 
 int g_gid[NLINK]={-1,-1};   // each link's GID index (rdma_ipv4_v2_gid; GLM53_RDMA_AR_GID overrides)
+uint32_t g_mtu_mine[NLINK]={};
+int g_mtu[NLINK]={};   // each link's programmed path MTU (rdma_path_mtu of both offers)
 bool qp_to_rts(int l){
   const int gid_index=g_gid[l];
-  ibv_qp* g_qp_l=g_qp[l];const ibv_mtu mtu=rdma_path_mtu(g_ctx[l],"rdma_ar");
+  ibv_qp* g_qp_l=g_qp[l];const ibv_mtu mtu=rdma_path_mtu(g_mtu_mine[l],g_peer.mtu[l]);g_mtu[l]=mtu;
   ibv_qp_attr a{};a.qp_state=IBV_QPS_INIT;a.pkey_index=0;a.port_num=1;a.qp_access_flags=IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_LOCAL_WRITE;
   if(!rdma_modify_qp(g_qp_l,&a,IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS,"rdma_ar",l,"INIT",mtu))return false;
   ibv_qp_attr r{};r.qp_state=IBV_QPS_RTR;r.path_mtu=mtu;r.dest_qp_num=g_peer.qpn[l];r.rq_psn=g_peer.psn[l];
@@ -185,6 +187,7 @@ extern "C" int glm53_rdma_ar_init(int rank){
     if(g_gid[l]<0){fprintf(stderr,"[rdma_ar] %s: no IPv4 RoCE v2 GID on port 1\n",wants[l]);return 9;}
     ibv_gid gid;if(ibv_query_gid(g_ctx[l],1,g_gid[l],&gid))return 9;
     mine.qpn[l]=g_qp[l]->qp_num;mine.psn[l]=0;mine.rkey[l]=g_mr[l]->rkey;memcpy(mine.gid[l],gid.raw,16);
+    mine.mtu[l]=g_mtu_mine[l]=rdma_port_mtu(g_ctx[l],"rdma_ar");
   }
   ibv_free_device_list(list);
   if(!sock_exchange(mine,g_peer)){fprintf(stderr,"[rdma_ar] exchange failed\n");return 10;}
@@ -208,8 +211,8 @@ extern "C" int glm53_rdma_ar_init(int rank){
     }else{g_stats=nullptr;g_stats_dev=nullptr;}
   }
   char gids[32],mtus[32];
-  if(g_nlink==2){snprintf(gids,sizeof gids,"%d/%d",g_gid[0],g_gid[1]);snprintf(mtus,sizeof mtus,"%d/%d",rdma_mtu_bytes(rdma_path_mtu(g_ctx[0],"rdma_ar")),rdma_mtu_bytes(rdma_path_mtu(g_ctx[1],"rdma_ar")));}
-  else{snprintf(gids,sizeof gids,"%d",g_gid[0]);snprintf(mtus,sizeof mtus,"%d",rdma_mtu_bytes(rdma_path_mtu(g_ctx[0],"rdma_ar")));}
+  if(g_nlink==2){snprintf(gids,sizeof gids,"%d/%d",g_gid[0],g_gid[1]);snprintf(mtus,sizeof mtus,"%d/%d",rdma_mtu_bytes(g_mtu[0]),rdma_mtu_bytes(g_mtu[1]));}
+  else{snprintf(gids,sizeof gids,"%d",g_gid[0]);snprintf(mtus,sizeof mtus,"%d",rdma_mtu_bytes(g_mtu[0]));}
   fprintf(stderr,"[rdma_ar] rank%d ready: dev=%s%s%s gid_index=%s mtu=%s slots=%d x %zu KiB split>=%llu B\n",rank,want,g_nlink==2?" + ":"",g_nlink==2?wants[1]:"",gids,mtus,NSLOT,SLOT_BYTES/1024,g_split);
   return 0;
 }
