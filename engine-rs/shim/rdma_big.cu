@@ -45,7 +45,7 @@ struct Ctl {                                   // pinned, host-mapped, registere
 struct Bufs {unsigned char send[2][AREA];unsigned char recv[2][AREA];};
 constexpr int PARTS=8;                          // blocks per 1 MiB chunk (one block alone copies only ~4 GB/s)
 struct DevState {unsigned long long seq;unsigned int arrive;unsigned int done;unsigned int parts[2][MAX_CHUNKS];};
-struct Peer {uint32_t qpn[NPORT],psn[NPORT],rkey_ctl[NPORT],rkey_buf[NPORT];uint64_t ctl,buf;uint8_t gid[NPORT][16];};
+struct Peer {uint32_t qpn[NPORT],psn[NPORT],rkey_ctl[NPORT],rkey_buf[NPORT],mtu[NPORT];uint64_t ctl,buf;uint8_t gid[NPORT][16];};   // mtu: rdma_port_mtu
 
 Ctl* g_ctl=nullptr;Ctl* g_ctl_dev=nullptr;Bufs* g_buf=nullptr;Bufs* g_buf_dev=nullptr;DevState* g_state=nullptr;int g_rank=-1;
 ibv_context* g_ctx[NPORT]{};ibv_pd* g_pd[NPORT]{};ibv_cq* g_cq[NPORT]{};ibv_qp* g_qp[NPORT]{};ibv_mr* g_mr_ctl[NPORT]{};ibv_mr* g_mr_buf[NPORT]{};
@@ -146,15 +146,18 @@ void proxy_loop(){
   }
 }
 
+uint32_t g_mtu_mine[NPORT]={};
+int g_mtu[NPORT]={};   // each port's programmed path MTU (rdma_path_mtu of both offers)
 bool qp_rts(int p,int gid_index){
+  const ibv_mtu mtu=rdma_path_mtu(g_mtu_mine[p],g_peer.mtu[p]);g_mtu[p]=mtu;
   ibv_qp_attr a{};a.qp_state=IBV_QPS_INIT;a.pkey_index=0;a.port_num=1;a.qp_access_flags=IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_LOCAL_WRITE;
-  if(ibv_modify_qp(g_qp[p],&a,IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS))return false;
-  ibv_qp_attr r{};r.qp_state=IBV_QPS_RTR;r.path_mtu=IBV_MTU_4096;r.dest_qp_num=g_peer.qpn[p];r.rq_psn=g_peer.psn[p];
+  if(!rdma_modify_qp(g_qp[p],&a,IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS,"rdma_big",p,"INIT",mtu))return false;
+  ibv_qp_attr r{};r.qp_state=IBV_QPS_RTR;r.path_mtu=mtu;r.dest_qp_num=g_peer.qpn[p];r.rq_psn=g_peer.psn[p];
   r.max_dest_rd_atomic=1;r.min_rnr_timer=12;r.ah_attr.is_global=1;r.ah_attr.port_num=1;
   memcpy(r.ah_attr.grh.dgid.raw,g_peer.gid[p],16);r.ah_attr.grh.sgid_index=gid_index;r.ah_attr.grh.hop_limit=1;
-  if(ibv_modify_qp(g_qp[p],&r,IBV_QP_STATE|IBV_QP_AV|IBV_QP_PATH_MTU|IBV_QP_DEST_QPN|IBV_QP_RQ_PSN|IBV_QP_MAX_DEST_RD_ATOMIC|IBV_QP_MIN_RNR_TIMER))return false;
+  if(!rdma_modify_qp(g_qp[p],&r,IBV_QP_STATE|IBV_QP_AV|IBV_QP_PATH_MTU|IBV_QP_DEST_QPN|IBV_QP_RQ_PSN|IBV_QP_MAX_DEST_RD_ATOMIC|IBV_QP_MIN_RNR_TIMER,"rdma_big",p,"RTR",mtu))return false;
   ibv_qp_attr t{};t.qp_state=IBV_QPS_RTS;t.timeout=14;t.retry_cnt=7;t.rnr_retry=7;t.sq_psn=0;t.max_rd_atomic=1;
-  return ibv_modify_qp(g_qp[p],&t,IBV_QP_STATE|IBV_QP_TIMEOUT|IBV_QP_RETRY_CNT|IBV_QP_RNR_RETRY|IBV_QP_SQ_PSN|IBV_QP_MAX_QP_RD_ATOMIC)==0;
+  return rdma_modify_qp(g_qp[p],&t,IBV_QP_STATE|IBV_QP_TIMEOUT|IBV_QP_RETRY_CNT|IBV_QP_RNR_RETRY|IBV_QP_SQ_PSN|IBV_QP_MAX_QP_RD_ATOMIC,"rdma_big",p,"RTS",mtu);
 }
 } // namespace
 
@@ -185,16 +188,17 @@ extern "C" int glm53_rdma_big_init(int rank){
     if(gid_index[p]<0){fprintf(stderr,"[rdma_big] %s: no IPv4 RoCE v2 GID on port 1\n",want[p]);return 9;}
     ibv_gid gid;if(ibv_query_gid(g_ctx[p],1,gid_index[p],&gid))return 9;
     mine.qpn[p]=g_qp[p]->qp_num;mine.psn[p]=0;mine.rkey_ctl[p]=g_mr_ctl[p]->rkey;mine.rkey_buf[p]=g_mr_buf[p]->rkey;memcpy(mine.gid[p],gid.raw,16);
+    mine.mtu[p]=g_mtu_mine[p]=rdma_port_mtu(g_ctx[p],"rdma_big");
   }
   ibv_free_device_list(list);
   if(!sock_exchange(mine,g_peer)){fprintf(stderr,"[rdma_big] exchange failed\n");return 10;}
-  for(int p=0;p<NPORT;++p)if(!qp_rts(p,gid_index[p])){fprintf(stderr,"[rdma_big] QP %d transition failed\n",p);return 11;}
+  for(int p=0;p<NPORT;++p)if(!qp_rts(p,gid_index[p]))return 11;
   std::thread t(proxy_loop);
   {const char* c=std::getenv("GLM53_RDMA_BIG_CPU");const int cpu=c?std::atoi(c):18;
    pthread_setname_np(t.native_handle(),"glm53-rdma-big");
    if(cpu>=0){cpu_set_t set;CPU_ZERO(&set);CPU_SET(cpu,&set);if(pthread_setaffinity_np(t.native_handle(),sizeof(set),&set))fprintf(stderr,"[rdma_big] affinity cpu%d failed\n",cpu);}}
   t.detach();
-  fprintf(stderr,"[rdma_big] rank%d ready: %s + %s, gid %d / %d, %d x %zu KiB per op/direction, pinned %zu MiB\n",rank,want[0],want[1],gid_index[0],gid_index[1],MAX_CHUNKS,CHUNK/1024,(sizeof(Bufs)+sizeof(Ctl))>>20);
+  fprintf(stderr,"[rdma_big] rank%d ready: %s + %s, gid %d / %d, mtu %d / %d, %d x %zu KiB per op/direction, pinned %zu MiB\n",rank,want[0],want[1],gid_index[0],gid_index[1],rdma_mtu_bytes(g_mtu[0]),rdma_mtu_bytes(g_mtu[1]),MAX_CHUNKS,CHUNK/1024,(sizeof(Bufs)+sizeof(Ctl))>>20);
   return 0;
 }
 extern "C" unsigned long long glm53_rdma_big_max_bytes(){return AREA;}
