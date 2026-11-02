@@ -9,7 +9,11 @@ three ranks then waited on each other for ever (or rank 0 failed with `rs_sp_red
 whenever a prefill chunk that contained image rows had at least 1,024 rows: a large image (about 930 image tokens or
 more) with a short question, or any image after about 1,000 tokens of text. The decisions now come from the image
 placeholders in the token ids, which every rank holds; rank 0's choice is unchanged and text-only chunks take the same
-path as before. The image checks of `bench/ds41/vision_e2e.py ... boundary` (an image after 4.5K / 5.6K tokens) pass.
+path as before. `bench/ds41_vision_e2e.py <base_url> - boundary` (an image ending about 4.5K / 5.6K tokens into the prompt)
+passes. The script was published after this tag, so it is not in the v0.3.11 tarball: take it from `main` (needs `pillow`).
+
+If you roll back: v0.3.9 and v0.3.10 have this hang. From reading the code, not from a test, v0.3.8 and earlier do not
+reach it with the default `DS41_PREFILL_CHUNK` (8192), but can with a larger value.
 
 **RDMA path MTU follows the ports (#2, #3).** The RDMA transports set the RC path MTU to 4096 regardless of the port.
 On a link left at the default netdev MTU 1500 the port reports `active_mtu` 1024, and with some driver / firmware
