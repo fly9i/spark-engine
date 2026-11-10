@@ -84,6 +84,10 @@ Set by `start-glm.sh` / `start-qwen.sh`; edit the scripts to change them.
 | `--allowed-media-domains`, `--media-deny-private`, `--allowed-local-media-path` | any, off, none | Restrictions for media URLs. |
 | `--media-timeout`, `--media-max-bytes`, `--video-max-bytes` | 30 s, 64 MB, 2 GB | Media download limits. |
 
+Streaming output is detokenized incrementally (since v0.3.12; GLM, DeepSeek and Qwen front ends): only a window of the
+newest tokens is decoded per step, with the same text and stop decisions as a full re-decode and about 7× less front-end
+CPU on 8,000-token outputs. `GLM53_TEXTSTREAM_FULL=1` in `spark.env` restores the full re-decode of earlier versions.
+
 Request parameters: `temperature` (0 = greedy; sampling is exact speculative sampling), `seed`, `max_tokens` /
 `max_completion_tokens`, `stop`, `stop_token_ids`, `stream`, `stream_options.include_usage`, `tools` / `tool_choice`,
 `chat_template_kwargs` (e.g. `{"enable_thinking": false}`), `reasoning_effort` (Qwen). `top_p`, `top_k` and penalties are

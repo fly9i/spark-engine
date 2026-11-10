@@ -8,10 +8,6 @@ extern "C" {
     fn qwen_exl3_had_in(x: *const c_void, x_f32: i32, ldx: i64, suh: *const c_void, xh: *mut c_void, m: i32, k: i32, st: St) -> i32;
     fn qwen_exl3_gemv(xh: *const c_void, tr: *const c_void, part: *mut c_void, m: i32, k: i32, n: i32, bits: i32, s: i32, st: St) -> i32;
     fn qwen_exl3_finish(part: *const c_void, s: i32, svh: *const c_void, y: *mut c_void, y_f32: i32, ldy: i64, m: i32, n: i32, st: St) -> i32;
-    fn qwen_gdn_conv(x: *const c_void, ldx: i64, state: *const c_void, w: *const c_void, y: *mut c_void, t: i32, st: St) -> i32;
-    fn qwen_gdn_conv_commit(x: *const c_void, ldx: i64, state: *mut c_void, n: i32, st: St) -> i32;
-    fn qwen_gdn_recur(y: *const c_void, ab: *const c_void, ldab: i64, z: *const c_void, ldz: i64, a_log: *const c_void,
-                      dt_bias: *const c_void, norm_w: *const c_void, s: *mut c_void, out: *mut c_void, t: i32, write: i32, st: St) -> i32;
     fn qwen_qsa_select(qi: *const c_void, pooled: *const c_void, r: i32, pos0: *const c_void, scores: *mut c_void, ld: i32, sel: *mut c_void, cnt: *mut c_void, sel_ld: i32, st: St) -> i32;
     fn qwen_exl3_reconstruct(tr: *const c_void, w: *mut c_void, k: i32, n: i32, bits: i32, st: St) -> i32;
     fn qwen_exl3_fold(tr: *const c_void, suh: *const c_void, svh: *const c_void, k: i32, n: i32, bits: i32, out: *mut c_void, ldo: i64, st: St) -> i32;
@@ -82,18 +78,6 @@ pub fn exl3_gemv(xh: &Tensor, tr: &Tensor, part: &Tensor, m: i64, k: i64, n: i64
 pub fn exl3_finish(part: &Tensor, s: i32, svh: &Tensor, y: &Tensor, m: i64, n: i64) {
     let f32 = (y.kind() == tch::Kind::Float) as i32;
     ok(unsafe { qwen_exl3_finish(p(part), s, p(svh), p(y), f32, y.stride()[0], m as i32, n as i32, st()) }, "exl3_finish");
-}
-pub fn gdn_conv(x: &Tensor, state: &Tensor, w: &Tensor, y: &Tensor, t: i64) {
-    ok(unsafe { qwen_gdn_conv(p(x), x.stride()[0], p(state), p(w), p(y), t as i32, st()) }, "gdn_conv");
-}
-pub fn gdn_conv_commit(x: &Tensor, state: &Tensor, n: i64) {
-    ok(unsafe { qwen_gdn_conv_commit(p(x), x.stride()[0], p(state), n as i32, st()) }, "gdn_conv_commit");
-}
-#[allow(clippy::too_many_arguments)]
-pub fn gdn_recur(y: &Tensor, ab: &Tensor, z: &Tensor, a_log: &Tensor, dt_bias: &Tensor, norm: &Tensor, s: &Tensor,
-                 out: Option<&Tensor>, t: i64, write: bool) {
-    ok(unsafe { qwen_gdn_recur(p(y), p(ab), ab.stride()[0], p(z), z.stride()[0], p(a_log), p(dt_bias), p(norm), p(s), opt(out),
-                               t as i32, write as i32, st()) }, "gdn_recur");
 }
 #[allow(clippy::too_many_arguments)]
 pub fn qsa_prep(qp: &Tensor, kp: &Tensor, vp: &Tensor, ip: &Tensor, r: i64, pos0: &Tensor, qn: &Tensor, kn: &Tensor, iqn: &Tensor,

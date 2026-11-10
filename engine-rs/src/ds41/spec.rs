@@ -244,7 +244,8 @@ impl Model {
         let e = self.embed(&super::kern::upload_i64(&ids, dev));                        // [R, dim]
         if graph_on() && draft_graph_on() && self.draft_debug.borrow().is_none() {
             let out = self.mtp_draft_graph(seqs, &e, &pos, toks, temps, seeds);
-            if std::env::var("DS41_DRAFT_GRAPH_CHECK").as_deref() == Ok("1") {
+            static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *CHECK.get_or_init(|| std::env::var("DS41_DRAFT_GRAPH_CHECK").as_deref() == Ok("1")) {
                 // the eager loop on the same head logits (the body graph's outputs, untouched by the Markov graph)
                 let (xf, logits) = {
                     let g = self.mtp_graphs.borrow();

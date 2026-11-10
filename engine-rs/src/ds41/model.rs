@@ -23,10 +23,10 @@ pub struct Fp8W { pub(super) w: Tensor, pub(super) s: Tensor }
 /// they are summed, like the official MoE (expert-parallel there, so each expert output is complete). With TP the
 /// partial sums are kept in FP32 instead (rounding a partial is not the official operation either).
 fn parity() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_PARITY").as_deref() == Ok("1")) }
-/// The sum over ranks of a layer output y [T, dim] FP32 (in place; the caller rounds it to BF16 next). Prefill-size
-/// buffers (> 64 rows) go over the BF16 transport (DS41_AR_BF16, default on): each rank's partial and the sum are
-/// rounded to BF16 on the wire (half the bytes on links that are at their limit; golden p2: prefill KL 0.0146 vs
-/// 0.0179 with the FP32 transport, both at the reference's own noise floor 0.0157).
+// The sum over ranks of a layer output y [T, dim] FP32 (in place; the caller rounds it to BF16 next). Prefill-size
+// buffers (> 64 rows) go over the BF16 transport (DS41_AR_BF16, default on): each rank's partial and the sum are
+// rounded to BF16 on the wire (half the bytes on links that are at their limit; golden p2: prefill KL 0.0146 vs
+// 0.0179 with the FP32 transport, both at the reference's own noise floor 0.0157).
 thread_local! { static DEFER_AR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 // inside the sequence-parallel encoders: attn_out returns its BF16 partial for the BF16-input reduce-scatter (sp_rs /
 // SpPending::rs take either dtype; the partial's FP32 copy is the same values). DS41_SP_RS_B16=0: FP32 as before.
@@ -257,7 +257,7 @@ fn qakv_split_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::On
 fn mx_gemv_ok(m: i64, k: i64, n: i64) -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let one = *E.get_or_init(|| std::env::var("DS41_GEMV_MX1").map_or(true, |v| v != "0"));
-    moe_mx_on() && m <= 16 && (m >= 2 || one) && k % 64 == 0 && n % 8 == 0
+    moe_mx_on() && m <= super::kern::few_rows() && (m >= 2 || one) && k % 64 == 0 && n % 8 == 0
 }
 /// DS41_MOE_MX=0: the BF16-MMA routed-expert kernels (shim/ds41_moe.cu) instead of the block-scaled MMA ones (ds41_mx.cu).
 pub(super) fn moe_mx_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_MOE_MX").map_or(true, |v| v != "0")) }
@@ -449,11 +449,11 @@ pub struct Model {
     pub(super) mtp_graphs: std::cell::RefCell<HashMap<usize, super::spec::MtpGraph>>,
 }
 
-/// Decode of one token for each of B sequences as CUDA graphs (one set per B): per layer S1 (Engram mix, mHC mix/pre, norm, Q / window KV projections) and
-/// S3 (output projection + rank sum, mHC post/mix/pre, MoE + rank sum, mHC post), and the final norm + logits. The
-/// shape-dynamic middle (compressor, indexer, pool, sparse attention; attn_mid) runs eagerly between S1 and S3 and
-/// writes its output into a fixed buffer; it runs per sequence on that sequence's row. The graphs touch no sequence
-/// state, so they serve any sequences.
+// Decode of one token for each of B sequences as CUDA graphs (one set per B): per layer S1 (Engram mix, mHC mix/pre, norm, Q / window KV projections) and
+// S3 (output projection + rank sum, mHC post/mix/pre, MoE + rank sum, mHC post), and the final norm + logits. The
+// shape-dynamic middle (compressor, indexer, pool, sparse attention; attn_mid) runs eagerly between S1 and S3 and
+// writes its output into a fixed buffer; it runs per sequence on that sequence's row. The graphs touch no sequence
+// state, so they serve any sequences.
 thread_local! {
     /// Engram rows of later engram layers being gathered in the background for the current prefill chunk (by layer).
     static ENGRAM_PENDING: std::cell::RefCell<HashMap<usize, std::thread::JoinHandle<(Vec<u8>, Vec<u8>)>>> = std::cell::RefCell::new(HashMap::new());
@@ -489,6 +489,10 @@ fn engram_skip_images(h: &Tensor, out: Tensor, off: i64) -> Tensor {
 fn shared_par() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_SHARED_PAR").map_or(true, |v| v != "0")) }
 /// DS41_OVERLAP_ROWS (512; 0 off): prefill chunks of at least twice this many rows run the encoder as two
 /// micro-batches with the all-reduces overlapped (Model::encoder_two_batch).
+/// DS41_ENGRAM_ASYNC_MIN (default 256 = the behaviour before it): prompt chunks of at least this many rows gather their
+/// engram rows in the background (serve's first-chunk prefetch, prefill_ced_one's per-layer gathers). Chunks of 256
+/// rows and more always did; lower values add the shorter ones (the same bytes, uploaded the same way).
+pub fn engram_async_min() -> i64 { static E: std::sync::OnceLock<i64> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_ENGRAM_ASYNC_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(256).max(1)) }
 fn overlap_rows() -> i64 { static E: std::sync::OnceLock<i64> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_OVERLAP_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(512)) }
 /// DS41_CED_SUB (4096; 0 off): prefill_ced runs longer pieces as sub-chunks of this many tokens (the serving chunk can
 /// then be a multiple: DS41_PREFILL_CHUNK); DS41_CED_PAIR=0: the sub-chunks one by one (no shared MoE call).
@@ -1023,6 +1027,8 @@ impl Model {
     pub fn logits_local(&self, x: &Tensor) -> Tensor {
         let m = x.size()[0];
         if gemv_on() && m <= 64 {
+            // (16-row chunks also under DS41_GEMV32: one 17..32-row call of the head is FMA-bound, slower than 16 + rest,
+            // ds41-kernel-test w32 24 rows 3390 vs 3120 us)
             let parts: Vec<Tensor> = (0..m).step_by(16).map(|r| super::kern::bf16_gemv(&x.narrow(0, r, 16.min(m - r)), &self.head)).collect();
             if parts.len() == 1 { parts.into_iter().next().unwrap() } else { Tensor::cat(&parts, 0) }
         } else { x.to_kind(Kind::Float).matmul(&self.head.to_kind(Kind::Float).tr()) }
@@ -1072,6 +1078,26 @@ impl Model {
         if !h.contains(&engram::DEAD) { return None; }
         let m: Vec<bool> = h.iter().map(|&t| t == engram::DEAD).collect();
         Some(Tensor::from_slice(&m).to_device(self.dev))
+    }
+
+    /// DS41_ENGRAM_EARLY=1 (default off): at the start of a speculative round (before the draft), warm the page cache
+    /// with the engram rows of each sequence's pending token -- the verify's first row, whose n-gram is known before the
+    /// draft (the draft rows' n-grams are not). The verify still gathers every row itself (rows_graph: the same rows,
+    /// the same bytes); only the cold-page faults of the first rows move ahead, under the draft (~3.5 ms).
+    pub(super) fn engram_early(&self, seqs: &[&mut Seq], toks: &[i64]) {
+        static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*E.get_or_init(|| std::env::var("DS41_ENGRAM_EARLY").is_ok_and(|v| v == "1")) { return; }
+        let Some(hs) = &self.hash else { return };
+        let mut rows = vec![Vec::new(); hs.layer_ids.len()];
+        for (s, &t) in seqs.iter().zip(toks) {
+            let n = s.hist.len();
+            let mut h: Vec<i64> = s.hist[n.saturating_sub(hs.max_ngram() - 1)..].to_vec();
+            h.push(hs.compress(t));
+            hs.at_into(&h, &mut rows);
+        }
+        for (li, &l) in hs.layer_ids.iter().enumerate() {
+            if self.layers.iter().any(|x| x.id == l) { engram::warm(&self.tables, l, std::mem::take(&mut rows[li]), hs.head_dim); }
+        }
     }
 
     /// Appends `ids` to the sequence's n-gram history; the engram hash ids [engram layer][T * cols].
@@ -1151,6 +1177,7 @@ impl Model {
     fn rows_graph(&self, seqs: &mut [&mut Seq], ids: &[Vec<i64>]) -> (Tensor, Option<Tensor>) {
         use crate::tp::graph::{begin_pool, end, Owned};
         let _g = tch::no_grad_guard();
+        let _wide = super::kern::WideScope::new();
         let c = &self.c;
         let dev = self.dev;
         assert_eq!(seqs.len(), ids.len());
@@ -1184,7 +1211,7 @@ impl Model {
         let pos_now = super::kern::upload_i64(&posv, dev);
         let want_hid = self.mtp.is_some();
         let mut graphs = self.graph.borrow_mut();
-        let mut run_mid = |layer: &Layer, mid: &[Tensor; 4], pos: &Tensor, obuf: Option<&Tensor>, sh: &mut Vec<Shared>, seqs: &mut [&mut Seq]| -> Option<Tensor> {
+        let run_mid = |layer: &Layer, mid: &[Tensor; 4], pos: &Tensor, obuf: Option<&Tensor>, sh: &mut Vec<Shared>, seqs: &mut [&mut Seq]| -> Option<Tensor> {
             let [x, qr, q, kv] = mid;
             // several sequences: each one's compressor / indexer, then the sparse attention of all rows in one launch
             if let (Some(ob), true) = (obuf, seqs.len() > 1 && attn_fused() && attn_multi_on()) {
@@ -1615,8 +1642,12 @@ impl Model {
         // (tech report 2.4: deterministic addressing lets them be prefetched; the tables are on NVMe here)
         let plan = self.sp_plan(t);
         if let Some(hs) = &self.hash {
-            if t >= 256 {
-                for (li, &l) in hs.layer_ids.iter().enumerate().skip(1) {
+            // chunks under 256 rows (short prompts, DS41_ENGRAM_ASYNC_MIN): every engram layer's rows in the background,
+            // the first one's too (a serving prefetch of them is taken over: engram::rows_async), so layer 1's gather
+            // overlaps the embedding and layer 0, and layer 14's the layers before it
+            let small = t < 256 && t >= engram_async_min();
+            if t >= 256 || small {
+                for (li, &l) in hs.layer_ids.iter().enumerate().skip(if small { 0 } else { 1 }) {
                     if self.layers.iter().any(|x| x.id == l) {
                         // sequence-parallel: only this rank's positions' rows (a third of the reads)
                         let rows = match &plan { Some(p) if l < enc => Self::sp_local_rows(p, &hashes[li], hs.cols()), _ => hashes[li].clone() };
@@ -2698,7 +2729,8 @@ impl Model {
     fn index_blocks(&self, q: &Tensor, wts: &Tensor, k: &Tensor, pos: &Tensor, ratio: i64, clen: i64, k_top: i64, offset: i64, is_cand: bool, cand: Option<&Tensor>) -> (Tensor, Option<Tensor>) {
         let t = q.size()[0];
         let per_row = clen.max(1) * if is_cand { 14 } else { 3 };
-        let budget = std::env::var("DS41_INDEX_MB").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(512) << 20;
+        static MB: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        let budget = *MB.get_or_init(|| std::env::var("DS41_INDEX_MB").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(512)) << 20;
         let rb = (budget / per_row).max(1);
         if rb >= t || k_top == 0 { return self.index_rows(q, wts, k, pos, ratio, clen, k_top, offset, is_cand, cand); }
         let mut ids = Vec::new();
@@ -2799,7 +2831,8 @@ impl Model {
             // FP32 router logits: the BF16 GEMV in chunks of 16 rows up to 64 rows (no cuBLAS inside the decode / verify
             // graphs: every capture stream would get its own cuBLAS workspace), FP32 matmul for prefill chunks
             let logits = if gemv_on() && t <= 64 {
-                let parts: Vec<Tensor> = (0..t).step_by(16).map(|r| super::kern::bf16_gemv(&x.narrow(0, r, 16.min(t - r)), &m.gate)).collect();
+                let ch = super::kern::few_rows();
+                let parts: Vec<Tensor> = (0..t).step_by(ch as usize).map(|r| super::kern::bf16_gemv(&x.narrow(0, r, ch.min(t - r)), &m.gate)).collect();
                 if parts.len() == 1 { parts.into_iter().next().unwrap() } else { Tensor::cat(&parts, 0) }
             } else { x.to_kind(Kind::Float).matmul(&m.gate.to_kind(Kind::Float).tr()) };
             let pick = |bias: &Tensor| {
@@ -2870,7 +2903,7 @@ impl Model {
         let sm = &m.shared;
         let shared_fused = || { let gu = sm.w13.mm_f32(x); sm.w2.mm_f32(&super::kern::swiglu_quant(&gu, lim)) };
         // decode / verify: the shared expert on a parallel stream beside the router and routed experts
-        if let (true, false, Some(p)) = (t <= 16 && ops_fused() && moe_mx_on() && shared_par(), parity(), ex.packed.as_ref()) {
+        if let (true, false, Some(p)) = (t <= super::kern::few_rows() && ops_fused() && moe_mx_on() && shared_par(), parity(), ex.packed.as_ref()) {
             let w = [&p[0], &p[1], &p[2], &p[3], &p[4], &p[5]];
             let y = prof("moe.experts", || super::kern::moe_mx_par(x, route, w, shared_fused));
             return ar_bf16(y);

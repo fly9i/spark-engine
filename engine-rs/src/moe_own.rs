@@ -52,16 +52,6 @@ pub(crate) fn run_into(tab: &Tensor, kmask: i32, x: &Tensor, ids: &Tensor, weigh
                                         kmask, rs_current_stream()) }, 0, "GLM MoE experts");
 }
 
-/// The 9 per-projection pointer tables of one layer (MoeFast order: gate tr, suh, svh, up tr, suh, svh, down tr, suh,
-/// svh; [288] each) in moe_exl3.cuh order: gate/up/down trellis, gate/up/down suh, gate/up/down svh; row 9 the experts'
-/// trellis widths `kbits`. Returns (table [10, 288], kmask).
-pub(crate) fn table(per_proj: &[Tensor], kbits: &[i64]) -> (Tensor, i32) {
-    assert_eq!(per_proj.len(), 9);
-    let order = [0usize, 3, 6, 1, 4, 7, 2, 5, 8];
-    let mut rows: Vec<Tensor> = order.iter().map(|&i| per_proj[i].shallow_clone()).collect();
-    rows.push(Tensor::from_slice(kbits).to_device(per_proj[0].device()));
-    (Tensor::stack(&rows, 0).contiguous(), kmask(kbits))
-}
 /// Bit K for every expert trellis width K present (each K in 3..=6).
 pub(crate) fn kmask(kbits: &[i64]) -> i32 {
     let m = kbits.iter().fold(0, |m, &k| { assert!((3..=6).contains(&k), "expert trellis K {k} not supported (3..6)"); m | 1 << k });
@@ -103,9 +93,6 @@ pub fn ab(model: &Path) {
     pool.ensure_many(layer, &(0..288).collect::<Vec<_>>(), dev);
     pool.assume_hot = true;
     let siv = pool.shared_input_verified(layer);
-    let per_proj: Vec<Tensor> = pool.probe_tables().iter().map(Tensor::shallow_clone).collect();
-    let slots = Tensor::from_slice(&(0..288).map(|e| pool.slot_of(layer, e)).collect::<Vec<_>>()).to_device(dev);
-    let layer_tabs: Vec<Tensor> = per_proj.iter().map(|t| t.index_select(0, &slots)).collect();
     let h = hadamard128(dev);
     let experts = pool.layer_tensors(layer);
     let kbits: Vec<i64> = experts.iter().map(|t| { let k = trellis_bits(&t[0]); assert!(trellis_bits(&t[3]) == k && trellis_bits(&t[6]) == k); k }).collect();
@@ -169,7 +156,7 @@ pub fn ab(model: &Path) {
                     refo = refo.index_add(0, &Tensor::from_slice(&[r]).to_device(dev), &(d * wf.narrow(0, r, 1).narrow(1, k, 1)));
                 }
             }
-            let rel = |y: &Tensor| ((y - &refo).norm().double_value(&[]) / refo.norm().double_value(&[]));
+            let rel = |y: &Tensor| (y - &refo).norm().double_value(&[]) / refo.norm().double_value(&[]);
             let own = Tensor::empty([rows, 4096], (Kind::Float, dev));
             run_into(&tab, kmask, &x, &ids, &w, &own, None, None);
             let e_own = rel(&own);

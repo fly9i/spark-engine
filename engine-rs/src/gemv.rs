@@ -30,7 +30,7 @@ fn rel(a:&Tensor,b:&Tensor)->f64 {
 pub fn probe(model:&Path,out:&Path) {
     tch::set_num_threads(4);let _guard=tch::no_grad_guard();std::env::remove_var("GLM53_DENSE_GEMV");
     std::fs::create_dir_all(out).unwrap();let dev=Device::Cuda(0);tch::manual_seed(20260923);
-    let mut idx=crate::safetensors::ShardIndex::scan(model).unwrap();let mut cases=Vec::new();
+    let idx=crate::safetensors::ShardIndex::scan(model).unwrap();let mut cases=Vec::new();
     let prefix="model.language_model.layers";
     let shapes=[("lm_head.weight".to_string(),-1),
         (format!("{prefix}.0.self_attn.q_proj.weight"),0),
@@ -99,7 +99,7 @@ pub fn small(x:&Tensor,w:&Tensor,round:bool)->Tensor {
 pub fn small_probe(model:&Path,out:&Path) {
     tch::set_num_threads(4);let _guard=tch::no_grad_guard();let dev=Device::Cuda(0);
     std::env::remove_var("GLM53_DENSE_SMALL");std::fs::create_dir_all(out).unwrap();
-    let mut idx=crate::safetensors::ShardIndex::scan(model).unwrap();let mut cases=Vec::new();
+    let idx=crate::safetensors::ShardIndex::scan(model).unwrap();let mut cases=Vec::new();
     for (name,axis) in [("0.self_attn.q_proj.weight",0),("0.self_attn.f_b_proj.weight",0),
         ("0.mlp.gate_proj.weight",0),("0.mlp.down_proj.weight",1),("3.self_attn.q_a_proj.weight",-1),
         ("3.self_attn.q_b_proj.weight",0),("3.self_attn.kv_a_proj_with_mqa.weight",-1),

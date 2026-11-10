@@ -83,6 +83,10 @@
 | `--allowed-media-domains`、`--media-deny-private`、`--allowed-local-media-path` | 任意、关闭、无 | 媒体 URL 的限制。 |
 | `--media-timeout`、`--media-max-bytes`、`--video-max-bytes` | 30 s、64 MB、2 GB | 媒体下载限制。 |
 
+流式输出采用增量反分词（v0.3.12 起；GLM、DeepSeek、Qwen 前端通用）：每步只解码最新 token 的一个窗口，文本与停止判定
+和全量重新解码相同，8,000 token 输出时前端 CPU 约少 7 倍。在 `spark.env` 中设 `GLM53_TEXTSTREAM_FULL=1` 可回到旧版本的
+全量重新解码。
+
 请求参数：`temperature`（0 = 贪心；采样为精确投机采样）、`seed`、`max_tokens` /
 `max_completion_tokens`、`stop`、`stop_token_ids`、`stream`、`stream_options.include_usage`、`tools` / `tool_choice`、
 `chat_template_kwargs`（例如 `{"enable_thinking": false}`）、`reasoning_effort`（Qwen）。`top_p`、`top_k` 和各类惩罚参数

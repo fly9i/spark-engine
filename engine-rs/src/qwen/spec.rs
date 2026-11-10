@@ -60,7 +60,7 @@ pub fn mtp_catch_up(m: &Model, seq: &mut Seq, hs: Vec<Tensor>, ids: Vec<i64>, st
     if skip as usize == ids.len() { return; }
     let hidden = Tensor::cat(&hs, 0);
     let hidden = hidden.narrow(0, skip, ids.len() as i64 - skip).contiguous();
-    m.mtp_prefill(seq, &hidden, &ids[skip as usize..], start + skip);
+    let _ = m.mtp_prefill(seq, &hidden, &ids[skip as usize..], start + skip);
 }
 
 pub fn generate(m: &Model, seq: &mut Seq, prompt: &[i64], n_new: usize, k: usize, stats: &mut Stats) -> Vec<i64> {

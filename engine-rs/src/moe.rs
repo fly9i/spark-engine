@@ -187,7 +187,6 @@ pub fn finish_tp(routed:Tensor,m:&MoeMeta,h:&Tensor)->Tensor {
 }
 
 /// Sequence-parallel prefill: routed + shared FP32 partials, reduce-scattered (this rank's rows).
-pub(crate) fn sp_finish(routed:Tensor,m:&MoeMeta,h:&Tensor)->Tensor {sp_finish_with_half(routed,m,h,None)}
 pub(crate) fn sp_finish_with_half(routed:Tensor,m:&MoeMeta,h:&Tensor,half:Option<&Tensor>)->Tensor {
     let shared=crate::weights::mm16_partial(&shared_activation_with_half(m,h,half),&m.sh_wd);
     crate::tp::reduce_scatter_rows(&(routed+shared).contiguous())
@@ -297,10 +296,6 @@ pub(crate) fn finish_packed_post_joined(routed:Tensor,shared:SideShared,m:&MoeMe
 
 /// Verifier consumer: perform the original shared Half rounding and routed
 /// addition inside MHC post, eliminating their otherwise unused intermediates.
-pub fn finish_tp_post(routed:Tensor,m:&MoeMeta,h:&Tensor,residual:&Tensor,pre:&crate::mhc::PreOut)->Tensor {
-    finish_tp_post_with_half(routed,m,h,None,residual,pre)
-}
-
 pub(crate) fn finish_tp_post_with_half(routed:Tensor,m:&MoeMeta,h:&Tensor,half:Option<&Tensor>,residual:&Tensor,pre:&crate::mhc::PreOut)->Tensor {
     if !crate::mhc::packed_enabled() ||
         !h.device().is_cuda() || !tp_pack_for_rows(routed.size()[0]) {
@@ -513,9 +508,9 @@ impl NativeExpertPool {
     /// 完整 clamp-SwiGLU(与 expert_forward 语义一致,fp16 出 → fp32)。
     pub fn expert_forward(x16: &Tensor, projs: &[(Tensor, Tensor, Tensor); 3], dev: Device) -> Tensor {
         let rows = x16.size()[0];
-        let (kg, ng) = { let (kt, nt) = (projs[0].0.size()[0], projs[0].0.size()[1]); (kt * 16, nt * 16) };
-        let (ku, nu) = { let (kt, nt) = (projs[1].0.size()[0], projs[1].0.size()[1]); (kt * 16, nt * 16) };
-        let (kd, nd) = { let (kt, nt) = (projs[2].0.size()[0], projs[2].0.size()[1]); (kt * 16, nt * 16) };
+        let ng = projs[0].0.size()[1] * 16;
+        let nu = projs[1].0.size()[1] * 16;
+        let nd = projs[2].0.size()[1] * 16;
         let xh = Tensor::empty_like(x16);
         let g = Tensor::zeros([rows, ng], (Kind::Half, dev));
         let u = Tensor::zeros([rows, nu], (Kind::Half, dev));

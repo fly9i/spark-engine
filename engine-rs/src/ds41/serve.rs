@@ -87,6 +87,7 @@ fn seqs_of<'a>(stores: &'a mut [Store], sidx: &[usize]) -> Vec<&'a mut Seq> {
 }
 fn spec_draft(m: &Model, stores: &mut [Store], sidx: &[usize], toks: &[i64], temps: &[f32], seeds: &[u64]) -> (Vec<Vec<i64>>, Vec<Vec<f32>>) {
     let seqs = seqs_of(stores, sidx);
+    m.engram_early(&seqs, toks);
     m.mtp_draft(&seqs, toks, temps, seeds)
 }
 fn spec_verify(m: &Model, stores: &mut [Store], sidx: &[usize], rows: &[Vec<i64>]) -> (Tensor, SpecPending) {
@@ -202,7 +203,8 @@ fn spec_calib(temp: f32) -> (f64, f64) {
     c[(temp > 0.0) as usize]
 }
 fn choose_drafts(confs: &[Vec<f32>], maxd: &[usize], temps: &[f32]) -> Vec<usize> {
-    if std::env::var("DS41_SPEC_MIN_P").is_ok() {   // the fixed-threshold rule (comparison)
+    static FIXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FIXED.get_or_init(|| std::env::var("DS41_SPEC_MIN_P").is_ok()) {   // the fixed-threshold rule (comparison)
         return confs.iter().zip(maxd).map(|(c, &m)| super::spec::spec_len(c, m)).collect();
     }
     let (base, seq, row) = spec_cost();
@@ -224,7 +226,7 @@ fn choose_drafts(confs: &[Vec<f32>], maxd: &[usize], temps: &[f32]) -> Vec<usize
     let (mut gain, mut cost) = (b as f64, base + (seq + row) * b as f64);
     loop {
         if b + d.iter().sum::<usize>() >= max_rows { break; }
-        let best = (0..b).filter(|&s| d[s] < p[s].len()).max_by(|&x, &y| p[x][d[x]].partial_cmp(&p[y][d[y]]).unwrap());
+        let best = (0..b).filter(|&s| d[s] < p[s].len()).max_by(|&x, &y| p[x][d[x]].total_cmp(&p[y][d[y]]));   // (total_cmp: a NaN confidence must not panic every rank)
         let Some(s) = best else { break };
         let g = p[s][d[s]];
         if (gain + g) / (cost + row) <= gain / cost { break; }
@@ -243,7 +245,7 @@ fn spec_log(temp: f32, conf: &[f32], d: usize, k: usize, b: usize, rows: usize, 
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |x| x.as_millis() as u64);
     if let Some(f) = f { let _ = writeln!(f.lock().unwrap(), "{}", json!({"t": temp, "conf": conf, "d": d, "k": k, "b": b, "rows": rows, "ms": ms, "ts": ts})); }
 }
-fn spec_on() -> bool { std::env::var("DS41_SPEC").map_or(true, |v| v != "0") }
+fn spec_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_SPEC").map_or(true, |v| v != "0")) }
 
 struct Conn(std::sync::Arc<std::sync::Mutex<Option<UnixStream>>>);
 fn write_line(conn: &mut Conn, v: &Value) {
@@ -295,12 +297,6 @@ impl Ctrl {
     }
 }
 
-/// One forward step every rank runs: `ids` appended to store `s` (reset first when asked); returns the logits of the
-/// last row.
-/// `last`: the prompt's last chunk (logits wanted). With CED (default) prompt chunks run the encoder only and the last
-/// one closes with the decoder replay (Model::prefill_ced); the logits of other chunks are not computed.
-/// `vis`: the image rows of this chunk (rank 0; crate::mm_canvas::MmState::chunk_rows).
-#[allow(clippy::too_many_arguments)]
 /// One row-graph / draft-graph warm-up item (DS41_WARM_DEFER: the batched shapes captured after the engine is ready).
 #[derive(Clone)]
 enum Warm { Draft(usize), Rows(Vec<usize>) }
@@ -342,6 +338,12 @@ fn warm_stores(m: &Model, n: usize) -> Vec<Store> {
 /// graphs, batched row signatures and draft graphs, took 2.0-2.4 GiB per rank).
 fn warm_graph_bytes() -> i64 { std::env::var("DS41_WARM_GRAPH_MB").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(104) << 20 }
 
+/// One forward step every rank runs: `ids` appended to store `s` (reset first when asked); returns the logits of the
+/// last row.
+/// `last`: the prompt's last chunk (logits wanted). With CED (default) prompt chunks run the encoder only and the last
+/// one closes with the decoder replay (Model::prefill_ced); the logits of other chunks are not computed.
+/// `vis`: the image rows of this chunk (rank 0; crate::mm_canvas::MmState::chunk_rows).
+#[allow(clippy::too_many_arguments)]
 fn step(m: &Model, stores: &mut [Store], s: usize, ids: &[i64], reset: bool, last: bool, ck: &[i64], vis: Option<(Vec<i64>, Tensor)>) -> Tensor {
     if reset { m.reset_seq(&mut stores[s].seq); stores[s].history.clear(); }
     stores[s].seq.ck_req = ck.to_vec();
@@ -478,7 +480,8 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
     // decode, uniform verify), and the draft graph of every batch size. Captures empty the allocator's cache, so the
     // largest eager piece, a full prefill chunk, runs last: its peak stays cached as the eager working set.
     super::mem::set_cap(tp.rank);
-    let (mut deferred, mut deferred_graphs): (Vec<Warm>, usize) = (Vec::new(), 0);
+    let mut deferred: Vec<Warm> = Vec::new();
+    let deferred_graphs: usize;
     {
         let tw = Instant::now();
         super::mem::warming(true);
@@ -773,7 +776,7 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
             }
             let ids: Vec<i64> = v["prompt_ids"].as_array().map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default();
             let max_new = v["max_new"].as_u64().unwrap_or(256) as usize;
-            if ids.is_empty() || ids.len() + max_new > cap as usize {
+            if ids.is_empty() || ids.len().saturating_add(max_new) > cap as usize {   // (saturating: a huge max_new must not wrap past the check)
                 write_line(&mut conn, &json!({"id": v["id"], "done": true, "error": format!("invalid request: {} prompt tokens + {} new must fit {} tokens", ids.len(), max_new, cap)}));
                 continue;
             }
@@ -881,7 +884,7 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
             // the first chunk run for this request: its own engram rows load from NVMe in the background too (the
             // tables mostly miss the page cache; layer 14's rows were a synchronous 0.8 s for 4096 new tokens), so
             // they overlap the layers before; then the next chunk's rows load while this chunk runs (every rank)
-            if !a.pf_started && ids.len() >= 256 {
+            if !a.pf_started && ids.len() as i64 >= super::model::engram_async_min().min(256) {
                 a.pf_started = true;
                 let prev = &a.prompt[a.done_prompt.saturating_sub(3)..a.done_prompt];
                 ctrl.send(&json!({"op": "pf", "prev": prev, "next": &ids}));
@@ -1015,7 +1018,8 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
         while i < active.len() {
             let a = &mut active[i];
             let mut finished = a.cancelled;
-            if let Some(e) = a.out.iter().position(|t| eos.contains(t) || a.stop_ids.contains(t)) { a.out.truncate(e + 1); finished = true; }
+            // (only the tokens of this iteration: the ones already sent were checked when they arrived)
+            if let Some(e) = a.out[a.sent..].iter().position(|t| eos.contains(t) || a.stop_ids.contains(t)) { a.out.truncate(a.sent + e + 1); finished = true; }
             if a.out.len() >= a.max_new { a.out.truncate(a.max_new); finished = true; }
             if a.out.len() > a.sent {
                 write_line(&mut conn, &json!({"id": a.id, "delta": &a.out[a.sent..]}));
@@ -1027,6 +1031,7 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
                 let mut p = super::model::take_prof();
                 p.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap());
                 eprintln!("[ds41-serve] profile (ms): {}", p.iter().map(|(n, ms)| format!("{n} {ms:.1}")).collect::<Vec<_>>().join(", "));
+                if let Some(s) = super::kern::take_moe_stats() { eprintln!("[ds41-serve] moe: {s}"); }
             }
             // the store keeps its state: history (every id run through the model) always equals the committed positions,
             // also after a cancel mid-prompt, so a later request extending it continues exactly

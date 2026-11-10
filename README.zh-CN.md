@@ -40,6 +40,30 @@ DeepSeek 预填 2026-10-30，Qwen 预填 2026-10-29，启动 2026-10-28。更多
 
 "prose" = 长篇解释（草稿接受率低）；"structured" = 从 1 数到 200（接受率高）。因为有投机，解码速度和文本相关。
 
+### DeepSeek-V4.1-Flash：v0.3.12（2026-11-10）
+
+v0.3.12 发布时的实测（2026-11-10）：三台 DGX Spark（TP3，即下文[测试系统](#测试系统与-gpu-频率)，默认 GPU 时钟），
+DeepSeek-V4.1-Flash-1017，默认设置加可选的条件钳制（`DS41_ABLATE_CLAMP`，与本 README 其他 DeepSeek 数据相同），贪心、关思考。
+解码：`bench/ds41_decode_bench.py --types prose,structured,code --conc 1,2,4 --max-tokens 400`（32 token 预热，流式；
+聚合 = 全部流的 token ÷ 从最早一路首 token 到最晚一路末 token 的时间窗），**每格只跑一次**——与上表（5 次取中位数）的脚本、
+提示集合和样本数都不同，请同口径比较。预填：`bench/ds41_prefill_bench.py 5 8k,32k`（流式，速率 = 提示 token ÷ TTFT，
+每个样本前缀唯一、前缀缓存帮不上，5 次取中位数）；冷 = 三台都清页缓存并重启服务、每个样本都是新文本；热 = 重复同一段文本。
+
+| 解码，聚合 tok/s | prose | structured | code |
+| --- | --- | --- | --- |
+| 1 路 | 69.3 | 127.1 | 112.3 |
+| 2 路 | 97.7 | 180.0 | 150.4 |
+| 4 路 | 129.4 | 219.4 | 176.5 |
+
+| 预填，tok/s | 8K | 32K |
+| --- | --- | --- |
+| 冷 | 5,400 | 5,677 |
+| 热 | 5,432 | 5,505 |
+
+可选，默认关：`DS41_GEMV32=1 DS41_HC32=1` 让 17–32 行的验证轮留在小行数内核上。同一构建开关对照，每臂 4 次：4 路 code
+164.1 → 189.2 tok/s，structured 220.3 → 235.9 tok/s；1 路、2 路不变。多路并发时输出与默认路径不同；单路输出相同。
+详见 [docs/release-notes.md](docs/release-notes.md)、[docs/ds41.zh-CN.md](docs/ds41.zh-CN.md#5-设置)。
+
 ### 量化与运行时精度
 
 | 部件 | GLM-5.3-Flash | DeepSeek-V4.1-Flash | Qwen3.8-Flash-Next |

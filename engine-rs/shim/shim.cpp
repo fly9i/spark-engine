@@ -30,9 +30,6 @@ class Graph; // 前向声明:mangling 需要 P5Graph
 
 extern "C" int glm53_sinkhorn_cuda(const float*, float*, int, cudaStream_t);
 extern "C" int glm53_dsa_node_append_cuda(const long long*,const float*,const float*,float*,float*,float*,const float*,const float*,const float*,void*,const void*,long long*,int,int,float*,cudaStream_t);
-extern "C" int rs_dsa_node_append(const long long* parent_len,const float* ptk,const float* ptg,float* ctk,float* ctg,float* cpools,const float* ape,const float* krow,const float* grow,void* clatent,const void* lrow,long long* clen,int dim,int lat){
-    return glm53_dsa_node_append_cuda(parent_len,ptk,ptg,ctk,ctg,cpools,ape,krow,grow,clatent,lrow,clen,dim,lat,nullptr,at::cuda::getCurrentCUDAStream());
-}
 extern "C" int rs_dsa_node_append_row(const long long* parent_len,const float* ptk,const float* ptg,float* ctk,float* ctg,float* cpools,const float* ape,const float* krow,const float* grow,void* clatent,const void* lrow,long long* clen,int dim,int lat,float* crow){
     return glm53_dsa_node_append_cuda(parent_len,ptk,ptg,ctk,ctg,cpools,ape,krow,grow,clatent,lrow,clen,dim,lat,crow,at::cuda::getCurrentCUDAStream());
 }
@@ -79,8 +76,6 @@ extern "C" int rs_c12_gemm(const float* x,const void* m8,const void* e4,const vo
 }
 extern "C" int glm53_draft_q4_encode_cuda(const void*,int,int,int,void*,void*,cudaStream_t);
 extern "C" int rs_draft_q4_encode(const void* w,int n,int k,int mse,void* sm,void* q){return glm53_draft_q4_encode_cuda(w,n,k,mse,sm,q,at::cuda::getCurrentCUDAStream());}
-extern "C" int glm53_draft_q4_gemm_cuda(const void*,const void*,const void*,float*,int,int,int,cudaStream_t);
-extern "C" int rs_draft_q4_gemm(const void* x,const void* q,const void* sm,float* y,int m,int n,int k){return glm53_draft_q4_gemm_cuda(x,q,sm,y,m,n,k,at::cuda::getCurrentCUDAStream());}
 extern "C" int glm53_q4d_encode_cuda(const void*,int,int,int,void*,void*,double*,cudaStream_t);
 extern "C" int rs_q4d_encode(const void* w,int n,int k,int mse,void* sm,void* q,double* err){return glm53_q4d_encode_cuda(w,n,k,mse,sm,q,err,at::cuda::getCurrentCUDAStream());}
 extern "C" int glm53_q4d_gemm_cuda(const float*,const void*,const void*,int,int,void*,int,int,int,cudaStream_t);
@@ -361,31 +356,6 @@ extern "C" int rs_exl3_mgemm_probe(const void* a, void* c, void* yh,
     }
 }
 
-// Diagnostic-only launch control; requires the explicitly preloaded test interposer.
-extern "C" int rs_exl3_mgemm_launch_probe(const void* a, void* c, void* yh,
-    const void* tr, const void* sh, const void* sv, const void* sel,
-    int64_t k, int64_t ki, int64_t no, int64_t rows, int64_t cap, int fp32,
-    int grid_x, int grid_z, int force_shape, int64_t* metadata, char* name, size_t name_size) {
-    using Arm = int (*)(int, int);
-    using Finish = int (*)(int64_t*, char*, size_t);
-    auto arm = reinterpret_cast<Arm>(dlsym(RTLD_DEFAULT, "m1_launch_probe_arm"));
-    auto finish = reinterpret_cast<Finish>(dlsym(RTLD_DEFAULT, "m1_launch_probe_finish"));
-    if (!arm || !finish || arm(grid_x, grid_z) != 0) return -10;
-    int rc = 0;
-    try {
-        auto A = blob(a, {rows, 1, ki}, 0);
-        auto C = blob(c, {k, 1, no}, fp32 ? 2 : 0);
-        auto YH = blob(yh, {k, 1, ki}, 0);
-        exl3_mgemm(A, blob(tr, {cap}, 3), C, blob(sh, {cap}, 3), YH,
-            blob(sv, {cap}, 3), blob(sel, {1, k}, 3), std::nullopt,
-            4, force_shape, 1u, 0u, -1, -1, 0);
-    } catch (const std::exception& e) {
-        fprintf(stderr, "[launch-probe] mgemm: %s\n", e.what()); rc = -1;
-    }
-    int launches = finish(metadata, name, name_size);
-    if (rc != 0) return rc;
-    return launches == 1 ? 0 : -11;
-}
 
 // Load the pinned recipe artifact only when explicitly requested by the probe.
 extern "C" int glm53_dsa_node_append_chain_multi_cuda(const void*,const int*,int,const float*,int,cudaStream_t);
@@ -538,18 +508,6 @@ extern "C" int rs_side_end() {
 extern "C" int rs_side_join() {
     if (!g_side_done) return 0;
     return cudaStreamWaitEvent(at::cuda::getCurrentCUDAStream().stream(), g_side_done, 0) == cudaSuccess ? 0 : 1;
-}
-// Numbered events for cross-stream ordering (Qwen prefill overlap): record on / wait from the current stream.
-static cudaEvent_t g_slots[8] = {};
-extern "C" int rs_ev_record(int i) {
-    if (i < 0 || i >= 8) return 1;
-    if (!g_slots[i] && cudaEventCreateWithFlags(&g_slots[i], cudaEventDisableTiming) != cudaSuccess) return 2;
-    return cudaEventRecord(g_slots[i], at::cuda::getCurrentCUDAStream().stream()) == cudaSuccess ? 0 : 3;
-}
-extern "C" int rs_ev_wait(int i) {
-    if (i < 0 || i >= 8) return 1;
-    if (!g_slots[i]) return 0;
-    return cudaStreamWaitEvent(at::cuda::getCurrentCUDAStream().stream(), g_slots[i], 0) == cudaSuccess ? 0 : 3;
 }
 // Wait for the current stream only (cudaDeviceSynchronize would also wait for the side stream).
 extern "C" int rs_stream_sync() { return cudaStreamSynchronize(at::cuda::getCurrentCUDAStream().stream()) == cudaSuccess ? 0 : 1; }
@@ -1065,10 +1023,6 @@ extern "C" int rs_exl3_inner_k(const void* tr_p,void* inner_p,int64_t k,int64_t 
     try{reconstruct(blob(inner_p,{k,n},0),blob(tr_p,{k/16,n/16,16*bits},1),bits,true,false);return 0;}
     catch(const std::exception& e){fprintf(stderr,"[exl3-inner] %s\n",e.what());return -1;}
 }
-extern "C" int rs_exl3_inner(const void* tr_p,void* inner_p,int64_t k,int64_t n){
-    try{reconstruct(blob(inner_p,{k,n},0),blob(tr_p,{k/16,n/16,64},1),4,true,false);return 0;}
-    catch(const std::exception& e){fprintf(stderr,"[exl3-inner] %s\n",e.what());return -1;}
-}
 // Prefill tier: transiently reconstruct one expert projection; never expand
 // the resident model or keep reconstructed weights across layers/requests.
 extern "C" int rs_exl3_recon_gemm(const void* x_p,void* y_p,const void* tr_p,const void* sh_p,const void* sv_p,
@@ -1113,14 +1067,6 @@ extern "C" int glm53_bf16w_rows_cuda(const float*,int,const void*,float*,int,int
 extern "C" int rs_bf16w_rows(const float* x,int ldx,const void* w,float* y,int m,int n,int k){return glm53_bf16w_rows_cuda(x,ldx,w,y,m,n,k,at::cuda::getCurrentCUDAStream());}
 extern "C" int glm53_mla_commit_many_cuda(const void*,int,cudaStream_t);
 extern "C" int rs_mla_commit_many(const void* entries,int n){return glm53_mla_commit_many_cuda(entries,n,at::cuda::getCurrentCUDAStream());}
-extern "C" int glm53_grouped_reduce_add_cuda(const void*,const void*,const float*,float*,int,cudaStream_t);
-extern "C" int rs_grouped_reduce_add(const void* x,const void* w,const float* add,float* y,int rows){
-    return glm53_grouped_reduce_add_cuda(x,w,add,y,rows,at::cuda::getCurrentCUDAStream());
-}
-extern "C" int glm53_route_group_cuda(const long long*,int,int,int,int,long long*,int*,int*,cudaStream_t);
-extern "C" int rs_route_group(const int64_t* ids,int R,int n_exp,int tile,int S,int64_t* rows64,int* rows32,int* error){
-    return glm53_route_group_cuda(reinterpret_cast<const long long*>(ids),R,n_exp,tile,S,reinterpret_cast<long long*>(rows64),rows32,error,at::cuda::getCurrentCUDAStream());
-}
 extern "C" int glm53_grouped_reduce_cuda(const void*,const void*,float*,int,cudaStream_t);
 extern "C" int rs_grouped_reduce(const void* x,const void* w,float* y,int rows){
     return glm53_grouped_reduce_cuda(x,w,y,rows,at::cuda::getCurrentCUDAStream());

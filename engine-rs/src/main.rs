@@ -288,7 +288,7 @@ fn census(dir: &Path) {
 
 fn exl3_hash(dir: &Path, prefix: &str, par: bool) {
     use sha2::{Digest, Sha256};
-    let mut idx = safetensors::ShardIndex::scan(dir).expect("scan");
+    let idx = safetensors::ShardIndex::scan(dir).expect("scan");
     let trellis = idx.get_i16(&format!("{prefix}.trellis")).expect("trellis");
     let shape = idx.entries[&format!("{prefix}.trellis")].shape.clone();
     assert!(shape.len() == 3 && shape[2] == 64, "trellis 形状 {:?}", shape);
@@ -322,7 +322,7 @@ fn hex(b: &[u8]) -> String {
 
 fn bench_decode(dir: &Path) {
     let t0 = std::time::Instant::now();
-    let mut idx = safetensors::ShardIndex::scan(dir).expect("scan");
+    let idx = safetensors::ShardIndex::scan(dir).expect("scan");
     println!("scan: {:.1}s ({} 张量)", t0.elapsed().as_secs_f32(), idx.entries.len());
     let f = exl3::mcg_table();
     for (name, par) in [("par", true), ("serial", false)] {
@@ -432,7 +432,7 @@ fn parity(model_dir: &Path, bin_path: &str, n: usize) {
         } else {
             let mm = layer.moe.as_ref().unwrap();
             let (topi, wts) = moe::route(&z2, &mm.w_gate, &mm.bias, 8);
-            let mut y = Tensor::zeros([z2.size()[0], z2.size()[1]], (Kind::Float, z2.device()));
+            let y = Tensor::zeros([z2.size()[0], z2.size()[1]], (Kind::Float, z2.device()));
             for t in 0..z2.size()[0] {
                 for ki in 0..topi.size()[1] {
                     let e = topi.get(t).get(ki).int64_value(&[]) as usize;
@@ -572,7 +572,7 @@ fn kda_probe(model_dir: &Path, bin_path: &str) {
 fn shim_smoke(model_dir: &Path) {
     use tch::{Device, Kind, Tensor};
     let dev = Device::cuda_if_available();
-    let mut idx = safetensors::ShardIndex::scan(model_dir).expect("scan");
+    let idx = safetensors::ShardIndex::scan(model_dir).expect("scan");
     let p = "model.language_model.layers.4.mlp.experts.0.gate_proj";
     let (suh, _) = idx.get_f32(&format!("{p}.suh")).expect("suh");
     let (svh, _) = idx.get_f32(&format!("{p}.svh")).expect("svh");
@@ -624,7 +624,7 @@ fn greedy(model_dir: &Path, ids_str: &str, max_new: usize) {
     let t0 = std::time::Instant::now();
     let w = weights::ModelWeights::load(model_dir, &cfg, cfg.num_hidden_layers, dev);
     println!("[greedy] 权重就绪 {:.1}s", t0.elapsed().as_secs_f32());
-    let mut pool = moe::ExpertPool::new(model_dir, 384);
+    let pool = moe::ExpertPool::new(model_dir, 384);
     let native = moe::NativeExpertPool::new(model_dir, 2048); // greedy 无 fast,native 是主路径
     let mut eng = forward::Engine { w, pool, native: Some(native), fast: None };
     let ids: Vec<i64> = ids_str.split(',').map(|s| s.trim().parse().expect("id")).collect();
@@ -717,7 +717,7 @@ fn bench_step(model_dir: &Path, n: usize) {
 /// ② 快照回滚:prefill → 快照 → 3 步 → 恢复 → 同 3 步,输出逐位一致
 /// 用 4 层(含 KDA×3 + DSA×1 + MoE),小规模快验证。
 fn state_eq(model_dir: &Path) {
-    use tch::{Device, Kind, Tensor};
+    use tch::{Device, Tensor};
     let dev = Device::cuda_if_available();
     let cfg = config::load(&model_dir.join("config.json")).expect("config");
     let n_layers = 4usize;

@@ -187,14 +187,11 @@ pub fn combined(dir:&Path,suite_file:&Path,output:&Path) {
     let tp=crate::tp::init_from_env();assert_eq!(tp.world,2);
     assert!(crate::tp::dense_enabled(),"combined qualification requires dense TP2");
     tch::set_num_threads(4);let _guard=tch::no_grad_guard();
-    let suite:serde_json::Value=serde_json::from_str(&std::fs::read_to_string(suite_file).unwrap()).unwrap();
-    let eos=ints(&suite["eos_token_ids"]);let cases=suite["cases"].as_array().unwrap();
     std::env::set_var("GLM53_MLA_LATENT","1");
     let cfg=crate::config::load(&dir.join("config.json")).unwrap();let dev=Device::Cuda(0);
     let w=crate::weights::ModelWeights::load(dir,&cfg,cfg.num_hidden_layers,dev);
-    let layers:Vec<_>=w.layers.iter().enumerate().filter_map(|(i,l)|l.moe.as_ref().map(|_|i)).collect();
     let mut fast=crate::moefast::MoeFast::new(dir,cfg.num_hidden_layers,cfg.n_routed_experts,cfg.num_hidden_layers*cfg.n_routed_experts+16,dev);
-    fast.preload_all(cfg.num_hidden_layers,cfg.n_routed_experts,dev);fast.assume_hot=true;let misses=fast.misses;
+    fast.preload_all(cfg.num_hidden_layers,cfg.n_routed_experts,dev);fast.assume_hot=true;
     let mut eng=Engine{w,fast:Some(fast),native:None,pool:crate::moe::ExpertPool::new(dir,4)};
     combined_check(&mut eng,suite_file,output);
 }

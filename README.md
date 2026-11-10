@@ -49,6 +49,34 @@ clock sampled every second, no throttling recorded); GLM's column is older (DGX 
 "Prose" = a long explanation (lower draft acceptance); "structured" = counting 1–200 (high acceptance). Decode speed depends on the text
 because of speculation.
 
+### DeepSeek-V4.1-Flash on v0.3.12 (2026-11-10)
+
+Release measurement of v0.3.12 on 2026-11-10: three DGX Sparks (TP3, the [test system](#test-system-and-gpu-clock) below,
+default GPU clocks), DeepSeek-V4.1-Flash-1017, default settings plus the optional conditional clamp (`DS41_ABLATE_CLAMP`)
+as in the other DeepSeek measurements of this README, greedy, thinking off. Decode:
+`bench/ds41_decode_bench.py --types prose,structured,code --conc 1,2,4 --max-tokens 400` (32-token warm-up, streamed;
+aggregate = all streams' tokens over the window from the first token of the earliest stream to the last token of the
+latest), **one run per cell** — a different script, prompt set and sample count from the median-of-5 table above, so
+compare like with like. Prefill: `bench/ds41_prefill_bench.py 5 8k,32k` (streamed, rate = prompt tokens / TTFT, each
+sample a unique prefix so the prefix cache cannot help, median of 5); cold = page caches dropped on all three nodes and
+the service restarted, every sample new text; warm = the same text repeated.
+
+| Decode, aggregate tok/s | Prose | Structured | Code |
+| --- | --- | --- | --- |
+| 1 stream | 69.3 | 127.1 | 112.3 |
+| 2 streams | 97.7 | 180.0 | 150.4 |
+| 4 streams | 129.4 | 219.4 | 176.5 |
+
+| Prefill, tok/s | 8K | 32K |
+| --- | --- | --- |
+| Cold | 5,400 | 5,677 |
+| Warm | 5,432 | 5,505 |
+
+Optional, off by default: `DS41_GEMV32=1 DS41_HC32=1` keeps verify rounds of 17–32 rows on the small-row kernels. Same
+build, switches on vs. off, 4 runs per arm: 4 streams code 164.1 → 189.2 tok/s, structured 220.3 → 235.9 tok/s; 1 and
+2 streams unchanged. With several streams the outputs differ from the default path's; single-stream outputs are
+identical. Details: [docs/release-notes.md](docs/release-notes.md), [docs/ds41.md](docs/ds41.md#5-settings).
+
 ### Quantization & runtime precision
 
 | Component | GLM-5.3-Flash | DeepSeek-V4.1-Flash | Qwen3.8-Flash-Next |

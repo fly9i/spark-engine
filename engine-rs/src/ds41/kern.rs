@@ -452,7 +452,7 @@ pub fn sparse_attn_multi_dev(q: &Tensor, seqs: &[(&Tensor, &Tensor, Option<&Tens
         out.data_ptr(), h as i32, scale as f32, ws.data_ptr(), md, &mut fused, rs_current_stream()) }, 0, "ds41_sparse_attn_multi_dev");
     fused != 0
 }
-/// win_commit of every row into its own sequence's ring: rings = device array of t ring pointers (rewritten per replay).
+// win_commit of every row into its own sequence's ring: rings = device array of t ring pointers (rewritten per replay).
 extern "C" {
     fn ds41_ring_save(rings: *const *mut std::ffi::c_void, l: i32, out: *mut std::ffi::c_void, pos0: i64, n: i32, w: i32, row_bytes: i64, st: *mut std::ffi::c_void) -> i32;
     fn ds41_ring_restore(rings: *const *mut std::ffi::c_void, l: i32, saved: *const std::ffi::c_void, pos0: i64, n: i32, j0: i32, w: i32, row_bytes: i64, st: *mut std::ffi::c_void) -> i32;
@@ -808,13 +808,42 @@ thread_local! {
     /// experts, running beside the branch) could take their blocks while the branch's GEMVs still use them.
     static SIDE_HOLD: std::cell::RefCell<Option<Vec<Tensor>>> = const { std::cell::RefCell::new(None) };
 }
+/// DS41_GEMV32=1 (default off): inside a decode / verify forward (Model::rows_graph, `WideScope`), 17..32 rows keep the
+/// <= 16-row kernels instead of the prefill-sized paths: the MX GEMV (two m16 tiles, one weight pass), the C12 GEMV
+/// (head / router chunks of 32 rows), the mHC mix jobs (with DS41_HC32) and the shared expert's parallel branch. Every
+/// row's result is the one it gets in a <= 16-row call (ds41-kernel-test DS41_KT_ONLY=w32).
+pub fn gemv32_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_GEMV32").is_ok_and(|v| v == "1")) }
+/// DS41_HC32=1 (default off): mHC mixes of 17..32 rows on the 160-slice path (shim/ds41_hc.cu hc_narrow), as jobs of
+/// the next MX GEMVs when those take 17..32 rows too (DS41_GEMV32), else as their own kernels.
+pub fn hc32_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_HC32").is_ok_and(|v| v == "1")) }
+thread_local! { static WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// Marks a decode / verify forward for DS41_GEMV32 while alive.
+pub struct WideScope(bool);
+extern "C" { fn ds41_hc_narrow_max(v: i32); }
+impl WideScope {
+    pub fn new() -> WideScope {
+        if hc32_on() { unsafe { ds41_hc_narrow_max(32) }; }
+        WideScope(WIDE.with(|w| w.replace(true)))
+    }
+}
+impl Drop for WideScope {
+    fn drop(&mut self) {
+        WIDE.with(|w| w.set(self.0));
+        if hc32_on() && !self.0 { unsafe { ds41_hc_narrow_max(16) }; }
+    }
+}
+/// Rows the few-row GEMVs take in one call here: 32 inside a WideScope with DS41_GEMV32, else 16.
+/// (Not with DS41_GEMV_PREQ_ROWS above 17, a diagnostic setting: 17..32 rows need the pre-quantized input, the kernel
+/// entry refuses them otherwise.)
+pub fn few_rows() -> i64 { if gemv32_on() && gemv_preq_rows() <= 17 && WIDE.with(|w| w.get()) { 32 } else { 16 } }
 /// `hc_mix` of a few rows (1..16, the 160-slice path) as side jobs of the next two MX GEMVs on this stream: the partial
 /// sums in the first one's grid, the finalize in the second's (shim/ds41_hc_job.cuh; the same operations as hc_mix's
 /// kernels, so the same bits). The caller makes sure those two GEMVs come next and that nothing reads the results
 /// before the second. None (nothing queued) when the shape does not take that path.
 pub fn hc_mix_jobs(h: &Tensor, f: &Tensor, scale: &Tensor, base: &Tensor, norm_eps: f64, eps: f64, iters: i64) -> Option<(Tensor, Tensor, Tensor)> {
     let (t, d) = (h.size()[0], h.size()[2]);
-    if !(1..=16).contains(&t) || unsafe { ds41_hc_slices(t as i32, d as i32) } != 160 { return None; }
+    let lim = if hc32_on() { few_rows() } else { 16 };
+    if t < 1 || t > lim || unsafe { ds41_hc_slices(t as i32, d as i32) } != 160 { return None; }
     let h = h.to_kind(Kind::BFloat16).contiguous();
     let o = (Kind::Float, h.device());
     let (pre, post, comb) = (Tensor::empty([t, 4], o), Tensor::empty([t, 4], o), Tensor::empty([t, 4, 4], o));
@@ -916,6 +945,26 @@ pub fn fp8_gemm_mx_grouped_bf16(x: &Tensor, w: &Tensor, ws: &Tensor, n: i64, gro
     y
 }
 
+/// DS41_MOE_STATS=1 (diagnostics, default off): eager routed-expert calls count their rows and distinct experts (a
+/// device sync each); `take_moe_stats` reports and resets them (serve's DS41_PROFILE line).
+static MOE_STATS: std::sync::Mutex<(u64, u64, u64, u64)> = std::sync::Mutex::new((0, 0, 0, 0));   // calls, rows, distinct experts, their weight bytes
+fn moe_stat(idx: &Tensor, w: &[&Tensor; 6]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("DS41_MOE_STATS").is_ok_and(|v| v == "1")) || crate::tp::graph::capturing() { return; }
+    let e = w[0].size()[0].max(1);
+    let per: i64 = w.iter().map(|t| (t.numel() * t.kind().elt_size_in_bytes()) as i64).sum::<i64>() / e;
+    let d = idx.flatten(0, -1).unique_dim(0, true, false, false).0.size()[0];
+    let mut s = MOE_STATS.lock().unwrap();
+    s.0 += 1; s.1 += idx.size()[0] as u64; s.2 += d as u64; s.3 += (d * per) as u64;
+}
+pub fn take_moe_stats() -> Option<String> {
+    let mut s = MOE_STATS.lock().unwrap();
+    if s.0 == 0 { return None; }
+    let r = format!("routed-expert calls {}, rows {}, distinct experts {} (mean {:.1} per call), their weights {:.2} GB", s.0, s.1, s.2, s.2 as f64 / s.0 as f64, s.3 as f64 / 1e9);
+    *s = (0, 0, 0, 0);
+    Some(r)
+}
+
 /// Routed experts on the block-scaled tensor-core MMA (shim/ds41_mx.cu): x BF16 [R, 5120] (quantized inside, like the
 /// official act_quant), weights in the mx layout; otherwise the contract of `moe`.
 pub fn moe_mx(x: &Tensor, idx: &Tensor, rw: &Tensor, w: [&Tensor; 6], add: Option<&Tensor>) -> Tensor {
@@ -927,6 +976,7 @@ pub fn moe_mx_q(xq: &Tensor, xs: &Tensor, idx: &Tensor, rw: &Tensor, w: [&Tensor
     let r = xq.size()[0];
     let (topk, e) = (idx.size()[1], w[0].size()[0]);
     let i = w[0].size()[1];
+    moe_stat(idx, &w);
     let (xq, xs) = (xq.contiguous(), xs.contiguous());
     let idx = idx.to_kind(Kind::Int64).contiguous();
     let rw = rw.to_kind(Kind::Float).contiguous();
@@ -951,6 +1001,7 @@ pub fn moe_mx_q_rows(xq: &Tensor, xs: &Tensor, idx: &Tensor, rw: &Tensor, w: [&T
     let (topk, e) = (idx.size()[1], w[0].size()[0]);
     let i = w[0].size()[1];
     if unsafe { ds41_moe_mx_col_passes(r as i32, topk as i32, e as i32) } != 1 { return None; }
+    moe_stat(idx, &w);
     let (xq, xs) = (xq.contiguous(), xs.contiguous());
     let idx = idx.to_kind(Kind::Int64).contiguous();
     let rw = rw.to_kind(Kind::Float).contiguous();
@@ -1360,7 +1411,6 @@ pub fn gemv_bench() {
     let idx = Tensor::from_slice(&[3i64, 77, 150, 201, 299, 380]).view([1, 6]).to_device(dev);
     let rw = Tensor::full([1, 6], 0.2, (Kind::Float, dev));
     let wx: Vec<Tensor> = ws.iter().enumerate().map(|(i, t)| if i % 2 == 0 { moe_pack_mx(t) } else { t.shallow_clone() }).collect();
-    let wxr = [&wx[0], &wx[1], &wx[2], &wx[3], &wx[4], &wx[5]];
     let x1 = Tensor::randn([1, 5120], (Kind::Float, dev)).to_kind(Kind::BFloat16);
     // fresh experts every call (as in decode), and DS41_BENCH_LAYERS copies of the layer's experts in turn (the
     // model's ~40 layers spread the expert reads over ~90 GB: TLB reach)
@@ -1406,6 +1456,82 @@ fn mx_table(dev: tch::Device) {
         set_gemv_preq_rows(-1);
         eprintln!("{line}");
     }
+}
+
+/// ds41-kernel-test (DS41_KT_ONLY=w32; run with DS41_GEMV32=1 DS41_HC32=1): rows of a 17..32-row call on the paths
+/// those switches open are bitwise the same rows computed by the <= 16-row path: MX GEMV (every decode shape, FP32 and
+/// BF16 out) against 16-row chunks and against single rows, the C12 GEMV (head slice, router) against 16-row chunks, the
+/// 160-slice mHC mix (standalone and as GEMV jobs) against 16-row chunks; plus times.
+fn w32_test(ck: &super::load::Checkpoint, dev: tch::Device) {
+    assert!(gemv32_on() && hc32_on(), "w32 test: set DS41_GEMV32=1 DS41_HC32=1");
+    let _w = WideScope::new();
+    assert_eq!(few_rows(), 32);
+    let time = |f: &dyn Fn() -> Tensor| { for _ in 0..3 { let _ = f(); } tch::Cuda::synchronize(0);
+        let t = std::time::Instant::now(); for _ in 0..20 { let _ = f(); } tch::Cuda::synchronize(0); t.elapsed().as_secs_f64() * 1e6 / 20.0 };
+    let chunks = |x: &Tensor, f: &dyn Fn(&Tensor) -> Tensor| -> Tensor {
+        let m = x.size()[0];
+        Tensor::cat(&(0..m).step_by(16).map(|r| f(&x.narrow(0, r, 16.min(m - r)))).collect::<Vec<_>>(), 0)
+    };
+    let mut bad = 0;
+    for (name, n, k) in [("qakv/3", 608i64, 5120i64), ("wq_b", 12288, 1280), ("wo_b", 5120, 3072), ("sh w13", 1536, 5120), ("sh w2", 5120, 768), ("idx wq_b", 4096, 1280)] {
+        let q = (Tensor::randn([n, k], (Kind::Float, dev)) * 0.05).to_kind(Kind::Float8e4m3fn).view_dtype(Kind::Uint8);
+        let sc = Tensor::randint_low(118, 126, [n / 32, k / 32], (Kind::Uint8, dev));
+        let mut line = format!("[ds41-kernel-test] w32 MX GEMV {name} [{n}x{k}]:");
+        for m in [17i64, 20, 24, 28, 32] {
+            let x = (Tensor::randn([m, k], (Kind::Float, dev)) * 2.0).to_kind(Kind::BFloat16);
+            let (a32, b32) = (fp8_gemv_mx(&x, &q, &sc), fp8_gemv_mx_bf16(&x, &q, &sc));
+            let (a16, b16) = (chunks(&x, &|t| fp8_gemv_mx(t, &q, &sc)), chunks(&x, &|t| fp8_gemv_mx_bf16(t, &q, &sc)));
+            let a1 = Tensor::cat(&(0..m).map(|r| fp8_gemv_mx(&x.narrow(0, r, 1), &q, &sc)).collect::<Vec<_>>(), 0);
+            let same = a32.equal(&a16) && b32.equal(&b16) && a32.equal(&a1);
+            if !same { bad += 1; }
+            let (u32_, u16_) = (time(&|| fp8_gemv_mx_bf16(&x, &q, &sc)), time(&|| chunks(&x, &|t| fp8_gemv_mx_bf16(t, &q, &sc))));
+            line += &format!(" m={m} one call {u32_:.1} us / 16-row chunks {u16_:.1} us{};", if same { " bitwise" } else { " DIFFERENT" });
+        }
+        eprintln!("{line}");
+    }
+    let wr = ck.get("layers.10.ffn.gate.weight", Kind::BFloat16).contiguous();
+    for (name, ww) in [("head", ck.get("head.weight", Kind::BFloat16).narrow(0, 0, 43136).contiguous()), ("router", wr)] {
+        assert!(c12_register(&ww) > 0, "c12_register {name}");
+        let mut line = format!("[ds41-kernel-test] w32 C12 GEMV {name}:");
+        for m in [17i64, 20, 24, 28, 32] {
+            let x = (Tensor::randn([m, 5120], (Kind::Float, dev)) * 2.0).to_kind(Kind::BFloat16);
+            let one = bf16_gemv(&x, &ww);
+            let two = chunks(&x, &|t| bf16_gemv(t, &ww));
+            let same = one.equal(&two);
+            if !same { bad += 1; }
+            let (u1, u2) = (time(&|| bf16_gemv(&x, &ww)), time(&|| chunks(&x, &|t| bf16_gemv(t, &ww))));
+            line += &format!(" m={m} {u1:.1} / {u2:.1} us{};", if same { " bitwise" } else { " DIFFERENT" });
+        }
+        eprintln!("{line}");
+    }
+    {
+        let (k, n) = (5120i64, 1792i64);
+        let w = (Tensor::randint(0x7e, [n, k], (Kind::Int64, dev)) + Tensor::randint(2, [n, k], (Kind::Int64, dev)) * 128).to_kind(Kind::Uint8);
+        let ws = (Tensor::randint(6, [n / 32, k / 32], (Kind::Int64, dev)) + 124).to_kind(Kind::Uint8);
+        let mut line = "[ds41-kernel-test] w32 mHC mix:".to_string();
+        for t in [17i64, 20, 24, 28, 32] {
+            let h = (Tensor::randn([t, 4, 5120], (Kind::Float, dev)) * 2.0).to_kind(Kind::BFloat16);
+            let f = Tensor::randn([24, 4 * 5120], (Kind::Float, dev)) * 0.01;
+            let (scl, bs) = (Tensor::randn([3], (Kind::Float, dev)), Tensor::randn([24], (Kind::Float, dev)));
+            let x = Tensor::randn([t, k], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+            // reference: the 16-row path (160 slices; the jobs path is bitwise it for 1..16 rows) on row chunks
+            let parts: Vec<_> = (0..t).step_by(16).map(|r| hc_mix(&h.narrow(0, r, 16.min(t - r)), &f, &scl, &bs, 1e-6, 1e-6, 20)).collect();
+            let cat = |i: usize| Tensor::cat(&parts.iter().map(|p| match i { 0 => p.0.shallow_clone(), 1 => p.1.shallow_clone(), _ => p.2.shallow_clone() }).collect::<Vec<_>>(), 0);
+            let r = (cat(0), cat(1), cat(2));
+            let a = hc_mix(&h, &f, &scl, &bs, 1e-6, 1e-6, 20);
+            let (y1, y2) = (fp8_gemv_mx(&x, &w, &ws), fp8_gemv_mx_bf16(&x, &w, &ws));
+            let j = hc_mix_jobs(&h, &f, &scl, &bs, 1e-6, 1e-6, 20).expect("hc_mix_jobs path at 17..32 rows");
+            let (z1, z2) = (fp8_gemv_mx(&x, &w, &ws), fp8_gemv_mx_bf16(&x, &w, &ws));
+            assert!(hc_jobs_done());
+            let same = r.0.equal(&a.0) && r.1.equal(&a.1) && r.2.equal(&a.2) && r.0.equal(&j.0) && r.1.equal(&j.1) && r.2.equal(&j.2) && y1.equal(&z1) && y2.equal(&z2);
+            if !same { bad += 1; }
+            let us = time(&|| hc_mix(&h, &f, &scl, &bs, 1e-6, 1e-6, 20).0);
+            line += &format!(" t={t} standalone {us:.1} us{};", if same { " bitwise (standalone, jobs, GEMVs)" } else { " DIFFERENT" });
+        }
+        eprintln!("{line}");
+    }
+    eprintln!("[ds41-kernel-test] w32: {bad} mismatching cases");
+    assert_eq!(bad, 0, "w32: a 17..32-row path differs from the <= 16-row path");
 }
 
 /// ds41-kernel-test (DS41_KT_ONLY=s2): the routed experts with 2-bit coded scales (DS41_MX_S2) against the raw scales,
@@ -1639,6 +1765,7 @@ pub fn test(ckpt: &std::path::Path) {
         }
         return;
     }
+    if std::env::var("DS41_KT_ONLY").as_deref() == Ok("w32") { w32_test(&ck, dev); return; }
     if std::env::var("DS41_KT_ONLY").as_deref() == Ok("c12") {
         // the C12 coding: 9..16 rows in one call are bitwise the 8-row calls (head slice and a router-sized weight)
         {
@@ -1652,7 +1779,7 @@ pub fn test(ckpt: &std::path::Path) {
                     let same = one.equal(&two);
                     let time = |f: &dyn Fn() -> Tensor| { for _ in 0..5 { let _ = f(); } tch::Cuda::synchronize(0);
                         let t0 = std::time::Instant::now(); for _ in 0..50 { let _ = f(); } tch::Cuda::synchronize(0); t0.elapsed().as_secs_f64() * 1e6 / 50.0 };
-                    let (u1, u2) = (time(&|| bf16_gemv(&x, &ww)), time(&|| { bf16_gemv(&x.narrow(0, 0, 8), &ww); bf16_gemv(&x.narrow(0, 8, m - 8), &ww) }));
+                    let (u1, u2) = (time(&|| bf16_gemv(&x, &ww)), time(&|| { let _ = bf16_gemv(&x.narrow(0, 0, 8), &ww); bf16_gemv(&x.narrow(0, 8, m - 8), &ww) }));
                     eprintln!("[ds41-kernel-test] c12 {name} m={m}: one call {u1:.1} us, 8 + {} rows {u2:.1} us (bitwise: {same})", m - 8);
                     assert!(same, "c12 16-row GEMV differs from the 8-row calls");
                 }

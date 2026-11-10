@@ -155,7 +155,7 @@ pub fn fast_probe(out:&std::path::Path) {
             1=>(Tensor::randn([rows,pools],(Kind::Float,dev))*3.).round(),            // heavy ties
             2=>Tensor::zeros([rows,pools],(Kind::Float,dev)),                          // all equal
             3=>Tensor::randn([rows,pools],(Kind::Float,dev)).relu()*0.01,              // many +0
-            4=>{let z=Tensor::randn([rows,pools],(Kind::Float,dev)).relu();(&z*-1.)}   // many -0 and negatives
+            4=>{let z=Tensor::randn([rows,pools],(Kind::Float,dev)).relu();&z*-1.}   // many -0 and negatives
             5=>{let z=Tensor::randn([rows,pools],(Kind::Float,dev));let m=Tensor::rand([rows,pools],(Kind::Float,dev)).lt(0.05);z.masked_fill(&m,-3.4028234663852886e38)}
             _=>{let z=Tensor::randn([rows,pools],(Kind::Float,dev));let m=Tensor::rand([rows,pools],(Kind::Float,dev)).lt(0.01);z.masked_fill(&m,f64::NAN)}
         };

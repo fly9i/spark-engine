@@ -236,7 +236,7 @@ pub fn set_fp32_accum() {
     }
 }
 
-/// 原地 allreduce(SUM),fp32/fp16;host 不阻塞(流依赖)。
+// 原地 allreduce(SUM),fp32/fp16;host 不阻塞(流依赖)。
 thread_local! {
     static AR_PREFETCH: std::cell::RefCell<Vec<(usize, i64)>> = std::cell::RefCell::new(Vec::new());
 }

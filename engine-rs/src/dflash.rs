@@ -473,8 +473,8 @@ impl Drafter {
         let cfg:serde_json::Value=serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
         assert_eq!(cfg["hidden_size"],4096);assert_eq!(cfg["num_hidden_layers"],5);
         assert_eq!(cfg["dflash_config"]["block_size"],8);assert_eq!(cfg["is_causal"],false);
-        let mut idx=crate::safetensors::ShardIndex::scan(dir).unwrap();let dev=target_head.device();
-        let mut get=|name:&str|{
+        let idx=crate::safetensors::ShardIndex::scan(dir).unwrap();let dev=target_head.device();
+        let get=|name:&str|{
             // GLM53_FAST_LOAD: a BF16 checkpoint tensor goes up as stored (BF16 -> F32 -> BF16 is the identity).
             let old=|idx:&crate::safetensors::ShardIndex|{let (v,shape)=idx.get_f32(name).unwrap_or_else(|e|panic!("DFlash {name}: {e}"));
                 Tensor::from_slice(&v).view(shape.iter().map(|&v|v as i64).collect::<Vec<_>>().as_slice()).to_kind(Kind::BFloat16).to_device(dev)};
@@ -1016,7 +1016,7 @@ impl Drafter {
 /// Local primitive gate loads only actual norm.weight, no head or TP setup.
 pub fn final_norm_select_probe(draft:&Path,out:&Path) {
     assert!(!crate::tp::is_tp());tch::set_num_threads(4);let _guard=tch::no_grad_guard();
-    let mut idx=crate::safetensors::ShardIndex::scan(draft).unwrap();let(v,shape)=idx.get_f32("norm.weight").unwrap();
+    let idx=crate::safetensors::ShardIndex::scan(draft).unwrap();let(v,shape)=idx.get_f32("norm.weight").unwrap();
     assert_eq!(shape,vec![4096]);let w=Norm::new(Tensor::from_slice(&v).to_kind(Kind::BFloat16).to_device(Device::Cuda(0)));
     crate::draft_final_norm::norm_check(|sum|norm(sum,&w),Device::Cuda(0),out);
 }
@@ -1054,7 +1054,7 @@ pub fn opt_probe(target:&Path,draft:&Path,out:&Path) {
     std::env::remove_var("GLM53_DRAFT_MLP_SHARD_LOAD");std::env::set_var("GLM53_DRAFT_MLP_TP","0");std::env::set_var("GLM53_DRAFT_TOPK_TP","0");
     let drafter=Drafter::load_target(draft,&target);tch::manual_seed(20260924);
     let hidden=Tensor::randn([7,4096],(Kind::BFloat16,dev));
-    let mut input=hidden.copy();let mut head_cases=Vec::new();
+    let input=hidden.copy();let mut head_cases=Vec::new();
     for n in [1,3,7] {
         let input=input.narrow(0,0,n);
         std::env::set_var("GLM53_DRAFT_HEAD_TP","0");let reference=drafter.logits(&input);

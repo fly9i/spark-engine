@@ -1,6 +1,6 @@
 //! Full-model chunk/prefix/capacity/long-context replay acceptance.
 use std::{path::Path,time::Instant};
-use tch::{Tensor,Kind,Device};
+use tch::{Tensor,Device};
 use serde_json::json;
 use crate::forward::{Engine,snapshot,states_max_diff,restore};
 

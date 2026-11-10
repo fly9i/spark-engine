@@ -9,9 +9,6 @@ pub trait Target {
 }
 pub struct Verified<S,A> {pub tokens:Vec<i64>,pub state:S,pub next:i64,pub aux:Vec<A>,pub evaluated:usize}
 
-pub fn verify<T:Target>(target:&mut T,base:&T::State,next:i64,nodes:&[Node],budget:usize)->Verified<T::State,T::Aux> {
-    verify_until(target,base,next,nodes,budget,&[])
-}
 pub fn verify_until<T:Target>(target:&mut T,base:&T::State,next:i64,nodes:&[Node],budget:usize,stop:&[i64])->Verified<T::State,T::Aux> {
     // Validate topology before executing any target work.
     let mut depths=Vec::new();

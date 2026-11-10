@@ -943,7 +943,9 @@ __global__ __launch_bounds__(256, 1) void down_gemm(const uint8_t* __restrict__ 
 // S > 1 (few weight rows: too few warps to stream at full bandwidth): the block's 8 warps take 8 / S row tiles, the S
 // warps of a tile each a contiguous 1 / S of the K spans, summed in shared memory in slice order (deterministic; S
 // depends on the shape only, so a row's result does not depend on m).
-template <int U, int S>
+// MT m16 tiles (DS41_GEMV32: MT = 2 for 17..32 rows): the weight fragment of a span feeds one MMA per tile; tile t's
+// rows 16 t + r get exactly the MMA / slice / reduction sequence that row r gets with MT = 1 (bitwise a <= 16-row call).
+template <int U, int S, int MT = 1>
 // aq null: x BF16 [m, k] is act-quantized by the CTA into shared memory first (one warp per 32-block, the same scale
 // and bytes as act_quant_fp8_kernel; dynamic shared memory m k + m k / 32 bytes), so no separate quantization kernel;
 // else aq / as_ are the quantized input in global memory. ob16: y is BF16 (rounded sums).
@@ -960,7 +962,9 @@ __global__ __launch_bounds__(256) void fp8_gemv_mx(const __nv_bfloat16* __restri
   const int n0 = (bx * (8 / S) + wid / S) * 8;
   const int kb = k / 32;
   const int ns = kb / 2, s_lo = slice * ns / S, s_hi = (slice + 1) * ns / S;
-  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  float acc[MT][4];
+#pragma unroll
+  for (int t = 0; t < MT; ++t) { acc[t][0] = 0.f; acc[t][1] = 0.f; acc[t][2] = 0.f; acc[t][3] = 0.f; }
   const int row = min(n0 + g, n - 1);
   const uint8_t* wr = w + (long long)row * k + 16 * q;
   const uint8_t* wsr = ws + (long long)(min(n0, n - 8) >> 5) * kb;
@@ -1006,26 +1010,33 @@ __global__ __launch_bounds__(256) void fp8_gemv_mx(const __nv_bfloat16* __restri
     aq = qs; as_ = ss;
   }
   if (n0 < n) {
-    const int r0 = g, r1 = g + 8, rs = (lane >> 2) + 8 * (lane & 1);
-    const uint8_t* a0p = aq + (long long)(r0 < m ? r0 : 0) * k + 8 * q;
-    const uint8_t* a1p = aq + (long long)(r1 < m ? r1 : 0) * k + 8 * q;
-    const bool z0 = r0 >= m, z1 = r1 >= m;
-    const uint8_t* asp = as_ + (long long)(rs < m ? rs : 0) * kb;
+    const uint8_t* a0p[MT]; const uint8_t* a1p[MT]; const uint8_t* asp[MT]; bool z0[MT], z1[MT];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+      const int r0 = g + 16 * t, r1 = g + 8 + 16 * t, rs = (lane >> 2) + 8 * (lane & 1) + 16 * t;
+      a0p[t] = aq + (long long)(r0 < m ? r0 : 0) * k + 8 * q;
+      a1p[t] = aq + (long long)(r1 < m ? r1 : 0) * k + 8 * q;
+      z0[t] = r0 >= m; z1[t] = r1 >= m;
+      asp[t] = as_ + (long long)(rs < m ? rs : 0) * kb;
+    }
     // per 64-byte span: lane holds bytes [16 q, 16 q + 16); block c (0, 1) of the span needs, at lane q, bytes
     // [8 q, 8 q + 8) of the block = span bytes [32 c + 8 q, +8): held by lane 2 c + (q >> 1), half q & 1
     const int src_hi = q >> 1;                                  // which lane of the block's pair holds my bytes
     const int half = q & 1;
     for (int sp0 = s_lo; sp0 < s_hi; sp0 += U) {
-      uint2 x0[U][2], x1[U][2]; uint32_t sa[U][2];
+      uint2 x0[MT][U][2], x1[MT][U][2]; uint32_t sa[MT][U][2];
   #pragma unroll
       for (int u = 0; u < U; ++u) {
         const int sp = sp0 + u;
         if (sp < s_hi) {
           for (int c = 0; c < 2; ++c) {
             const int b = 2 * sp + c;
-            x0[u][c] = z0 ? make_uint2(0, 0) : *reinterpret_cast<const uint2*>(a0p + b * 32);
-            x1[u][c] = z1 ? make_uint2(0, 0) : *reinterpret_cast<const uint2*>(a1p + b * 32);
-            sa[u][c] = asp[b];
+  #pragma unroll
+            for (int t = 0; t < MT; ++t) {
+              x0[t][u][c] = z0[t] ? make_uint2(0, 0) : *reinterpret_cast<const uint2*>(a0p[t] + b * 32);
+              x1[t][u][c] = z1[t] ? make_uint2(0, 0) : *reinterpret_cast<const uint2*>(a1p[t] + b * 32);
+              sa[t][u][c] = asp[t][b];
+            }
           }
         }
       }
@@ -1042,11 +1053,15 @@ __global__ __launch_bounds__(256) void fp8_gemv_mx(const __nv_bfloat16* __restri
           const uint32_t vx = __shfl_sync(0xffffffffu, wv[u].x, src), vy = __shfl_sync(0xffffffffu, wv[u].y, src);
           const uint32_t vz = __shfl_sync(0xffffffffu, wv[u].z, src), vw = __shfl_sync(0xffffffffu, wv[u].w, src);
           const uint32_t lo = half ? vz : vx, hi = half ? vw : vy;
-          uint32_t a0, a1, a2, a3, bb0, bb1;
-          a_split(x0[u][c], a0, a2);
-          a_split(x1[u][c], a1, a3);
+          uint32_t bb0, bb1;
           a_split(make_uint2(lo, hi), bb0, bb1);
-          mma_e4(acc, a0, a1, a2, a3, bb0, bb1, sa[u][c], sb[u][c]);
+  #pragma unroll
+          for (int t = 0; t < MT; ++t) {
+            uint32_t a0, a1, a2, a3;
+            a_split(x0[t][u][c], a0, a2);
+            a_split(x1[t][u][c], a1, a3);
+            mma_e4(acc[t], a0, a1, a2, a3, bb0, bb1, sa[t][u][c], sb[u][c]);
+          }
         }
       }
 #pragma unroll
@@ -1054,26 +1069,32 @@ __global__ __launch_bounds__(256) void fp8_gemv_mx(const __nv_bfloat16* __restri
     }
   }
   if (S > 1) {
-    __shared__ float4 red[8][32];
-    red[wid][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    __shared__ float4 red[MT][8][32];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) red[t][wid][lane] = make_float4(acc[t][0], acc[t][1], acc[t][2], acc[t][3]);
     __syncthreads();
     if (slice) return;
-    for (int j = 1; j < S; ++j) {
-      const float4 o = red[wid + j][lane];
-      acc[0] += o.x; acc[1] += o.y; acc[2] += o.z; acc[3] += o.w;
-    }
+#pragma unroll
+    for (int t = 0; t < MT; ++t)
+      for (int j = 1; j < S; ++j) {
+        const float4 o = red[t][wid + j][lane];
+        acc[t][0] += o.x; acc[t][1] += o.y; acc[t][2] += o.z; acc[t][3] += o.w;
+      }
   }
   if (n0 >= n) return;
-  const int r0 = g, r1 = g + 8;
   const int c = n0 + 2 * q;
   if (c < n) {
-    if (ob16) {
-      __nv_bfloat16* yb = reinterpret_cast<__nv_bfloat16*>(yv);
-      if (r0 < m) *reinterpret_cast<__nv_bfloat162*>(yb + (long long)r0 * n + c) = __floats2bfloat162_rn(acc[0], acc[1]);
-      if (r1 < m) *reinterpret_cast<__nv_bfloat162*>(yb + (long long)r1 * n + c) = __floats2bfloat162_rn(acc[2], acc[3]);
-    } else {
-      if (r0 < m) *reinterpret_cast<float2*>(y + (long long)r0 * n + c) = make_float2(acc[0], acc[1]);
-      if (r1 < m) *reinterpret_cast<float2*>(y + (long long)r1 * n + c) = make_float2(acc[2], acc[3]);
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+      const int r0 = g + 16 * t, r1 = g + 8 + 16 * t;
+      if (ob16) {
+        __nv_bfloat16* yb = reinterpret_cast<__nv_bfloat16*>(yv);
+        if (r0 < m) *reinterpret_cast<__nv_bfloat162*>(yb + (long long)r0 * n + c) = __floats2bfloat162_rn(acc[t][0], acc[t][1]);
+        if (r1 < m) *reinterpret_cast<__nv_bfloat162*>(yb + (long long)r1 * n + c) = __floats2bfloat162_rn(acc[t][2], acc[t][3]);
+      } else {
+        if (r0 < m) *reinterpret_cast<float2*>(y + (long long)r0 * n + c) = make_float2(acc[t][0], acc[t][1]);
+        if (r1 < m) *reinterpret_cast<float2*>(y + (long long)r1 * n + c) = make_float2(acc[t][2], acc[t][3]);
+      }
     }
   }
 }
@@ -1335,10 +1356,11 @@ int ds41_fp8_gemv_mx_q(const void* x, const void* aq, const void* as_, const voi
 }
 // ds41_fp8_gemv_mx_q with an mHC mix job (ds41_hc_job.cuh; job->kind 0: none) in the grid's first CTAs
 int ds41_fp8_gemv_mx_job(const void* x, const void* aq, const void* as_, const void* w, const void* ws, void* y, int m, int n, int k, int ob16, const HcJob* jp, cudaStream_t st) {
-  if (m < 1 || m > 16 || k % 64 || n % 8) return 1;
+  if (m < 1 || m > 32 || k % 64 || n % 8) return 1;
   HcJob job = *jp;
   job.ctas = hcj::ctas(job.kind, job.T);
-  if (job.kind && (job.T < 1 || job.T > 16 || (4 * job.D) % (hcj::SLICES * 2 * hcj::PTH))) return 1;
+  if (job.kind && (job.T < 1 || job.T > 32 || (4 * job.D) % (hcj::SLICES * 2 * hcj::PTH))) return 1;
+  if (m > 16 && !aq) return 1;   // (17..32 rows: always the quantized input from global memory)
   // split K 8 ways while every warp keeps >= 2 spans (cold weights, m = 1: wq_b 69.6 -> 67.2 us, wo_b 70.5 -> 67.7,
   // wq_a [1280 x 5120] 38.6 -> 32.3; DS41_GEMV_SPLIT forces S)
   static const int force = std::getenv("DS41_GEMV_SPLIT") ? std::atoi(std::getenv("DS41_GEMV_SPLIT")) : 0;
@@ -1347,8 +1369,9 @@ int ds41_fp8_gemv_mx_job(const void* x, const void* aq, const void* as_, const v
   else while (S > 1 && k / 64 / S < 2) S /= 2;
   const int sm = aq ? 0 : m * k + m * k / 32;
   if (sm > 48 * 1024 && ds41_fp8_gemv_mx_init()) return 4;
-#define GEMV_MX(SS) pdl_launch((fp8_gemv_mx<4, SS>), dim3((n / 8 + 8 / SS - 1) / (8 / SS) + job.ctas), dim3(256), (size_t)sm, st, (const __nv_bfloat16*)x, (const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, m, n, k, ob16, job)
-  switch (S) { case 1: GEMV_MX(1); break; case 2: GEMV_MX(2); break; case 4: GEMV_MX(4); break; default: GEMV_MX(8); }
+#define GEMV_MX(SS, T) pdl_launch((fp8_gemv_mx<4, SS, T>), dim3((n / 8 + 8 / SS - 1) / (8 / SS) + job.ctas), dim3(256), (size_t)sm, st, (const __nv_bfloat16*)x, (const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, m, n, k, ob16, job)
+  if (m <= 16) { switch (S) { case 1: GEMV_MX(1, 1); break; case 2: GEMV_MX(2, 1); break; case 4: GEMV_MX(4, 1); break; default: GEMV_MX(8, 1); } }
+  else { switch (S) { case 1: GEMV_MX(1, 2); break; case 2: GEMV_MX(2, 2); break; case 4: GEMV_MX(4, 2); break; default: GEMV_MX(8, 2); } }
 #undef GEMV_MX
   return (int)cudaGetLastError();
 }

@@ -237,10 +237,6 @@ impl KvPool {
         let _ = p.zero_();
         (l, p)
     }
-    /// Rows still free (contiguous: sum of free ranges; VMM: as `largest_free`).
-    pub fn free_rows(&self) -> i64 {
-        match &self.vmm { Some(v) => self.vmm_rows_free(v), None => self.free.borrow().iter().map(|r| r.1).sum() }
-    }
 }
 
 /// MemTotal and MemAvailable in bytes.

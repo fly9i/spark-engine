@@ -24,7 +24,6 @@ pub fn enable(start:i64,width:i64,device:Device) {
     let buf=Tensor::zeros([MAX_ROWS as i64,width],(Kind::Float,device));
     NOISE.with(|n|*n.borrow_mut()=Some(Noise{buf,dirty:vec![false;MAX_ROWS],start,width,early:None,params}));
 }
-pub fn enabled()->bool {NOISE.with(|n|n.borrow().is_some())}
 pub fn fused_enabled()->bool {std::env::var("GLM53_GUMBEL_FUSED").as_deref()==Ok("1")}
 /// Fused mode: (temps, keys, start, width) for the verifier top-1 kernel; None when sampling is off or not fused.
 pub(crate) fn fused_params()->Option<(Tensor,Tensor,i64,i64)> {

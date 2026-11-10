@@ -184,7 +184,6 @@ impl HostBuf {
     }
     fn bytes(&self) -> &[u8] { unsafe { std::slice::from_raw_parts(self.ptr, self.len) } }
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] { unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) } }
-    pub(crate) fn len(&self) -> usize { self.len }
 
     /// Copy the first `bytes` of this buffer into bytes [off, off+bytes) of the contiguous device tensor `dst` and
     /// wait for it (the buffer is reused right after). Pinned: SM copy kernel over 16-byte words (`off` must be

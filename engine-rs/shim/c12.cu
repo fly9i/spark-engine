@@ -239,9 +239,16 @@ __global__ void __launch_bounds__(256) c12_gemv_f32(const __nv_bfloat16* __restr
 }
 extern "C" int glm53_c12_gemv_f32_cuda(const void* x,const void* m8,const void* e4,const void* eb,const int* ptr,const int* col,const void* val,
                                        float* y,int m,int n,int k,int pdl,cudaStream_t st){
-  if(m<1||m>16||k%256!=0||n%16!=0)return int(cudaErrorInvalidValue);
+  if(m<1||m>32||k%256!=0||n%16!=0)return int(cudaErrorInvalidValue);
   const C12View w{(const uint8_t*)m8,(const uint8_t*)e4,(const uint8_t*)eb,ptr,col,(const uint16_t*)val,n,k};
   const __nv_bfloat16* xx=(const __nv_bfloat16*)x;const dim3 g((n+7)/8),b(256);const bool p=pdl!=0;
+  // 17..32 rows (DS41_GEMV32 verify rounds; DS41 is the only caller of this entry with m > 16): one read of the weight,
+  // each row's FMA sequence and reduction its own (bitwise the <= 16-row calls). The M <= 16 instantiations are unchanged.
+  if(m>16){
+    if(n<=(std::getenv("DS41_C12_DEEP_ROWS")?std::atoi(std::getenv("DS41_C12_DEEP_ROWS")):4096)&&k==5120)pdl_launch_if(p,c12_gemv_f32<32,10>,g,b,0,st,xx,w,y,m);
+    else pdl_launch_if(p,c12_gemv_f32<32,4>,g,b,0,st,xx,w,y,m);
+    return int(cudaGetLastError());
+  }
   // 9..16 rows (multi-sequence verify): one read of the weight for all of them; each row's FMA sequence and reduction
   // are M's and m's own (bitwise the 8-row calls)
   if(m>8){

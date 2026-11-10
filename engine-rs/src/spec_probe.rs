@@ -86,10 +86,10 @@ fn select(base:&DecodeStates,next:i64,nodes:&[Node],budget:usize,stop:&[i64],log
     ->BatchedVerified {
     select_with(base,next,nodes,budget,stop,logits,states,features,None)
 }
-/// GLM53_COMMIT_SIDE=1: the accepted node's in-place state commit (KDA replay + conv window, MLA latent commits) runs
-/// on a forked side stream, overlapping the drafter (which never reads target state); settle_side_commit() joins it
-/// before anything reads the state again (next verifier replay, snapshots/restores, every serve op but the round).
-/// Same kernels, same values (L0).
+// GLM53_COMMIT_SIDE=1: the accepted node's in-place state commit (KDA replay + conv window, MLA latent commits) runs
+// on a forked side stream, overlapping the drafter (which never reads target state); settle_side_commit() joins it
+// before anything reads the state again (next verifier replay, snapshots/restores, every serve op but the round).
+// Same kernels, same values (L0).
 thread_local!{static SIDE_COMMIT:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};
     /// Verifier outputs the side-stream commits read (main-stream allocations): kept alive until the join, so the
     /// caching allocator cannot hand their memory to main-stream work that runs concurrently with the commits.
@@ -664,9 +664,9 @@ pub fn decode(model:&Path,draft:&Path,ids:&[i64],mode:&str,n:usize,out:&Path) {
     let mut fast=crate::moefast::MoeFast::new(model,cfg.num_hidden_layers,cfg.n_routed_experts,cfg.num_hidden_layers*cfg.n_routed_experts+16,dev);
     fast.preload_all(cfg.num_hidden_layers,cfg.n_routed_experts,dev);fast.assume_hot=true;
     let mut eng=Engine{w,fast:Some(fast),native:None,pool:crate::moe::ExpertPool::new(model,4)};
-    let (logits,mut state,features)=eng.prefill_record_last(&Tensor::from_slice(ids).to_device(dev),None,true);
+    let (logits,state,features)=eng.prefill_record_last(&Tensor::from_slice(ids).to_device(dev),None,true);
     let mut context=draft.empty_context();draft.append(&mut context,&Tensor::cat(&features,1));
-    let mut anchor=logits.get(logits.size()[0]-1).argmax(-1,false).int64_value(&[]);
+    let anchor=logits.get(logits.size()[0]-1).argmax(-1,false).int64_value(&[]);
     let result=generate(&mut eng,&draft,state,context,anchor,mode,n);
     if tp.rank==0 {std::fs::write(out,serde_json::to_string_pretty(&result).unwrap()).unwrap();}
 }
@@ -833,7 +833,7 @@ pub fn run(model:&Path,draft:&Path,out:&Path) {
     let drafter=Drafter::load_target(draft,&w);
     let mut fast=crate::moefast::MoeFast::new(model,cfg.num_hidden_layers,cfg.n_routed_experts,
         cfg.num_hidden_layers*cfg.n_routed_experts+16,dev);
-    fast.preload_all(cfg.num_hidden_layers,cfg.n_routed_experts,dev);fast.assume_hot=true;let misses=fast.misses;
+    fast.preload_all(cfg.num_hidden_layers,cfg.n_routed_experts,dev);fast.assume_hot=true;
     let mut eng=Engine{w,fast:Some(fast),native:None,pool:crate::moe::ExpertPool::new(model,4)};
     check(&mut eng,&drafter,out);
     drop(drafter);

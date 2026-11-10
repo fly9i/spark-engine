@@ -114,9 +114,41 @@ class SafeEncoder:
         return ids
 
 
-class DsTextStream(o.TextStream):
+def _ds_decode(self, ids):
+    """Text of `ids` with the control tokens as their stand-ins (the text between them decoded by the tokenizer)."""
+    parts, seg = [], []
+    for t in ids:
+        s = self.ctrl.get(t)
+        if s is None:
+            seg.append(t)
+            continue
+        if seg:
+            parts.append(self.tok.decode(seg, skip_special_tokens=False))
+            seg = []
+        parts.append(s)
+    if seg:
+        parts.append(self.tok.decode(seg, skip_special_tokens=False))
+    return "".join(parts)
+
+
+class DsTextStreamIncr(o.TextStreamIncr):
     """TextStream with the generated ｜DSML｜ / </think> tokens decoded to stand-ins: the reasoning ends at the real
-    </think> token only; reasoning (and content without a tool parser) is handed out with the tokens' text again."""
+    </think> token only; reasoning (and content without a tool parser) is handed out with the tokens' text again.
+    (The bounded-cost stream, o.TextStreamIncr; DsTextStreamFull is the original, GLM53_TEXTSTREAM_FULL=1.)"""
+
+    def __init__(self, tok, reasoning, stops, stop_ids, ctrl, keep_dsml):
+        super().__init__(tok, reasoning, stops, stop_ids)
+        self.ctrl, self.keep_dsml = ctrl, keep_dsml
+        self.think_close = _S_THINK
+
+    _decode = _ds_decode
+
+    def _store(self, r, c):
+        return _literal(r), (c if self.keep_dsml else _literal(c, drop_think=True))
+
+
+class DsTextStreamFull(o.TextStreamFull):
+    """DsTextStreamIncr's original implementation (full re-decode every feed)."""
 
     def __init__(self, tok, reasoning, stops, stop_ids, ctrl, keep_dsml):
         super().__init__(tok, reasoning, stops, stop_ids)
@@ -147,6 +179,9 @@ class DsTextStream(o.TextStream):
             c = _literal(c, drop_think=True)
             self.content = self.content[:c0] + c
         return r, c, stop
+
+
+DsTextStream = DsTextStreamFull if o.TEXTSTREAM_FULL else DsTextStreamIncr
 
 
 class DsToolCalls(o.ToolCalls):

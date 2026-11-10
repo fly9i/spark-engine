@@ -106,21 +106,18 @@ pub fn perf_target(dir:&Path,flag:&str,out:&Path) {
 }
 
 fn full_compare(dir: &Path, out: &Path, flag:&str) {
-    use crate::forward::{Engine,DecodeStates,LayerState};
+    use crate::forward::Engine;
     tch::set_num_threads(4);
     let _guard=tch::no_grad_guard();
     let tp=crate::tp::init_from_env();assert_eq!(tp.world,2);
     let dev=Device::Cuda(0);
     std::fs::create_dir_all(out).unwrap();
-    let refs:serde_json::Value=serde_json::from_str(&std::fs::read_to_string(
-        "bench/m0-refs.json").unwrap()).unwrap();
     if flag!="GLM53_MHC_FUSED" {std::env::set_var("GLM53_MLA_LATENT","1");std::env::set_var("GLM53_MHC_FUSED","1");}
     let cfg=crate::config::load(&dir.join("config.json")).unwrap();
     let w=crate::weights::ModelWeights::load(dir,&cfg,cfg.num_hidden_layers,dev);
     let mut fast=crate::moefast::MoeFast::new(dir,cfg.num_hidden_layers,cfg.n_routed_experts,
         cfg.num_hidden_layers*cfg.n_routed_experts+16,dev);
     fast.preload_all(cfg.num_hidden_layers,cfg.n_routed_experts,dev);fast.assume_hot=true;
-    let misses=fast.misses;
     let mut eng=Engine{w,fast:Some(fast),native:None,pool:crate::moe::ExpertPool::new(dir,4)};
     full_check(&mut eng,out,flag);
 }

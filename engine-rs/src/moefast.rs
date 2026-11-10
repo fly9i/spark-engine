@@ -219,9 +219,6 @@ impl MoeFast {
         }
     }
 
-    /// Diagnostic callers retain this pool until all GPU operations finish.
-    pub(crate) fn probe_tables(&self) -> &[Tensor; PTR_TABLES] { &self.ptrs }
-
     /// O(1) proof tied to this pool's immutable scale tensors and current layer
     /// residency. A local 288-expert probe is sufficient; other layers need not
     /// be loaded. Callers must retain this pool without mutation through replay.
@@ -276,8 +273,6 @@ impl MoeFast {
         }
         let (t,m)=&self.own_tables[&layer];(t.shallow_clone(),*m)
     }
-    /// Prepare the per-layer expert tables before graph capture.
-    pub(crate) fn prepare_layer(&mut self,layer:usize) {let _=self.own_table(layer);}
     /// Routed experts of decode / verify rows (moe_exl3.cuh): x [R, 4096] fp16, ids [R, 8], weights [R, 8] -> [R, 4096] FP32.
     pub fn expert_cooperative(&mut self,layer:usize,x:&Tensor,ids:&Tensor,weights:&Tensor)->Tensor {
         let out=Tensor::empty([x.size()[0],4096],(Kind::Float,x.device()));
@@ -501,15 +496,6 @@ impl MoeFast {
         let slot = self.claim_slot(layer, e);
         self.commit_slot(layer, e, slot, ts, true);
         slot as i64
-    }
-
-    fn ensure(&mut self, layer: usize, e: usize, dev: Device) -> i64 {
-        if let Some(&s) = self.where_.get(&(layer, e)) {
-            return s as i64;
-        }
-        if expert_part(layer, e, self.tp).is_none() { return self.install_dummy(layer, e, dev); }
-        let raw = load_expert_raw(&self.idx, layer, e, self.tp);
-        self.install(layer, e, raw, dev)
     }
 
     /// 批量装入(并行磁盘读取;GPU 上传仍串行)。
@@ -761,14 +747,6 @@ pub(crate) fn route_error_check(dev:Device) {
 pub(crate) fn route_error_check_forced(dev:Device) {
     let v=i32::try_from(route_error_flag(dev).to_device(Device::Cpu)).unwrap();
     assert_eq!(v,0,"device route grouping error {v} (1: expert id out of range, 2: segment capacity)");
-}
-pub(crate) fn grouped_reduce_add(result:&Tensor,weights:&Tensor,add:&Tensor)->Tensor {
-    let rows=weights.size()[0];assert_eq!(weights.size(),[rows,8]);
-    assert!(result.is_contiguous());assert_eq!(result.kind(),Kind::Half);
-    assert_eq!(add.size(),[rows,4096]);assert_eq!(add.kind(),Kind::Float);assert!(add.is_contiguous());
-    let weights=weights.to_kind(Kind::Half).contiguous();let out=Tensor::empty([rows,4096],(Kind::Float,result.device()));
-    extern "C" {fn rs_grouped_reduce_add(x:*const std::ffi::c_void,w:*const std::ffi::c_void,add:*const f32,y:*mut f32,rows:i32)->i32;}
-    assert_eq!(unsafe{rs_grouped_reduce_add(result.data_ptr(),weights.data_ptr(),add.data_ptr().cast(),out.data_ptr().cast(),rows as i32)},0);out
 }
 
 /// Preserve the FP16 route-weight rounding and libtorch's four accumulators.

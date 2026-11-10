@@ -44,7 +44,7 @@ pub fn causal_conv1d_pub(x: &Tensor, w: &Tensor) -> Tensor {
     // x [T,C], w [C,K] → y [T,C]。左 pad K-1 个零,无偏置。
     let (t, c) = (x.size()[0], x.size()[1]);
     let k = w.size()[1];
-    let mut xp = Tensor::zeros([k - 1 + t, c], (x.kind(), x.device()));
+    let xp = Tensor::zeros([k - 1 + t, c], (x.kind(), x.device()));
     let _ = xp.narrow(0, k - 1, t).copy_(x);
     let mut y = Tensor::zeros([t, c], (x.kind(), x.device()));
     for j in 0..k {
@@ -122,9 +122,6 @@ pub struct KdaState {
 }
 
 impl KdaState {
-    pub fn new(dev: tch::Device) -> Self {
-        Self::with_heads(dev, 64)
-    }
 
     pub fn with_heads(dev: tch::Device, heads: i64) -> Self {
         Self {
@@ -1006,8 +1003,8 @@ pub fn conv_chain_probe(model:&std::path::Path,out:&std::path::Path) {
 /// W05 local gate: fused KDA gate/o-norm kernels vs the ATen formulas on real rank-0 shards.
 pub fn gate_probe(model:&std::path::Path,out:&std::path::Path) {
     use serde_json::json;let _g=tch::no_grad_guard();let dev=tch::Device::Cuda(0);std::fs::create_dir_all(out).unwrap();
-    let mut idx=crate::safetensors::ShardIndex::scan(model).unwrap();let mut cases=Vec::new();let mut ws=Vec::new();
-    let mut get=|n:&str,kind:Kind|{let (v,s)=idx.get_f32(n).unwrap();
+    let idx=crate::safetensors::ShardIndex::scan(model).unwrap();let mut cases=Vec::new();let mut ws=Vec::new();
+    let get=|n:&str,kind:Kind|{let (v,s)=idx.get_f32(n).unwrap();
         Tensor::from_slice(&v).view(s.iter().map(|&x|x as i64).collect::<Vec<_>>().as_slice()).to_kind(kind).to_device(dev)};
     for layer in [0i64,4,30] {
         let p=format!("model.language_model.layers.{layer}.self_attn");

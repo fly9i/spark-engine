@@ -7,7 +7,7 @@ use std::{path::Path,cell::RefCell};
 
 use tch::{Device, Kind, Tensor};
 
-use crate::config::{Config, LayerPlan};
+use crate::config::Config;
 use crate::safetensors::ShardIndex;
 
 pub struct HcParams {

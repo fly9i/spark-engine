@@ -39,6 +39,7 @@ impl Hash {
         }
     }
     pub fn cols(&self) -> usize { (self.max_ngram - 1) * self.n_heads }
+    pub fn max_ngram(&self) -> usize { self.max_ngram }
     /// Compressed id of a token; DEAD for DEAD and for ids outside the vocabulary (salted image placeholders,
     /// crate::mm_canvas: image positions take no part in an n-gram).
     pub fn compress(&self, id: i64) -> i64 { if id < 0 || id as usize >= self.token_map.len() { DEAD } else { self.token_map[id as usize] } }
@@ -104,7 +105,7 @@ pub(crate) fn give(v: Vec<u8>) {
     }
 }
 
-/// Table rows of one engram layer, dequantized like ParallelEngramEmbedding: [n, head_dim] BF16 for row ids `rows`.
+// Table rows of one engram layer, dequantized like ParallelEngramEmbedding: [n, head_dim] BF16 for row ids `rows`.
 extern "C" { fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32; }
 const MADV_WILLNEED: i32 = 3;
 
@@ -134,6 +135,14 @@ fn tables(ck: &Checkpoint, layer: usize) -> (&'static [u8], &'static [u8]) {
     let (wn, sn) = (format!("layers.{layer}.engram.embed.weight"), format!("layers.{layer}.engram.embed.scale"));
     // SAFETY: the checkpoint (and its maps) lives as long as the model, i.e. the process
     unsafe { (std::mem::transmute::<&[u8], &'static [u8]>(ck.bytes(&wn)), std::mem::transmute::<&[u8], &'static [u8]>(ck.bytes(&sn))) }
+}
+
+/// DS41_ENGRAM_EARLY: the pages of these rows read into the page cache on a background thread (a gather whose result
+/// is dropped); the real gather later reads the same bytes, only sooner from memory.
+pub fn warm(ck: &Checkpoint, layer: usize, rows: Vec<i64>, head_dim: i64) {
+    if rows.is_empty() { return; }
+    let (w, s) = tables(ck, layer);
+    std::thread::spawn(move || { let _ = gather(w, s, &rows, head_dim); });
 }
 
 /// The host gather of a later engram layer's rows started on a background thread (the encoder layers before it run

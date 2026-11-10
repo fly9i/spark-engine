@@ -18,7 +18,7 @@ pub fn run(dir:&Path,out:&Path) {
     std::fs::create_dir_all(out).unwrap();let dev=Device::Cuda(0);let cfg=crate::config::load(&dir.join("config.json")).unwrap();
     let w=crate::weights::ModelWeights::load(dir,&cfg,cfg.num_hidden_layers,dev);
     let mut fast=crate::moefast::MoeFast::new(dir,cfg.num_hidden_layers,cfg.n_routed_experts,cfg.num_hidden_layers*cfg.n_routed_experts+16,dev);
-    fast.preload_all(cfg.num_hidden_layers,cfg.n_routed_experts,dev);fast.assume_hot=true;let misses=fast.misses;
+    fast.preload_all(cfg.num_hidden_layers,cfg.n_routed_experts,dev);fast.assume_hot=true;
     let mut eng=Engine{w,fast:Some(fast),native:None,pool:crate::moe::ExpertPool::new(dir,4)};
     check(&mut eng,out);
 }

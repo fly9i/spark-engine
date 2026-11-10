@@ -67,11 +67,6 @@ pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Tensor {
     (w.to_kind(Kind::Float) * (xf * (var + eps).rsqrt())).to_kind(x.kind())
 }
 
-/// FP8 linear: y = act_quant(x) @ W^T with W already dequantized to BF16 (exact), BF16 output with FP32 accumulation.
-pub fn linear_fp8(x: &Tensor, w: &Tensor) -> Tensor {
-    act_quant(&x.to_kind(Kind::BFloat16), 32).matmul(&w.tr())
-}
-
 /// Rotary frequencies (model.py precompute_freqs_cis) for `dim` rotary dims at the given positions: (cos, sin) [n, dim/2].
 pub struct Rope { freqs: Tensor }
 impl Rope {

@@ -48,7 +48,7 @@ impl Engine {
                 crate::weights::row_mm16(&(g * crate::weights::mm16(&z2, &dm.wu)), &dm.wd)
             } else if let Some(mm) = &layer.moe {
                 let (topi, wts) = crate::moe::route(&z2, &mm.w_gate, &mm.bias, 8);
-                let mut y = Tensor::zeros(
+                let y = Tensor::zeros(
                     [z2.size()[0], z2.size()[1]],
                     (Kind::Float, z2.device()),
                 );
@@ -1168,7 +1168,7 @@ pub fn mlp_forward_f(
             crate::weights::row_mm16(crate::spx_hess::tap(crate::spx_hess::DENSE_DOWN,&(g * crate::weights::mm16(z2, &dm.wu))), &dm.wd)
         } else if let Some(mm) = &layer.moe {
             let (topi, wts) = crate::moe::route(z2, &mm.w_gate, &mm.bias, 8);
-            let mut y = Tensor::zeros([z2.size()[0], z2.size()[1]], (Kind::Float, z2.device()));
+            let y = Tensor::zeros([z2.size()[0], z2.size()[1]], (Kind::Float, z2.device()));
             if let Some(np) = native.as_mut() {
                 let x16 = z2.to_kind(Kind::Half);
                 for t in 0..z2.size()[0] {
@@ -1362,8 +1362,6 @@ pub fn states_max_diff(a: &DecodeStates, b: &DecodeStates) -> f64 {
     }
     worst
 }
-
-pub fn layer_plan_idx_public(_l: &crate::weights::LayerWeights) -> usize { 0 }
 
 pub(crate) fn restore(dst: &mut DecodeStates, src: &DecodeStates) {
     crate::spec_probe::settle_side_commit();

@@ -88,7 +88,6 @@ fn table()->&'static Table {
         eprintln!("[depth] rate table from {path}: lambda {:.6}",t.lambda);t
     })
 }
-pub fn rate_depth(conf:&[f32],max:usize)->usize {rate_depth_scaled(conf,max,1.0)}
 fn bin(c:f32)->usize {((c.max(0.)*20.) as usize).min(19)}
 /// rate_depth with the table's conditional acceptance probabilities scaled by `scale` (capped at 0.98).
 pub fn rate_depth_scaled(conf:&[f32],max:usize,scale:f64)->usize {

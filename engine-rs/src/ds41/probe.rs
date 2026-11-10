@@ -157,6 +157,11 @@ pub fn bench(ckpt: &Path, hash: &str, prompt_len: usize, decode_n: usize, chunk:
     crate::tp::set_tf32(false);
     let dev = Device::Cuda(0);
     let m = Model::load(ckpt, tp.rank, tp.world, usize::MAX, (hash != "-").then(|| Path::new(hash)), dev);
+    if let Ok(plan) = std::env::var("DS41_VPROBE") {
+        let out = std::env::var("DS41_VPROBE_OUT").expect("DS41_VPROBE_OUT");
+        vprobe(&m, Path::new(&plan), Path::new(&out), tp.rank);
+        return;
+    }
     let mut rng = 0x9E3779B97F4A7C15u64;
     // DS41_BENCH_IDS=<file>: the prompt's token ids from a file (whitespace-separated, repeated to prompt_len; real text
     // routes unevenly, unlike the random ids)
@@ -243,6 +248,100 @@ pub fn bench(ckpt: &Path, hash: &str, prompt_len: usize, decode_n: usize, chunk:
             eprintln!("[ds41-bench] round {round}: prefill {prompt_len} tokens (chunk {chunk}) {pre_ms:.0} ms = {:.0} tok/s; decode {decode_n}: median {med:.2} ms/token = {:.1} tok/s",
                 prompt_len as f64 / pre_ms * 1e3, 1e3 / med.max(1e-9));
         }
+    }
+}
+
+/// DS41_VPROBE=<plan.json> DS41_VPROBE_OUT=<dir> (`ds41-bench <ckpt> <hash> 0 0`, every TP3 rank; rank 0 writes):
+/// teacher-forced verify rows. The plan: groups {ctx: [ids per sequence], cont: [ids per sequence], rounds: [[rows per
+/// sequence]]}. Per group every context is prefilled (CED, 2048-token chunks); per round each sequence's next rows of
+/// its continuation are (1) verified for all sequences in one row-graph call (the >16-row path under test), then rolled
+/// back completely, and (2) run one sequence at a time (<= 8 rows each: the c=1 path), which commits them. Writes the
+/// full FP32 logits of (1) to wide.f32 and of (2) to ref.f32 (rows in the same order), the head inputs recovered from
+/// rank 0's logits slice (least squares over the head rows, rounded to BF16; exact when the head reproduces the slice
+/// bit for bit, counted per row in meta.json) to wide_x.f32 / ref_x.f32. DS41_VPROBE_NOWIDE=1: only (2).
+fn vprobe(m: &Model, plan: &Path, out: &Path, rank: usize) {
+    use std::io::Write;
+    let _g = tch::no_grad_guard();
+    let v: serde_json::Value = serde_json::from_reader(std::fs::File::open(plan).expect("plan")).expect("plan json");
+    let ids = |x: &serde_json::Value| -> Vec<Vec<i64>> {
+        x.as_array().unwrap().iter().map(|r| r.as_array().unwrap().iter().map(|t| t.as_i64().unwrap()).collect()).collect()
+    };
+    let nowide = std::env::var("DS41_VPROBE_NOWIDE").is_ok_and(|v| v == "1");
+    let w0 = rank == 0;
+    if w0 { std::fs::create_dir_all(out).unwrap(); }
+    let file = |n: &str| std::io::BufWriter::new(std::fs::File::create(out.join(n)).unwrap());
+    let mut f = w0.then(|| [file("wide.f32"), file("ref.f32"), file("wide_x.f32"), file("ref_x.f32")]);
+    let put = |w: &mut std::io::BufWriter<std::fs::File>, t: &Tensor| {
+        let v: Vec<f32> = Vec::<f32>::try_from(t.to_kind(Kind::Float).to_device(Device::Cpu).contiguous().view(-1)).unwrap();
+        let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        w.write_all(&b).unwrap();
+    };
+    // x = (H^T H)^-1 H^T l over rank 0's head rows (FP64), rounded to BF16; exact rows: the head gives l back bit for bit
+    let h64 = w0.then(|| m.head.to_kind(Kind::Double));
+    let chol = h64.as_ref().map(|h| h.tr().matmul(h).linalg_cholesky(false));
+    let recover = |loc: &Tensor| -> (Tensor, i64) {
+        let (h, c) = (h64.as_ref().unwrap(), chol.as_ref().unwrap());
+        let rhs = h.tr().matmul(&loc.to_kind(Kind::Double).tr());
+        let x = rhs.cholesky_solve(c, false).tr().to_kind(Kind::BFloat16).contiguous();
+        let back = m.logits_local(&x);
+        let ok = back.eq_tensor(loc).to_kind(Kind::Float).min_dim(1, false).0.sum(Kind::Float).double_value(&[]) as i64;
+        (x, ok)
+    };
+    let mut meta = Vec::new();
+    let t0 = std::time::Instant::now();
+    for (gi, g) in v.as_array().unwrap().iter().enumerate() {
+        let ctx = ids(&g["ctx"]);
+        let cont = ids(&g["cont"]);
+        let rounds: Vec<Vec<usize>> = g["rounds"].as_array().unwrap().iter().map(|r| r.as_array().unwrap().iter().map(|n| n.as_u64().unwrap() as usize).collect()).collect();
+        let b = ctx.len();
+        let mut seqs: Vec<Seq> = (0..b).map(|s| {
+            let need: usize = rounds.iter().map(|r| r[s]).sum();
+            assert!(need <= cont[s].len(), "group {gi} sequence {s}: continuation too short");
+            m.new_seq(((ctx[s].len() + need + 64) as i64 + 255) / 256 * 256)
+        }).collect();
+        for s in 0..b {
+            let n = ctx[s].len();
+            for (i, c) in ctx[s].chunks(2048).enumerate() { let _ = m.prefill_ced(&mut seqs[s], c, (i + 1) * 2048 >= n); }
+            let _ = m.last_hidden.borrow_mut().take();
+        }
+        let mut cur = vec![0usize; b];
+        for (ri, r) in rounds.iter().enumerate() {
+            let rows: Vec<Vec<i64>> = (0..b).map(|s| cont[s][cur[s]..cur[s] + r[s]].to_vec()).collect();
+            let mut rec = json!({"group": gi, "round": ri, "split": r, "total": r.iter().sum::<usize>(), "pos": seqs.iter().map(|s| s.pos).collect::<Vec<_>>()});
+            if !nowide {
+                let rbs: Vec<_> = (0..b).map(|s| m.spec_checkpoint(&seqs[s], r[s] as i64)).collect();
+                let (loc, _) = { let mut v: Vec<&mut Seq> = seqs.iter_mut().collect(); m.forward_rows_local(&mut v, &rows) };
+                let full = m.logits_full(&loc);
+                for (s, rb) in rbs.into_iter().enumerate() { m.spec_rollback(&mut seqs[s], rb, 0); }
+                if let Some(f) = f.as_mut() {
+                    put(&mut f[0], &full);
+                    let (x, ok) = recover(&loc);
+                    put(&mut f[2], &x);
+                    rec["x_exact_wide"] = json!(ok);
+                }
+            }
+            let mut ok_ref = 0;
+            for s in 0..b {
+                let (loc, _) = m.forward_rows_local(&mut [&mut seqs[s]], &[rows[s].clone()]);
+                let full = m.logits_full(&loc);
+                if let Some(f) = f.as_mut() {
+                    put(&mut f[1], &full);
+                    let (x, ok) = recover(&loc);
+                    put(&mut f[3], &x);
+                    ok_ref += ok;
+                }
+            }
+            rec["x_exact_ref"] = json!(ok_ref);
+            for s in 0..b { cur[s] += r[s]; }
+            if w0 && ri % 10 == 0 { eprintln!("[ds41-vprobe] group {gi} round {ri} ({:.0} s): {rec}", t0.elapsed().as_secs_f64()); }
+            meta.push(rec);
+        }
+    }
+    if let Some(mut f) = f {
+        for w in f.iter_mut() { w.flush().unwrap(); }
+        let j = json!({"vocab": m.c.vocab, "v0": m.sp.v0, "v1": m.sp.v1, "dim": m.head.size()[1], "nowide": nowide, "rounds": meta});
+        std::fs::write(out.join("meta.json"), serde_json::to_string(&j).unwrap()).unwrap();
+        eprintln!("[ds41-vprobe] done: {} rounds in {:.0} s", j["rounds"].as_array().unwrap().len(), t0.elapsed().as_secs_f64());
     }
 }
 
@@ -553,7 +652,7 @@ pub fn refusal_dir(ckpt: &Path, harmful: &Path, harmless: &Path, hash: &Path, ou
     crate::tp::set_tf32(false);
     let m = Model::load(ckpt, tp.rank, tp.world, usize::MAX, Some(hash), Device::Cuda(0));
     let load = |p: &Path| -> Vec<Vec<i64>> { serde_json::from_reader(std::fs::File::open(p).unwrap_or_else(|e| panic!("{p:?}: {e}"))).unwrap() };
-    let mut run = |set: &[Vec<i64>], name: &str| -> Vec<Vec<Tensor>> {
+    let run = |set: &[Vec<i64>], name: &str| -> Vec<Vec<Tensor>> {
         let t0 = std::time::Instant::now();
         let r: Vec<Vec<Tensor>> = set.iter().map(|ids| {
             crate::ablate::capture_start();

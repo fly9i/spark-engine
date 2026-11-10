@@ -46,9 +46,6 @@ pub struct MlaState {
 }
 
 impl MlaState {
-    pub fn new(dev: tch::Device) -> Self {
-        Self::with_heads(dev, 64)
-    }
 
     pub fn with_heads(dev: tch::Device, heads: i64) -> Self {
         Self {
@@ -107,9 +104,6 @@ pub struct MlaStateG {
 }
 
 impl MlaStateG {
-    pub fn new(dev: tch::Device, max_t: i64) -> Self {
-        Self::with_heads(dev, max_t, 64)
-    }
 
     pub fn with_heads(dev: tch::Device, max_t: i64, heads: i64) -> Self {
         Self {

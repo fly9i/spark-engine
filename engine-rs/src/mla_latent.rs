@@ -468,15 +468,6 @@ pub fn chunk(w:&MlaWeights,x:&Tensor,st:&mut State)->Tensor {
     row_mm16(crate::spx_hess::tap(crate::spx_hess::MLA_O,&hidden),&w.wo)
 }
 
-/// Every branch inherits only its ancestors' latent/indexer state.
-pub fn tree(w:&MlaWeights,x:&Tensor,base:&State,parents:&[Option<usize>])->(Tensor,Vec<State>) {
-    tree_impl(w,x,base,parents,true)
-}
-
-pub(crate) fn tree_impl(w:&MlaWeights,x:&Tensor,base:&State,parents:&[Option<usize>],check_room:bool)->(Tensor,Vec<State>) {
-    tree_impl_selected(w,x,base,parents,dsa::TreeSelection::Ranked,check_room)
-}
-
 pub(crate) fn index_side_enabled()->bool {std::env::var("GLM53_MLA_INDEX_SIDE").as_deref()==Ok("1")}
 pub(crate) fn tree_impl_selected(w:&MlaWeights,x:&Tensor,base:&State,parents:&[Option<usize>],selection:dsa::TreeSelection,check_room:bool)->(Tensor,Vec<State>) {
     let t=x.size()[0];assert_eq!(t as usize,parents.len());let heads=w.q_b.size()[0]/256;

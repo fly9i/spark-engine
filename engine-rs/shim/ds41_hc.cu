@@ -299,7 +299,16 @@ extern "C" {
 // slices of K for T tokens (K / S must stay a multiple of 2 * THREADS)
 // few tokens: 160 slices of 64 threads (160 CTAs: the fn rows stream from all SMs; 40 x 256 left 8 idle and took 15 us
 // per call at T = 1), else 40 / 8 / 1 slices of 256 threads
-static bool hc_narrow(int T, int D) { return T <= 16 && (HC * D) % (160 * 2 * 64) == 0 && !std::getenv("DS41_HC_WIDE_PART"); }
+// DS41_HC32=1 (default off): up to 32 tokens too (multi-sequence verify rounds of 17..32 rows). The 160-slice part
+// kernel is one CTA per (token, slice) and the S > 8 finalize one CTA per token, so a token's result is the same in any
+// call of <= 32 tokens: those rounds get the bits of the <= 16-row path (today they take hc_part_kernel<4> with 8 slices)
+// Only inside a decode / verify forward: the host sets the limit around Model::rows_graph (ds41_hc_narrow_max, from
+// kern::WideScope); prefill chunks of 17..32 rows keep hc_part_kernel<4>.
+static int g_hc_narrow_max = 16;
+extern "C" void ds41_hc_narrow_max(int v) { g_hc_narrow_max = v; }
+static bool hc_narrow(int T, int D) {
+  return T <= g_hc_narrow_max && (HC * D) % (160 * 2 * 64) == 0 && !std::getenv("DS41_HC_WIDE_PART");
+}
 // many tokens (register-blocked path): K split so that the 64-token CTAs number about 192
 static bool hc_reg(int T, int D) { return T > 64 && (HC * D) % RK == 0 && !std::getenv("DS41_HC_PART4"); }
 // DS41_HC_REG1=1: hc_part_reg (hc_part_reg2 is bitwise equal)

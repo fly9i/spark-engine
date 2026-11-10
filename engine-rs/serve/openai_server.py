@@ -271,8 +271,10 @@ class Engine:
 
 
 # ----------------------------------------------------------------------------- text streaming
-class TextStream:
-    """Incremental detokenization + reasoning split + stop strings.
+class TextStreamFull:
+    """Incremental detokenization + reasoning split + stop strings (the original implementation: every feed decodes
+    all generated ids and searches the stop strings over the whole content, quadratic in the output length; kept as
+    the reference for TextStreamIncr and as the rollback, GLM53_TEXTSTREAM_FULL=1).
 
     feed(ids) returns (reasoning_delta, content_delta, stop_hit). Text that could still be the
     start of '</think>' or of a stop string is held back until it is disambiguated."""
@@ -342,6 +344,121 @@ class TextStream:
         if self.hit_stop_id:
             self.stopped = True
         return r_out, c_out, self.stopped
+
+
+def _tail(s, n):
+    return s[max(0, len(s) - n):] if n > 0 else ""
+
+
+class TextStreamIncr:
+    """TextStreamFull's results (the same deltas, stop decisions and final text) at a cost bounded per feed.
+
+    Detokenization decodes only a window of the newest ids: the window starts after the last feed whose decoded
+    window did not end in U+FFFD, i.e. at a token boundary where the byte stream is complete UTF-8, so the text of
+    all ids is the text before the window plus the window's (the tokenizers here are byte-level BPE: the text is the
+    lossy UTF-8 decoding of the concatenated token bytes; ds41_server's control-token stand-ins split the decoding at
+    those tokens anyway). Stop strings are searched over the content's tail: at the start of a feed every occurrence
+    lying wholly inside the content the previous feed started with was already ruled out by that feed's search, so
+    only the last (longest stop - 1) characters of it plus what was appended since can hold the first match.
+    reasoning / content are kept as lists of pieces (joined when read)."""
+
+    def __init__(self, tok, reasoning, stops, stop_ids=()):
+        self.tok, self.ids, self.text_len = tok, [], 0
+        self.stop_ids = set(stop_ids)
+        self.hit_stop_id = False
+        self.in_reasoning = reasoning
+        self.stops = [s for s in stops if s]
+        self._smax = max((len(s) for s in self.stops), default=0)
+        self._rparts, self._cparts = [], []
+        self._rj, self._cj = ("", 0), ("", 0)       # joined text cache: (text, parts joined)
+        self.buf = ""                  # decoded but not yet classified
+        self.stopped = False
+        self.think_close = THINK_CLOSE
+        self._b, self._cb = 0, 0       # decode window: first id, characters of the text before it
+        self._ptail, self._last = "", ""   # content tail at the previous feed's start, content appended by it
+
+    @staticmethod
+    def _joined(parts, cache):
+        if cache[1] != len(parts):
+            cache = ("".join(parts), len(parts))
+        return cache
+
+    @property
+    def reasoning(self):
+        self._rj = self._joined(self._rparts, self._rj)
+        return self._rj[0]
+
+    @property
+    def content(self):
+        self._cj = self._joined(self._cparts, self._cj)
+        return self._cj[0]
+
+    def _decode(self, ids):
+        """Text of the generated ids (a front end may stand in for control tokens, see ds41_server.DsTextStream)."""
+        return self.tok.decode(ids, skip_special_tokens=False)
+
+    _holdback = TextStreamFull._holdback
+
+    def _store(self, r, c):
+        """The deltas as handed out and kept (a subclass may rewrite them)."""
+        return r, c
+
+    def feed(self, ids, final=False):
+        if self.stopped:
+            return "", "", True
+        for t in ids:                                     # cut at the first stop token id (excluded)
+            if t in self.stop_ids:
+                self.hit_stop_id, final = True, True
+                break
+            if t not in EOS:
+                self.ids.append(t)
+        w = self._decode(self.ids[self._b:])
+        w2 = w[:-1] if not final and w.endswith("�") else w   # incomplete UTF-8 sequence
+        new = w2[max(0, self.text_len - self._cb):]
+        self.text_len = max(self.text_len, self._cb + len(w2))
+        if w and not w.endswith("�"):
+            self._b, self._cb = len(self.ids), self._cb + len(w)
+        # the content the stop search may still find a first match in (see the class comment)
+        win = self._ptail + self._last
+        self._ptail = _tail(win, self._smax - 1)
+        self._last = ""
+        self.buf += new
+        r_out, c_out = "", ""
+        if self.in_reasoning:
+            i = self.buf.find(self.think_close)
+            if i >= 0:
+                r_out += self.buf[:i]
+                self.buf = self.buf[i + len(self.think_close):].lstrip("\n")
+                self.in_reasoning = False
+            else:
+                keep = 0 if final else self._holdback(self.buf, [self.think_close])
+                r_out, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
+        if not self.in_reasoning:
+            for s in self.stops:
+                j = (win + self.buf).find(s)
+                if j >= 0:
+                    j -= len(win)
+                    if j >= 0:
+                        c_out += self.buf[:j]
+                    self.buf, self.stopped = "", True
+                    break
+            if not self.stopped:
+                keep = 0 if final else self._holdback(self.buf, self.stops)
+                c_out, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
+        r_out, c_out = self._store(r_out, c_out)
+        if r_out:
+            self._rparts.append(r_out)
+        if c_out:
+            self._cparts.append(c_out)
+        self._last = c_out
+        if self.hit_stop_id:
+            self.stopped = True
+        return r_out, c_out, self.stopped
+
+
+# GLM53_TEXTSTREAM_FULL=1: the original full re-decode (TextStreamFull); default the bounded incremental one
+TEXTSTREAM_FULL = os.environ.get("GLM53_TEXTSTREAM_FULL", "0") == "1"
+TextStream = TextStreamFull if TEXTSTREAM_FULL else TextStreamIncr
 
 
 TOOL_OPEN, TOOL_CLOSE = "<tool_call>", "</tool_call>"
