@@ -812,17 +812,40 @@ thread_local! {
 /// <= 16-row kernels instead of the prefill-sized paths: the MX GEMV (two m16 tiles, one weight pass), the C12 GEMV
 /// (head / router chunks of 32 rows), the mHC mix jobs (with DS41_HC32) and the shared expert's parallel branch. Every
 /// row's result is the one it gets in a <= 16-row call (ds41-kernel-test DS41_KT_ONLY=w32).
-pub fn gemv32_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_GEMV32").is_ok_and(|v| v == "1")) }
+pub fn gemv32_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| batch_inv_on() || std::env::var("DS41_GEMV32").is_ok_and(|v| v == "1")) }
+/// DS41_BATCH_INVARIANT=1 (default off): every row of a decode / verify call (Model::rows_graph, any split of up to 32
+/// rows over the sequences) gets the bits it gets when its sequence runs alone with its own rows (the c=1 path): the
+/// row-count-dependent paths keep their <= 8 / <= 16-row kernels -- DS41_GEMV32 + DS41_HC32, and the three below.
+pub fn batch_inv_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_BATCH_INVARIANT").is_ok_and(|v| v == "1")) }
+/// DS41_INV_MOE16=1 (diagnostic; implied by DS41_BATCH_INVARIANT): routed experts of 9..32 rows in 16-row items with the
+/// K-split gate/up kernel, as for <= 8 rows (shim/ds41_mx.cu gr_of), inside a WideScope.
+pub fn inv_moe_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| batch_inv_on() || std::env::var("DS41_INV_MOE16").is_ok_and(|v| v == "1")) }
+/// DS41_INV_PROJ8=1 (diagnostic; implied by DS41_BATCH_INVARIANT): the compressor / indexer-weight projections of more
+/// than 8 rows as <= 8-row BF16 GEMV chunks (else cuBLAS), inside a WideScope.
+pub fn inv_proj_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| batch_inv_on() || std::env::var("DS41_INV_PROJ8").is_ok_and(|v| v == "1")) }
+/// DS41_INV_WOA=1 (diagnostic; implied by DS41_BATCH_INVARIANT): wo_a of 17..32 rows as grouped-GEMV chunks of
+/// grouped_max_rows() rows (else fp8_mm_grouped), inside a WideScope.
+pub fn inv_woa_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| batch_inv_on() || std::env::var("DS41_INV_WOA").is_ok_and(|v| v == "1")) }
+/// DS41_INV_CNT (default on; 0: the previous behaviour, for A/B): the CED closing replay continues each replayed
+/// position's own clamp count-gate count (Model::ced_finish), not the counter rows the last GPU pass left (another
+/// sequence's chunk or decode step, a previous request). Independent of DS41_BATCH_INVARIANT.
+pub fn inv_cnt_on() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("DS41_INV_CNT").map_or(true, |v| v != "0"))
+}
+/// Inside a decode / verify forward (WideScope).
+pub fn wide() -> bool { WIDE.with(|w| w.get()) }
 /// DS41_HC32=1 (default off): mHC mixes of 17..32 rows on the 160-slice path (shim/ds41_hc.cu hc_narrow), as jobs of
 /// the next MX GEMVs when those take 17..32 rows too (DS41_GEMV32), else as their own kernels.
-pub fn hc32_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_HC32").is_ok_and(|v| v == "1")) }
+pub fn hc32_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| batch_inv_on() || std::env::var("DS41_HC32").is_ok_and(|v| v == "1")) }
 thread_local! { static WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 /// Marks a decode / verify forward for DS41_GEMV32 while alive.
 pub struct WideScope(bool);
-extern "C" { fn ds41_hc_narrow_max(v: i32); }
+extern "C" { fn ds41_hc_narrow_max(v: i32); fn ds41_moe_gr16_max(v: i32); }
 impl WideScope {
     pub fn new() -> WideScope {
         if hc32_on() { unsafe { ds41_hc_narrow_max(32) }; }
+        if inv_moe_on() { unsafe { ds41_moe_gr16_max(32) }; }
         WideScope(WIDE.with(|w| w.replace(true)))
     }
 }
@@ -830,6 +853,7 @@ impl Drop for WideScope {
     fn drop(&mut self) {
         WIDE.with(|w| w.set(self.0));
         if hc32_on() && !self.0 { unsafe { ds41_hc_narrow_max(16) }; }
+        if inv_moe_on() && !self.0 { unsafe { ds41_moe_gr16_max(8) }; }
     }
 }
 /// Rows the few-row GEMVs take in one call here: 32 inside a WideScope with DS41_GEMV32, else 16.

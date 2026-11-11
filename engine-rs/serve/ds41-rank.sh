@@ -17,7 +17,11 @@ if [[ -n ${SPARK_TP3_IFNAME:-} ]]; then export NCCL_SOCKET_IFNAME=$SPARK_TP3_IFN
 export GLM53_RDMA_ARN_ROWS_PIPE=${GLM53_RDMA_ARN_ROWS_PIPE:-12} GLM53_COMM_STREAM_PRIO=${GLM53_COMM_STREAM_PRIO:-1} DS41_MOE_OUT_MB=${DS41_MOE_OUT_MB:-1024}
 # serving: 4 sequences, DSpark speculative decoding (the draft stages take ~2.7 GiB per rank), NVMe prefix cache, image input
 # (rank 0 loads the vision encoder, ~1 GiB). Small per-capture cuBLAS workspaces shared by the graphs.
-export DS41_SERVE_STORES=${DS41_SERVE_STORES:-4} DS41_MTP=${DS41_MTP:-1} DS41_SPEC=${DS41_SPEC:-1} DS41_PCACHE=${DS41_PCACHE:-1} \
+# DS41_BATCH_INVARIANT=1 (default here since v0.3.13; the binary's own default is off): every row of a multi-sequence
+# decode / verify call (up to 32 rows) gets the bits of the single-stream path, so a request's output does not depend on
+# what else is running. DS41_BATCH_INVARIANT=0 in spark.env: the previous row-count-dependent kernel paths.
+export DS41_SERVE_STORES=${DS41_SERVE_STORES:-4} DS41_MTP=${DS41_MTP:-1} DS41_SPEC=${DS41_SPEC:-1} \
+  DS41_BATCH_INVARIANT=${DS41_BATCH_INVARIANT:-1} DS41_PCACHE=${DS41_PCACHE:-1} \
   DS41_VISION=${DS41_VISION:-1} DS41_PCACHE_DIR=${DS41_PCACHE_DIR:-$SPARK_HOME/var/ds41-prefix-cache}
 export CUBLAS_WORKSPACE_CONFIG=:16:8 GLM53_GRAPH_SHARED_WS=1
 # host memory: after the warm-up the checkpoint's file pages are dropped from the process and glibc's free pages returned;

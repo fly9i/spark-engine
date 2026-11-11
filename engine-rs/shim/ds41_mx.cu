@@ -1234,7 +1234,10 @@ __global__ __launch_bounds__(256) void fp8_gemv_bx(const __nv_bfloat16* __restri
 inline bool moe_gemm(int R) { static const bool on = !(std::getenv("DS41_MOE_GEMM") && std::getenv("DS41_MOE_GEMM")[0] == '0'); return on && R > 64; }
 // DS41_MOE_ROWS (prefill items, 64 default, or 128: an expert's rows up to 128 share one read of its weights; measured no faster)
 inline int gemm_rows() { static const int r = std::getenv("DS41_MOE_ROWS") && std::atoi(std::getenv("DS41_MOE_ROWS")) == 128 ? 128 : 64; return r; }
-inline int gr_of(int R, int topk, int E) { (void)topk; (void)E; return R <= 8 ? 16 : moe_gemm(R) ? gemm_rows() : 32; }   // (64-row up_mx items: register-bound, 2.4x slower)
+// rows up to which the routed experts take 16-row items with the K-split gate/up kernel (8; ds41_moe_gr16_max: 32 inside
+// a DS41_BATCH_INVARIANT / DS41_INV_MOE16 decode / verify forward, so every row gets its <= 8-row call's sums)
+static int g_gr16_max = 8;
+inline int gr_of(int R, int topk, int E) { (void)topk; (void)E; return R <= g_gr16_max ? 16 : moe_gemm(R) ? gemm_rows() : 32; }   // (64-row up_mx items: register-bound, 2.4x slower)
 inline int gmax_of(int R, int topk, int E) { const int P = R * topk; return (P < E ? P : E) + P / gr_of(R, topk, E) + 1; }
 inline size_t al(size_t b) { return (b + 255) & ~(size_t)255; }
 // DS41_DOWN_GEMM=0: down_mx<4> instead of down_gemm for one-pass 64-row items (the same MMA sequence per output)
@@ -1484,6 +1487,7 @@ int ds41_moe_mx_combine_rows(void* ws, int R, int I, int topk, int E, const floa
   return (int)cudaGetLastError();
 }
 // whether a call's down outputs are BF16 (DS41_MOE_PAIR_BF16), else FP32
+void ds41_moe_gr16_max(int v) { g_gr16_max = v; }
 int ds41_moe_mx_pair_b16(int R, int topk, int E) { return pair_b16(R, topk, E) ? 1 : 0; }
 // the down outputs out [P, H] FP32 (ds41_moe_mx_pair_b16: BF16) and pairmap [P] in a call's workspace (a combine done
 // elsewhere: the reduce-scatter)

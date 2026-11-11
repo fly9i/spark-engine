@@ -1,52 +1,58 @@
-spark-engine v0.3.12 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
+spark-engine v0.3.13 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
 
-Changes since v0.3.11: an incremental detokenizer in the front ends, small hardening of the DeepSeek-V4.1-Flash serving
-loop, dead code removed, and new optional DeepSeek switches that are **off by default**. With the default settings the
-release checks below are bitwise identical to v0.3.11.
+Changes since v0.3.12, both for DeepSeek-V4.1-Flash: with several streams, a request's output no longer depends on what
+else the server is doing (`DS41_BATCH_INVARIANT`, on by default in the start scripts), and a fix for the optional
+conditional clamp. GLM-5.3-Flash and Qwen3.8-Flash-Next are unchanged.
 
-**Front ends: incremental detokenization.** Streaming responses used to re-decode the whole completion for every new
-token, so the front end's CPU time grew with the square of the output length. The GLM, DeepSeek and Qwen front ends now
-decode only a window of the newest tokens (it starts at the last token boundary where the bytes are complete UTF-8) and
-search stop strings only in the text that can still hold a first match. Deltas, stop decisions and the final text are
-the same as before (32,000 comparison cases over the three tokenizers, no difference). On 8,000-token outputs the front
-end's CPU time is about 7× lower (1 stream 1.2 → 0.16 s, 4 streams 5.2 → 0.72 s); client tok/s is unchanged.
-`GLM53_TEXTSTREAM_FULL=1` in `spark.env` restores the previous full re-decode.
+**Multi-stream outputs equal single-stream outputs (`DS41_BATCH_INVARIANT=1`, default in `serve/ds41-rank.sh`).**
+Single-stream greedy outputs were already reproducible, but with two or more streams a request's text could differ from
+the same request run alone: when several sequences verify their drafts in one call, five kernel paths switch with the
+total row count (routed-expert item size, the FP8 GEMV vs. a GEMM, the mHC mix, the compressor / indexer projections and
+`wo_a`). They sum in a different order, and one-ulp differences grow through the layers. With the switch every row of a
+decode / verify call of up to 32 rows (4 streams × up to 8 rows) takes the kernels of the single-stream path, so its
+result is bitwise the same whatever runs beside it. It implies `DS41_GEMV32` and `DS41_HC32` (v0.3.12) plus three new
+switches, `DS41_INV_MOE16`, `DS41_INV_PROJ8` and `DS41_INV_WOA`, which exist separately only for diagnostics.
+`DS41_BATCH_INVARIANT=0` in `spark.env` restores the v0.3.12 behaviour. The binary's own default is off; only the start
+scripts turn it on.
 
-**DeepSeek-V4.1-Flash serving loop.** The `max_tokens` capacity check uses a saturating add (a huge `max_tokens` could
-wrap past it), the draft-choice comparison uses a total order (a NaN confidence can no longer panic every rank), stop
-token ids are scanned only in the tokens that arrived in this step, and a few settings are read once instead of every
-round.
+Checks with the switch on: teacher-forced verify rounds of 9–32 rows (2, 4 and 12 sequences, mixed content and
+context lengths; 4,162 + 2,210 rows) bitwise equal to the single-stream reference (2,210-row mixed set with the switch
+off: 511 equal). Served texts identical to the same requests run alone: the same prompt at 2 / 4 / 5 streams,
+interleaved long prefills, staggered arrivals of 250 / 2K / 10K / 30K-token prompts, prompts restored from the prefix
+cache while other streams decode, concurrent image requests, and fixed-seed sampling at 4 streams.
 
-**Optional switches (DeepSeek-V4.1-Flash, all off by default).** Set them in `spark.env` (every rank reads it) or through
-`DS41_EXTRA_ENV`.
+Limits: calls of more than 32 rows (more than 4 streams, or longer drafts) fall back to the row-count-dependent paths.
+Prefill is not affected. A prompt that extends a cached conversation (its earlier answer decoded token by token) can
+still differ from the same prompt prefilled from scratch; that comes from how prefill closes a prompt, not from
+concurrency, and is unchanged. `DS41_BATCH_INVARIANT` is part of the prefix-cache identity, so entries saved with the
+other setting are not reused.
 
-| Switch | What it does |
-| --- | --- |
-| `DS41_GEMV32=1` with `DS41_HC32=1` | Speculative verify rounds of 17–32 rows (several streams verifying together) stay on the ≤ 16-row decode kernels instead of the prefill-sized paths: the MXFP4/FP8 GEMV takes a second 16-row tile in the same weight pass, the router's C12 GEMV, the shared expert's parallel branch and the mHC mix take up to 32 rows. Each row gets bitwise the result of a ≤ 16-row call (`ds41-kernel-test` with `DS41_KT_ONLY=w32`). Served decode, same build with the switches on and off, 4 runs per arm: 4 streams code 164.1 → 189.2 tok/s, 4 streams structured 220.3 → 235.9 tok/s; 4 streams prose and 1 / 2 streams unchanged. **Outputs with several streams differ from the default path** (those rounds take different kernels than today's > 16-row path); single-stream outputs are identical. Kept off by default for that reason. `DS41_HC32` alone gives no measurable gain. |
-| `DS41_ENGRAM_EARLY=1` | At the start of a speculative round, reads the Engram rows of each sequence's pending token into the page cache on a background thread, under the draft. Outputs unchanged; the Engram wait per round drops, but no decode throughput gain was measured. |
-| `DS41_ENGRAM_ASYNC_MIN` (default `256`) | Prompt chunks of at least this many rows gather their Engram rows in the background (the behaviour so far); lower values add shorter chunks. Outputs unchanged; no TTFT difference measured for 40–500-token prompts. |
-| `DS41_MOE_STATS=1` | Diagnostics: routed-expert calls count their rows and distinct experts (a device sync each) and rank 0 logs a `[ds41-serve] moe:` line per prompt. |
-| `DS41_VPROBE=<plan.json>` | Measurement with `ds41-bench`: teacher-forced logits of multi-sequence verify rounds against the same rows run one sequence at a time. |
+**Optional conditional clamp: per-row gate counters no longer carry over (`DS41_INV_CNT`, default on).** With the
+optional conditional clamp (`DS41_ABLATE_CLAMP`) enabled, the per-row counters of its count gate could carry over between
+requests: the last step of a prompt's prefill read counter rows that the prompt itself had not written, left by another
+request's prefill, a decode step or the previous request. Only integer counters carried over, no text, activations or
+KV, but it made outputs with the clamp enabled depend on earlier or concurrent requests and applied the clamp to rows
+it was not meant for. Each sequence now carries its own counts through prefill chunks, checkpoints and prefix-cache
+entries. With the clamp enabled, outputs can differ from v0.3.12, in particular for prompts of 1,024 tokens or more;
+without the clamp nothing changes. `DS41_INV_CNT=0` restores the previous behaviour (for comparisons only).
 
-**Dead code removed.** Unused Rust functions, unused `shim.cpp` wrappers and `shim/c11.cuh` are gone; nothing that runs
-changed.
-
-**Speed** (v0.3.12, 2026-11-10, three DGX Sparks, DeepSeek-V4.1-Flash-1017, default settings plus the optional
-conditional clamp as in the README's measurements; greedy, thinking off). Decode with
-`bench/ds41_decode_bench.py --types prose,structured,code --conc 1,2,4 --max-tokens 400`, aggregate tok/s, one run each:
+**Speed** (v0.3.13, 2026-11-11, three DGX Sparks, DeepSeek-V4.1-Flash-1017, default settings plus the optional
+conditional clamp as in the README's measurements; greedy, thinking off; same build with `DS41_BATCH_INVARIANT` off and
+on). Decode with `bench/ds41_decode_bench.py --types prose,structured,code --conc 1,2,4` (256 tokens per stream,
+aggregate tok/s), four service starts in the order off, on, on, off, 3 runs each: median of n = 6 per cell, off / on:
 
 | Streams | Prose | Structured | Code |
 | --- | --- | --- | --- |
-| 1 | 69.3 | 127.1 | 112.3 |
-| 2 | 97.7 | 180.0 | 150.4 |
-| 4 | 129.4 | 219.4 | 176.5 |
+| 1 | 69.3 / 69.3 | 126.3 / 127.1 | 111.6 / 112.5 |
+| 2 | 99.0 / 95.9 | 179.8 / 188.1 | 148.4 / 147.2 |
+| 4 | 126.2 / 128.3 | 220.6 / 242.9 | 169.1 / 184.1 |
 
-Prefill with `bench/ds41_prefill_bench.py 5 8k,32k` (streamed, rate = prompt tokens / TTFT, each sample a unique prefix,
-median of 5): 8K cold 5,400 / warm 5,432 tok/s, 32K cold 5,677 / warm 5,505 tok/s (cold = page caches dropped on all
-three nodes and the service restarted, every sample new text). These are single release measurements, not a
-side-by-side comparison with v0.3.11; decode runs move by a few percent between service starts.
+Beyond the run-to-run spread: 4 streams structured +10.1% and code +8.9%, 2 streams structured +4.6%, and 2 streams prose
+−3.1% (not located; timing the verify calls on the same rows shows no cost there). The other cells are within the spread
+(up to about 4% between the two "off" starts). Prefill, warm, `bench/ds41_prefill_bench.py 5 8k,32k` in alternated
+starts: 8K 5,404–5,477 and 32K 5,519–5,603 tok/s with the switch on or off, the same as v0.3.12 (5,464–5,474 /
+5,550–5,556 in the same series).
 
-Checks against v0.3.11 on our three DGX Sparks: DeepSeek release goldens and paired-prefill checks identical, serving,
-image (including `boundary`) tests pass; GLM-5.3 TP2 and Qwen3.8-Flash-Next greedy replies identical (20 / 20 each).
-Qwen3.8-Flash-Next decode after the check (prose, greedy, thinking off, 400 tokens, concurrent prompts marked with a
-`(stream i/n)` suffix, median of 3): 3 / 4 streams 110.6 / 126.5 tok/s aggregate.
+Checks against v0.3.12 on our three DGX Sparks: DeepSeek release goldens without the clamp identical, paired-prefill
+checks identical, serving, image (including `boundary`) and prefix-cache fork tests pass; GLM-5.3 TP2 and
+Qwen3.8-Flash-Next greedy replies identical (20 / 20 each).

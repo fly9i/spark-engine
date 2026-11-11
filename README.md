@@ -49,33 +49,33 @@ clock sampled every second, no throttling recorded); GLM's column is older (DGX 
 "Prose" = a long explanation (lower draft acceptance); "structured" = counting 1–200 (high acceptance). Decode speed depends on the text
 because of speculation.
 
-### DeepSeek-V4.1-Flash on v0.3.12 (2026-11-10)
+### DeepSeek-V4.1-Flash on v0.3.13 (2026-11-11)
 
-Release measurement of v0.3.12 on 2026-11-10: three DGX Sparks (TP3, the [test system](#test-system-and-gpu-clock) below,
+Release measurement of v0.3.13 on 2026-11-11: three DGX Sparks (TP3, the [test system](#test-system-and-gpu-clock) below,
 default GPU clocks), DeepSeek-V4.1-Flash-1017, default settings plus the optional conditional clamp (`DS41_ABLATE_CLAMP`)
-as in the other DeepSeek measurements of this README, greedy, thinking off. Decode:
-`bench/ds41_decode_bench.py --types prose,structured,code --conc 1,2,4 --max-tokens 400` (32-token warm-up, streamed;
-aggregate = all streams' tokens over the window from the first token of the earliest stream to the last token of the
-latest), **one run per cell** — a different script, prompt set and sample count from the median-of-5 table above, so
-compare like with like. Prefill: `bench/ds41_prefill_bench.py 5 8k,32k` (streamed, rate = prompt tokens / TTFT, each
-sample a unique prefix so the prefix cache cannot help, median of 5); cold = page caches dropped on all three nodes and
-the service restarted, every sample new text; warm = the same text repeated.
+as in the other DeepSeek measurements of this README, greedy, thinking off. The same build with `DS41_BATCH_INVARIANT`
+off and on (on is the default from v0.3.13: with several streams every request gets exactly its single-stream output).
+Decode: `bench/ds41_decode_bench.py --types prose,structured,code --conc 1,2,4` (256 tokens per stream, 32-token warm-up,
+streamed; aggregate = all streams' tokens over the window from the first token of the earliest stream to the last token
+of the latest); four service starts in the order off, on, on, off, 3 runs each, **median of n = 6 per cell** — a
+different script, prompt set and sample count from the median-of-5 table above, so compare like with like.
 
-| Decode, aggregate tok/s | Prose | Structured | Code |
+| Decode, aggregate tok/s (off / **on**) | Prose | Structured | Code |
 | --- | --- | --- | --- |
-| 1 stream | 69.3 | 127.1 | 112.3 |
-| 2 streams | 97.7 | 180.0 | 150.4 |
-| 4 streams | 129.4 | 219.4 | 176.5 |
+| 1 stream | 69.3 / **69.3** | 126.3 / **127.1** | 111.6 / **112.5** |
+| 2 streams | 99.0 / **95.9** | 179.8 / **188.1** | 148.4 / **147.2** |
+| 4 streams | 126.2 / **128.3** | 220.6 / **242.9** | 169.1 / **184.1** |
 
-| Prefill, tok/s | 8K | 32K |
-| --- | --- | --- |
-| Cold | 5,400 | 5,677 |
-| Warm | 5,432 | 5,505 |
+Beyond the run-to-run spread (up to about 4% between the two "off" starts): with the switch on, 4 streams structured
++10.1% and code +8.9%, 2 streams structured +4.6%, 2 streams prose −3.1%; the other cells are within it. Prefill
+(`bench/ds41_prefill_bench.py 5 8k,32k`, streamed, rate = prompt tokens / TTFT, each sample a unique prefix, median of 5,
+warm, starts alternated) is the same with the switch on or off and as v0.3.12: 8K 5,404–5,477 tok/s, 32K 5,519–5,603
+tok/s. `DS41_BATCH_INVARIANT=0` in `spark.env` turns the switch off. Details: [docs/release-notes.md](docs/release-notes.md),
+[docs/ds41.md](docs/ds41.md#5-settings).
 
-Optional, off by default: `DS41_GEMV32=1 DS41_HC32=1` keeps verify rounds of 17–32 rows on the small-row kernels. Same
-build, switches on vs. off, 4 runs per arm: 4 streams code 164.1 → 189.2 tok/s, structured 220.3 → 235.9 tok/s; 1 and
-2 streams unchanged. With several streams the outputs differ from the default path's; single-stream outputs are
-identical. Details: [docs/release-notes.md](docs/release-notes.md), [docs/ds41.md](docs/ds41.md#5-settings).
+v0.3.12 (2026-11-10, same setup, one run per cell with `--max-tokens 400`, so not directly comparable): decode 1 / 2 / 4
+streams prose 69.3 / 97.7 / 129.4, structured 127.1 / 180.0 / 219.4, code 112.3 / 150.4 / 176.5 tok/s; prefill 8K cold
+5,400 / warm 5,432, 32K cold 5,677 / warm 5,505 tok/s.
 
 ### Quantization & runtime precision
 

@@ -251,6 +251,47 @@ pub fn bench(ckpt: &Path, hash: &str, prompt_len: usize, decode_n: usize, chunk:
     }
 }
 
+/// Sort key of a DS41_DEBUG_ROWS=2 name "L<i>.<what>*": layer, then the forward order of the tensor kinds (the middle's
+/// own pushes "L<i>.m<k>.<what>*" between kv and o).
+fn dbg_key(name: &str) -> (i64, i64, String) {
+    let l = name[1..].split('.').next().and_then(|v| v.parse().ok()).unwrap_or(999);
+    let what = name.splitn(2, '.').nth(1).unwrap_or("").trim_end_matches('*').to_string();
+    let order = ["x", "qr", "q", "kv", "o", "y", "h2", "x2", "moe", "h"];
+    let k = order.iter().position(|o| *o == what).map(|p| if p >= 4 { p as i64 + 100 } else { p as i64 }).unwrap_or_else(|| {
+        what.strip_prefix('m').and_then(|r| r.split('.').next()).and_then(|v| v.parse::<i64>().ok()).map_or(50, |v| 10 + v)
+    });
+    (l, k, what)
+}
+/// Batched-call rows vs the per-sequence reference calls (same names; row ranges by `split`): every differing tensor
+/// as [name, differing rows (batched row index), max |diff|, max |ref|], in forward order.
+fn dbg_diffs(wide: &[(String, Tensor)], refs: &[Vec<(String, Tensor)>], split: &[usize]) -> Vec<serde_json::Value> {
+    let mut out: Vec<((i64, i64, String), serde_json::Value)> = Vec::new();
+    let offs: Vec<i64> = split.iter().scan(0i64, |a, &n| { let o = *a; *a += n as i64; Some(o) }).collect();
+    for (name, w) in wide.iter().filter(|(n, _)| n.ends_with('*')) {
+        let mut rows_bad = Vec::new();
+        let (mut md, mut mr) = (0f64, 0f64);
+        for (s, rd) in refs.iter().enumerate() {
+            let Some((_, r)) = rd.iter().find(|(n, _)| n == name) else { continue };
+            let n = split[s] as i64;
+            if w.size()[0] < offs[s] + n || r.size()[0] != n { continue; }
+            let a = w.narrow(0, offs[s], n).to_kind(Kind::Double);
+            let b = r.to_kind(Kind::Double);
+            if a.size() != b.size() { continue; }
+            let d = (&a - &b).abs().reshape([n, -1]);
+            let rowmax = d.amax([1].as_slice(), false);
+            for j in 0..n {
+                let v = rowmax.double_value(&[j]);
+                if v.is_nan() || v > 0.0 { rows_bad.push(offs[s] + j); }
+            }
+            md = md.max(d.max().double_value(&[]));
+            mr = mr.max(b.abs().max().double_value(&[]));
+        }
+        if !rows_bad.is_empty() { out.push((dbg_key(name), json!([name, rows_bad, md, mr]))); }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.into_iter().map(|x| x.1).collect()
+}
+
 /// DS41_VPROBE=<plan.json> DS41_VPROBE_OUT=<dir> (`ds41-bench <ckpt> <hash> 0 0`, every TP3 rank; rank 0 writes):
 /// teacher-forced verify rows. The plan: groups {ctx: [ids per sequence], cont: [ids per sequence], rounds: [[rows per
 /// sequence]]}. Per group every context is prefilled (CED, 2048-token chunks); per round each sequence's next rows of
@@ -267,10 +308,13 @@ fn vprobe(m: &Model, plan: &Path, out: &Path, rank: usize) {
         x.as_array().unwrap().iter().map(|r| r.as_array().unwrap().iter().map(|t| t.as_i64().unwrap()).collect()).collect()
     };
     let nowide = std::env::var("DS41_VPROBE_NOWIDE").is_ok_and(|v| v == "1");
+    let reps: usize = std::env::var("DS41_VPROBE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // DS41_VPROBE_NODUMP=1: no logits / head-input files (timing runs)
+    let nodump = std::env::var("DS41_VPROBE_NODUMP").is_ok_and(|v| v == "1");
     let w0 = rank == 0;
     if w0 { std::fs::create_dir_all(out).unwrap(); }
     let file = |n: &str| std::io::BufWriter::new(std::fs::File::create(out.join(n)).unwrap());
-    let mut f = w0.then(|| [file("wide.f32"), file("ref.f32"), file("wide_x.f32"), file("ref_x.f32")]);
+    let mut f = (w0 && !nodump).then(|| [file("wide.f32"), file("ref.f32"), file("wide_x.f32"), file("ref_x.f32")]);
     let put = |w: &mut std::io::BufWriter<std::fs::File>, t: &Tensor| {
         let v: Vec<f32> = Vec::<f32>::try_from(t.to_kind(Kind::Float).to_device(Device::Cpu).contiguous().view(-1)).unwrap();
         let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -309,6 +353,20 @@ fn vprobe(m: &Model, plan: &Path, out: &Path, rank: usize) {
             let rows: Vec<Vec<i64>> = (0..b).map(|s| cont[s][cur[s]..cur[s] + r[s]].to_vec()).collect();
             let mut rec = json!({"group": gi, "round": ri, "split": r, "total": r.iter().sum::<usize>(), "pos": seqs.iter().map(|s| s.pos).collect::<Vec<_>>()});
             if !nowide {
+                // DS41_VPROBE_REPS=k: first k timed batched calls (synchronized, rank 0's wall ms), each rolled back
+                if reps > 0 {
+                    let mut ms = Vec::new();
+                    for _ in 0..reps {
+                        let rbs: Vec<_> = (0..b).map(|s| m.spec_checkpoint(&seqs[s], r[s] as i64)).collect();
+                        tch::Cuda::synchronize(0);
+                        let t = std::time::Instant::now();
+                        let _ = { let mut v: Vec<&mut Seq> = seqs.iter_mut().collect(); m.forward_rows_local(&mut v, &rows) };
+                        tch::Cuda::synchronize(0);
+                        ms.push(t.elapsed().as_secs_f64() * 1e3);
+                        for (s, rb) in rbs.into_iter().enumerate() { m.spec_rollback(&mut seqs[s], rb, 0); }
+                    }
+                    rec["ms"] = json!(ms);
+                }
                 let rbs: Vec<_> = (0..b).map(|s| m.spec_checkpoint(&seqs[s], r[s] as i64)).collect();
                 let (loc, _) = { let mut v: Vec<&mut Seq> = seqs.iter_mut().collect(); m.forward_rows_local(&mut v, &rows) };
                 let full = m.logits_full(&loc);
@@ -320,9 +378,12 @@ fn vprobe(m: &Model, plan: &Path, out: &Path, rank: usize) {
                     rec["x_exact_wide"] = json!(ok);
                 }
             }
+            let wdbg = super::model::take_rows_debug();
+            let mut rdbg = Vec::new();
             let mut ok_ref = 0;
             for s in 0..b {
                 let (loc, _) = m.forward_rows_local(&mut [&mut seqs[s]], &[rows[s].clone()]);
+                rdbg.push(super::model::take_rows_debug());
                 let full = m.logits_full(&loc);
                 if let Some(f) = f.as_mut() {
                     put(&mut f[1], &full);
@@ -332,13 +393,18 @@ fn vprobe(m: &Model, plan: &Path, out: &Path, rank: usize) {
                 }
             }
             rec["x_exact_ref"] = json!(ok_ref);
+            // DS41_DEBUG_ROWS=2: per recorded tensor (layer order), the rows of the batched call that differ from the c=1
+            // reference: the first differing (layer, tensor) and every differing one with its max |diff| / max |ref|
+            if w0 && !nowide && super::model::debug_rows_all() && !wdbg.is_empty() {
+                rec["diffs"] = json!(dbg_diffs(&wdbg, &rdbg, r));
+            }
             for s in 0..b { cur[s] += r[s]; }
             if w0 && ri % 10 == 0 { eprintln!("[ds41-vprobe] group {gi} round {ri} ({:.0} s): {rec}", t0.elapsed().as_secs_f64()); }
             meta.push(rec);
         }
     }
-    if let Some(mut f) = f {
-        for w in f.iter_mut() { w.flush().unwrap(); }
+    if let Some(f) = f.as_mut() { for w in f.iter_mut() { w.flush().unwrap(); } }
+    if w0 {
         let j = json!({"vocab": m.c.vocab, "v0": m.sp.v0, "v1": m.sp.v1, "dim": m.head.size()[1], "nowide": nowide, "rounds": meta});
         std::fs::write(out.join("meta.json"), serde_json::to_string(&j).unwrap()).unwrap();
         eprintln!("[ds41-vprobe] done: {} rounds in {:.0} s", j["rounds"].as_array().unwrap().len(), t0.elapsed().as_secs_f64());
@@ -589,6 +655,7 @@ pub fn ckpt_test(ckpt: &Path, hash: &str, p: i64, len: i64) {
     c2.hist = a.hist[..p as usize].to_vec();
     c2.pos = p; c2.hw = p; c2.dec_pos = a.dec_pos;
     c2.ced_tail = Some((ch.shallow_clone(), cp.shallow_clone(), p));
+    c2.ced_cnt = capt.cnt.as_ref().map(|c| (c.shallow_clone(), p));
     let rest = &ids[p as usize..(p + 300) as usize];
     // a checkpoint with dec_pos + window <= p stores no decoder rings (Model::pcache_win): a restore leaves them as they
     // were reset; filled with NaN instead, the continuation must give the same logits (never read)
@@ -604,6 +671,7 @@ pub fn ckpt_test(ckpt: &Path, hash: &str, p: i64, len: i64) {
         c3.hist = a.hist[..p as usize].to_vec();
         c3.pos = p; c3.hw = p; c3.dec_pos = a.dec_pos;
         c3.ced_tail = Some((ch.shallow_clone(), cp.shallow_clone(), p));
+        c3.ced_cnt = capt.cnt.as_ref().map(|c| (c.shallow_clone(), p));
         let l3 = m.logits(&m.prefill_ced(&mut c3, rest, true).unwrap());
         let bad = c3.win.iter().map(|w| w.isnan().sum(Kind::Int64).int64_value(&[])).sum::<i64>();
         (l3, bad)

@@ -293,6 +293,8 @@ pub(super) fn site_z_off(ln: &Tensor, x: &Tensor, eps: f64, off: i64) -> Tensor 
     rmsn(x, ln, eps)
 }
 pub(super) fn site_z(ln: &Tensor, x: &Tensor, eps: f64) -> Tensor { site_z_off(ln, x, eps, 0) }
+/// The clamp count gate's per-row counters (crate::ablate::Clamp::gate_counts), when the gate is on.
+fn gate_cnt() -> Option<Tensor> { crate::ablate::clamp().and_then(|c| c.gate_counts()).map(|c| c.shallow_clone()) }
 
 /// FP4 fake quantization: the fused kernel (DS41_OPS) for BF16 input, else ops::fp4_quant.
 fn fp4q(x: &Tensor, block: i64, e4m3_scale: bool) -> Tensor {
@@ -502,13 +504,22 @@ fn pair_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock
 pub fn ced_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_CED").map_or(true, |v| v != "0")) }
 /// DS41_DEBUG_ROWS=1: the row graphs record row 0 of every layer's S1 outputs, middle output and layer output
 /// (take_rows_debug), to find where two row signatures diverge.
-fn debug_rows() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_DEBUG_ROWS").is_ok_and(|v| v == "1")) }
+fn debug_rows() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_DEBUG_ROWS").is_ok_and(|v| v == "1" || v == "2")) }
+/// DS41_DEBUG_ROWS=2 (diagnostics): every row of every recorded tensor (names "L<i>.<what>*"), and the eager middle's
+/// intermediate tensors through dbg_push (probe::vprobe's first-divergence search).
+pub(super) fn debug_rows_all() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_DEBUG_ROWS").is_ok_and(|v| v == "2")) }
+/// DS41_DEBUG_ROWS=2: record a whole tensor (outside graph capture only).
+pub(super) fn dbg_push(name: String, t: &Tensor) {
+    if !debug_rows_all() || crate::tp::graph::capturing() { return; }
+    ROWS_DBG.with(|d| d.borrow_mut().push((name, t.to_device(Device::Cpu))));
+}
 thread_local! { static ROWS_DBG: std::cell::RefCell<Vec<(String, Tensor)>> = const { std::cell::RefCell::new(Vec::new()) }; }
 fn rows_dbg(i: usize, mid: &[Tensor; 4], o: &Tensor, h: &[Tensor; 5]) {
     if !debug_rows() { return; }
     ROWS_DBG.with(|d| {
         let mut d = d.borrow_mut();
         for (nm, t) in [("x", &mid[0]), ("qr", &mid[1]), ("q", &mid[2]), ("kv", &mid[3]), ("o", o), ("y", &h[0]), ("h2", &h[1]), ("x2", &h[2]), ("moe", &h[3]), ("h", &h[4])] {
+            if debug_rows_all() { d.push((format!("L{i}.{nm}*"), t.to_device(Device::Cpu))); continue; }
             d.push((format!("L{i}.{nm}"), t.narrow(0, 0, 1).to_kind(Kind::Float).to_device(Device::Cpu)));
             d.push((format!("L{i}.{nm}#last"), t.narrow(0, t.size()[0] - 1, 1).to_kind(Kind::Float).to_device(Device::Cpu)));
         }
@@ -566,6 +577,9 @@ pub struct Seq {
     /// CED prefill: the encoder output (residual h [n, hc, dim] BF16, pre-mix [n, hc] FP32) of the last n <= window
     /// positions ending at the given position, for the decoder replay of the prompt's last window
     pub(super) ced_tail: Option<(Tensor, Tensor, i64)>,
+    /// The clamp count gate's encoder counts (Int [n]) of the positions of `ced_tail` (same n, same end), so the CED
+    /// closing replay continues each replayed position's own count (ced_finish; DS41_INV_CNT)
+    pub(super) ced_cnt: Option<(Tensor, i64)>,
     /// Prefix cache checkpoints inside a prefill chunk: positions strictly inside the next chunk (set by the serve loop
     /// before it) whose state is captured while the chunk runs (`ck_cap`), as if the chunk had been cut there.
     pub ck_req: Vec<i64>,
@@ -578,7 +592,9 @@ pub struct Seq {
 /// The state of a sequence at a position inside a prefill chunk that a chunk end would have: the window rings of the
 /// layers that ran (the others are unchanged), the compressor's open groups, the CED encoder tail.
 #[derive(Default)]
-pub struct Capture { pub(super) win: HashMap<usize, Tensor>, pub(super) cs: HashMap<usize, (Tensor, Tensor)>, pub(super) ced: Option<(Tensor, Tensor)> }
+pub struct Capture { pub(super) win: HashMap<usize, Tensor>, pub(super) cs: HashMap<usize, (Tensor, Tensor)>, pub(super) ced: Option<(Tensor, Tensor)>,
+                     /// the encoder counts of `ced`'s positions (DS41_INV_CNT, clamp count gate on)
+                     pub(super) cnt: Option<Tensor> }
 
 fn bf16(t: Tensor) -> Tensor { t.to_kind(Kind::BFloat16) }
 
@@ -860,7 +876,7 @@ impl Model {
             }
         }
         let mtp_win = self.mtp.as_ref().map_or(vec![], |m| (0..m.layers.len()).map(|_| Tensor::zeros([c.window, c.head_dim], opts)).collect());
-        Seq { pos: 0, win, ckv: HashMap::new(), ikv: HashMap::new(), cstate, comp_log: HashMap::new(), mtp_win, hist: Vec::new(), cap: 0, hw: 0, dec_pos: 0, ced_tail: None, vis: None,
+        Seq { pos: 0, win, ckv: HashMap::new(), ikv: HashMap::new(), cstate, comp_log: HashMap::new(), mtp_win, hist: Vec::new(), cap: 0, hw: 0, dec_pos: 0, ced_tail: None, ced_cnt: None, vis: None,
               ck_req: Vec::new(), ck_cap: Default::default() }
     }
     /// The sequence's compressed KV / index keys are `views` (kv_arrays order; e.g. its KV pool lease), its capacity
@@ -890,6 +906,7 @@ impl Model {
         seq.hist.clear();
         seq.comp_log.clear();
         seq.ced_tail = None;
+        seq.ced_cnt = None;
         seq.ck_req.clear();
         seq.ck_cap.clear();
     }
@@ -923,6 +940,8 @@ impl Model {
             f.push(("ced_h".into(), Part::Dev(th.shallow_clone())));
             f.push(("ced_pm".into(), Part::Dev(tp.shallow_clone())));
             meta.insert("ced_end".into(), serde_json::json!(end));
+            // the tail's encoder counts (clamp count gate, DS41_INV_CNT)
+            if let Some((cc, ce)) = seq.ced_cnt.as_ref().filter(|x| x.1 == *end) { let _ = ce; f.push(("ced_cnt".into(), Part::Dev(cc.shallow_clone()))); }
         }
         let hb: Vec<u8> = seq.hist.iter().flat_map(|t| t.to_le_bytes()).collect();
         f.push(("hist".into(), Part::Host { kind: Kind::Int64, shape: vec![seq.hist.len() as i64], bytes: std::sync::Arc::new(hb) }));
@@ -943,6 +962,7 @@ impl Model {
         if !seq.mtp_win.is_empty() { f.push(("mtp_win".into(), Part::Dev(Tensor::stack(&seq.mtp_win, 0)))); }
         f.push(("ced_h".into(), Part::Dev(ch.shallow_clone())));
         f.push(("ced_pm".into(), Part::Dev(cp.shallow_clone())));
+        if let Some(cc) = &cap.cnt { f.push(("ced_cnt".into(), Part::Dev(cc.shallow_clone()))); }
         let mut meta = serde_json::Map::new();
         meta.insert("pos".into(), serde_json::json!(p));
         meta.insert("dec_pos".into(), serde_json::json!(seq.dec_pos));
@@ -988,6 +1008,11 @@ impl Model {
         seq.dec_pos = dec_pos;
         seq.ced_tail = match (o.remove("ced_h"), o.remove("ced_pm"), l.meta["ced_end"].as_i64()) {
             (Some(th), Some(tp), Some(end)) => Some((th, tp, end)),
+            _ => None,
+        };
+        // the tail's encoder counts (DS41_INV_CNT); an entry without them (saved with DS41_INV_CNT=0) restores none
+        seq.ced_cnt = match (o.remove("ced_cnt"), &seq.ced_tail) {
+            (Some(cc), Some((th, _, end))) if cc.size()[0] == th.size()[0] => Some((cc, *end)),
             _ => None,
         };
         Ok(())
@@ -1571,6 +1596,7 @@ impl Model {
         seq.pos += t;
         if seq.dec_pos == start { seq.dec_pos = seq.pos; }
         seq.ced_tail = None;
+        seq.ced_cnt = None;
         if !hid.is_empty() { *self.last_hidden.borrow_mut() = Some(Tensor::cat(&hid, 1)); }
         let x = Self::hc_pre(&h, &pre_mix);
         let x = match keep { Some(rows) => x.index_select(0, &Tensor::from_slice(rows).to_device(dev)), None => x };
@@ -1685,7 +1711,7 @@ impl Model {
                 self.layer_forward(layer, &mut h, &mut pre_mix, seq, &pos, start, &mut sh, &hashes, &mut hid);
             }
         }
-        self.ced_finish(seq, &h, &pre_mix, z, start, t, last, inner, vl, sh)
+        self.ced_finish(seq, &h, &pre_mix, z, start, t, last, inner, vl, sh, None)
     }
 
     /// prefill_ced_one on a, then on b, bit for bit, both taking the sequence-parallel two-micro-batch encoder: the
@@ -1725,13 +1751,16 @@ impl Model {
         let mut pre_mix = Tensor::zeros([ta + tb, c.hc], (Kind::Float, dev));
         let _ = pre_mix.narrow(1, 0, 1).fill_(1.0);
         let z = self.encoder_sp_parts(&mut h, &mut pre_mix, seq, &pos, &parts, &[sa, sa + ta / 2, sb, sb + tb / 2], &hashes, enc, &[(0, ta), (ta, tb)], hs0);
+        // DS41_INV_CNT: each chunk's own encoder counts (a at rows [0, ta), b at [ta, ta + tb)) for ced_finish
+        let own = |o: i64, n: i64| gate_cnt().filter(|_| super::kern::inv_cnt_on()).map(|c| c.narrow(0, o, n).copy());
+        let (ca, cb) = (own(0, ta), own(ta, tb));
         // the clamp's count gate: b's counters where b alone leaves them (from row 0; the decoder replay reads them)
         if let Some(cnt) = crate::ablate::clamp().and_then(|c| c.gate_counts()) {
             let bc = cnt.narrow(0, ta, tb).copy();
             let _ = cnt.narrow(0, 0, tb).copy_(&bc);
         }
-        let _ = self.ced_finish(seq, &h.narrow(0, 0, ta), &pre_mix.narrow(0, 0, ta), z.as_ref().map(|z| z.narrow(0, 0, ta)), sa, ta, false, true, vl, Shared::default());
-        self.ced_finish(seq, &h.narrow(0, ta, tb), &pre_mix.narrow(0, ta, tb), z.as_ref().map(|z| z.narrow(0, ta, tb)), sb, tb, last, inner, vl_set(None), Shared::default())
+        let _ = self.ced_finish(seq, &h.narrow(0, 0, ta), &pre_mix.narrow(0, 0, ta), z.as_ref().map(|z| z.narrow(0, 0, ta)), sa, ta, false, true, vl, Shared::default(), ca);
+        self.ced_finish(seq, &h.narrow(0, ta, tb), &pre_mix.narrow(0, ta, tb), z.as_ref().map(|z| z.narrow(0, ta, tb)), sb, tb, last, inner, vl_set(None), Shared::default(), cb)
     }
 
     /// The end of a CED prefill chunk after its encoder layers (h / pre_mix the chunk's encoder output): the decoder's
@@ -1740,7 +1769,8 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     /// `z`: hc_pre(h, pre_mix) when the encoder computed it (encoder_sp_parts: then h holds only the rows read below).
     #[allow(clippy::too_many_arguments)]
-    fn ced_finish(&self, seq: &mut Seq, h: &Tensor, pre_mix: &Tensor, z: Option<Tensor>, start: i64, t: i64, last: bool, inner: bool, vl: VlGuard, mut sh: Shared) -> Option<Tensor> {
+    fn ced_finish(&self, seq: &mut Seq, h: &Tensor, pre_mix: &Tensor, z: Option<Tensor>, start: i64, t: i64, last: bool, inner: bool, vl: VlGuard, mut sh: Shared,
+                  own_cnt: Option<Tensor>) -> Option<Tensor> {
         let c = &self.c;
         let dev = self.dev;
         let enc = (c.n_layers / 2) as usize;
@@ -1750,6 +1780,28 @@ impl Model {
             prof("attn.compress", || self.compress(layer, &x, seq, start, &x, &mut sh));
         }
         let w = c.window;
+        // The clamp's count gate (SPARK_ABLATE_CLAMP_MIN > 1, crate::ablate) counts per row the triggered sites of one
+        // forward pass, from layer 0's attention input on; a site edits a row once the row's count reaches m. Under CED a
+        // position's pass is split: its encoder layers run in its prompt chunk, its decoder layers in the closing replay
+        // below, which reads the counters of rows [0, r) without a reset. DS41_INV_CNT (default on; 0: the previous
+        // behaviour): those rows get each replayed position's own encoder count (carried with the encoder tail, through
+        // chunks and prefix-cache checkpoints), i.e. what one uninterrupted pass over the prompt counts. Before, the
+        // replay read rows [0, r) as left by the last GPU pass -- this chunk's FIRST rows (not the replayed positions)
+        // and, when the chunk is shorter than the replay window (the prefix-cache cut before the last token, a restored
+        // checkpoint), rows of the previous pass on the GPU: another sequence's chunk or decode step, a previous request.
+        let gate = gate_cnt().filter(|_| super::kern::inv_cnt_on());
+        let tc = gate.as_ref().map(|cnt| {
+            let mine = own_cnt.unwrap_or_else(|| cnt.narrow(0, 0, t).copy());
+            match seq.ced_cnt.take() {
+                Some((pc, end)) if end == start && seq.ced_tail.as_ref().is_some_and(|x| x.2 == start) => Tensor::cat(&[pc, mine], 0),
+                // a contiguous encoder tail whose counts are unknown (never: every tail is saved with its counts while
+                // DS41_INV_CNT is on): zeros
+                _ => match &seq.ced_tail {
+                    Some((th, _, end)) if *end == start => Tensor::cat(&[Tensor::zeros([th.size()[0]], (Kind::Int, dev)), mine], 0),
+                    _ => mine,
+                },
+            }
+        });
         let (th, tp) = match seq.ced_tail.take() {
             Some((th, tp, end)) if end == start => (Tensor::cat(&[th, h.shallow_clone()], 0), Tensor::cat(&[tp, pre_mix.shallow_clone()], 0)),
             _ => (h.shallow_clone(), pre_mix.shallow_clone()),
@@ -1760,11 +1812,14 @@ impl Model {
             if p > start && (p < start + t || (inner && p == start + t)) {
                 let e = n - (start + t - p);
                 let k = e.min(w);
-                seq.ck_cap.entry(p).or_default().ced = Some((th.narrow(0, e - k, k).copy(), tp.narrow(0, e - k, k).copy()));
+                let cap = seq.ck_cap.entry(p).or_default();
+                cap.ced = Some((th.narrow(0, e - k, k).copy(), tp.narrow(0, e - k, k).copy()));
+                cap.cnt = tc.as_ref().map(|c| c.narrow(0, e - k, k).copy());
             }
         }
         let keep = n.min(w);
         seq.ced_tail = Some((th.narrow(0, n - keep, keep).copy(), tp.narrow(0, n - keep, keep).copy(), start + t));
+        seq.ced_cnt = tc.as_ref().map(|c| (c.narrow(0, n - keep, keep).copy(), start + t));
         seq.pos += t;
         drop(vl);
         if !last { return None; }
@@ -1773,6 +1828,16 @@ impl Model {
         let have = th.size()[0];
         let (r0, lo) = if seq.dec_pos >= end - have { (seq.dec_pos, 0) } else { (end - have, end - have) };
         let r = end - r0;
+        if let (Some(cnt), Some((cc, _))) = (&gate, &seq.ced_cnt) { let _ = cnt.narrow(0, 0, r).copy_(&cc.narrow(0, have - r, r)); }
+        // DS41_CNT_TRACE=1 (diagnostic, rank 0): the count-gate rows the replay starts from
+        static TR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TR.get_or_init(|| std::env::var("DS41_CNT_TRACE").is_ok_and(|v| v == "1")) && self.sp.rank == 0 {
+            if let Some(cnt) = crate::ablate::clamp().and_then(|cl| cl.gate_counts()) {
+                let v = Vec::<i32>::try_from(cnt.narrow(0, 0, r).to_device(Device::Cpu)).unwrap_or_default();
+                let (nz, h) = v.iter().enumerate().fold((0, 0u64), |(nz, h), (i, &x)| (nz + (x != 0) as usize, h.wrapping_mul(1_000_003).wrapping_add((x as u64) ^ i as u64)));
+                eprintln!("[ds41] cnt-trace replay end {end} rows {r} chunk {t}: nonzero {nz}, sum {}, hash {h:016x}, head {:?}", v.iter().map(|&x| x as i64).sum::<i64>(), &v[..v.len().min(12)]);
+            }
+        }
         let mut hr = th.narrow(0, have - r, r).copy();
         let mut pr = tp.narrow(0, have - r, r).copy();
         let rpos = Tensor::arange_start(r0, end, (Kind::Int64, dev));
@@ -1781,6 +1846,16 @@ impl Model {
         let _vl = vl_set(self.image_rows(seq, r0, end));
         for layer in self.layers.iter().filter(|l| l.id >= enc) {
             self.layer_forward(layer, &mut hr, &mut pr, seq, &rpos, r0, &mut sh, &[], &mut hid);
+        }
+        // DS41_CNT_TRACE: replayed rows whose count reached the gate's m (edited at some site of the pass), and the
+        // replayed positions' encoder counts already at m
+        if *TR.get_or_init(|| false) && self.sp.rank == 0 {
+            if let Some(cl) = crate::ablate::clamp().filter(|cl| cl.gate_counts().is_some()) {
+                let m = cl.min_m() as i64;
+                let after = cl.gate_counts().unwrap().narrow(0, 0, r).ge(m).sum(Kind::Int64).int64_value(&[]);
+                let enc_m = seq.ced_cnt.as_ref().map(|(cc, _)| cc.narrow(0, have - r, r).ge(m).sum(Kind::Int64).int64_value(&[]));
+                eprintln!("[ds41] cnt-trace replay end {end}: rows at m={m} after the decoder {after}, encoder-only {enc_m:?}");
+            }
         }
         seq.dec_pos = end;
         if !hid.is_empty() { *self.last_hidden.borrow_mut() = Some(Tensor::cat(&hid, 1)); }
@@ -2538,8 +2613,14 @@ impl Model {
         let y = prof("attn.out", || {
             // per group: o[:, g] [T, hpg*hd] x wo_a[g]^T -> BF16 [T, o_lora] (the official BF16 einsum; FP8 weight exact)
             let o3 = o.view([t, gl, -1]);
-            let oa = if gemv_on() && t <= super::kern::grouped_max_rows() {
+            let gm = super::kern::grouped_max_rows();
+            let oa = if gemv_on() && t <= gm {
                 bf16(super::kern::fp8_gemv_grouped(&o3.reshape([t, -1]), &a.wo_a.w, &a.wo_a.s, c.o_lora))
+            } else if gemv_on() && t <= 32 && super::kern::inv_woa_on() && super::kern::wide() {
+                // DS41_INV_WOA (batch invariance): grouped-GEMV chunks of grouped_max_rows() rows
+                let o2 = o3.reshape([t, -1]);
+                let parts: Vec<Tensor> = (0..t).step_by(gm as usize).map(|r| bf16(super::kern::fp8_gemv_grouped(&o2.narrow(0, r, gm.min(t - r)), &a.wo_a.w, &a.wo_a.s, c.o_lora))).collect();
+                Tensor::cat(&parts, 0)
             } else if gemv_on() && t > 64 && wo_a_mma() && wo_a_act() && moe_mx_on() && (o3.size()[2] % 64) == 0 {
                 // prefill rows: each group on the block-scaled MMA GEMM (o is already act_quant'ed, so its E4M3 + UE8M0
                 // operands are exactly o's values: the products are the BF16 einsum's, only the FP32 sum order differs)
@@ -2625,6 +2706,11 @@ impl Model {
     pub(super) fn comp_proj(&self, layer: &Layer, x: &Tensor) -> Tensor {
         let cm = layer.attn.comp.as_ref().unwrap();
         let t = x.size()[0];
+        // DS41_INV_PROJ8 (batch invariance): more than 8 rows of a decode / verify call as <= 8-row GEMV chunks
+        if gemv_on() && t > 8 && t <= 64 && super::kern::inv_proj_on() && super::kern::wide() {
+            let parts: Vec<Tensor> = (0..t).step_by(8).map(|r| self.comp_proj(layer, &x.narrow(0, r, 8.min(t - r)))).collect();
+            return Tensor::cat(&parts, 0);
+        }
         let gemv = gemv_on() && t <= 8;
         if self.c.compress[layer.id] == 1 {
             return if gemv { bf16(super::kern::bf16_gemv(x, &cm.wkv)) } else { x.matmul(&cm.wkv.tr()) };
@@ -2651,7 +2737,12 @@ impl Model {
         let t = x.size()[0];
         let (nh, id, rd) = (c.index_heads, c.index_dim, c.rope_dim);
         let q = fp4q(&rot_mut(ix.wq_b.mm(qr).view([t, nh, id]), &layer.attn.rope, pos, rd, false), 32, false);   // [T, nh, id]
-        let wp = if gemv_on() && t <= 8 { bf16(super::kern::bf16_gemv(x, &ix.weights_proj)) } else { x.matmul(&ix.weights_proj.tr()) };
+        let wp = if gemv_on() && t <= 8 { bf16(super::kern::bf16_gemv(x, &ix.weights_proj)) }
+                 else if gemv_on() && t <= 64 && super::kern::inv_proj_on() && super::kern::wide() {
+                     // (DS41_INV_PROJ8: <= 8-row GEMV chunks, the c=1 path's rows)
+                     let parts: Vec<Tensor> = (0..t).step_by(8).map(|r| bf16(super::kern::bf16_gemv(&x.narrow(0, r, 8.min(t - r)), &ix.weights_proj))).collect();
+                     Tensor::cat(&parts, 0)
+                 } else { x.matmul(&ix.weights_proj.tr()) };
         let wts = wp * ((id as f64).powf(-0.5) * (nh as f64).powf(-0.5));                                         // [T, nh] BF16
         (q, wts)
     }
@@ -2995,6 +3086,7 @@ impl Seq {
         if self.dec_pos == self.pos { self.dec_pos += n; }
         self.pos += n;
         self.ced_tail = None;
+        self.ced_cnt = None;
     }
 }
 
