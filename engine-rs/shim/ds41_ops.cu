@@ -37,8 +37,8 @@ __global__ void rms_norm_kernel(const __nv_bfloat16* __restrict__ x, const __nv_
 }
 
 // rms_norm for n % 8 == 0, n <= 8 * 2 * 512: every thread keeps up to two 8-element vectors of the row in registers
-// (one read of x; the generic kernel above reads it twice), 16-byte loads and stores. With a clamp (docs/05-消融.md
-// §3a, the GLM FUSE=2 approach): the row's normalized fp32 values are clamped in registers before the BF16 store --
+// (one read of x; the generic kernel above reads it twice), 16-byte loads and stores. With a clamp (docs/abliteration.md
+// §3, the GLM FUSE=2 approach): the row's normalized fp32 values are clamped in registers before the BF16 store --
 // per-thread partial dots c_j = z . d_j, the block reduction + count gate of shim/ablate_clamp.cuh, then the update
 // subtracted on a second (L2-cached) read of d. Zero extra kernels, no fp32 round-trip of z; cl.d == null is the
 // original kernel (same fmuls, same rounding).
@@ -648,7 +648,7 @@ int ds41_rms_norm(const void* x, const void* w, void* y, int rows, int n, float 
   pdl_launch(rms_norm_kernel, dim3(rows), dim3(threads), 0, st, (const __nv_bfloat16*)x, (const __nv_bfloat16*)w, (__nv_bfloat16*)y, n, eps);
   return (int)cudaGetLastError();
 }
-/// The clamped-site variant (docs/05-消融.md §3a): BF16 x/w and a vec-eligible n (the 5120 sublayer-input shapes),
+/// The clamped-site variant (docs/abliteration.md §3): BF16 x/w and a vec-eligible n (the 5120 sublayer-input shapes),
 /// else -1 and the caller falls back to the row kernel. `cl`'s count pointer may be offset to the caller's row base
 /// (the encoder two-micro-batch path).
 int ds41_rms_norm_cl(const void* x, const void* w, void* y, int rows, int n, float eps, const SparkClamp* cl, cudaStream_t st) {

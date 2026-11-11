@@ -37,14 +37,14 @@ interfaces of each node a point-to-point address, for example:
 
 | Interface | Node A (rank 0, head) | Node B (rank 1, worker) |
 | --- | --- | --- |
-| `enp1s0f0np0` (RDMA device `rocep1s0f0`) | 10.0.1.2/30 | 10.0.1.1/30 |
-| `enP2p1s0f0np0` (RDMA device `roceP2p1s0f0`) | 10.0.2.2/30 | 10.0.2.1/30 |
+| `enp1s0f0np0` (RDMA device `rocep1s0f0`) | 172.16.1.1/30 | 172.16.1.2/30 |
+| `enP2p1s0f0np0` (RDMA device `roceP2p1s0f0`) | 172.16.2.1/30 | 172.16.2.2/30 |
 
-Check with `ibv_devinfo -d rocep1s0f0` (`PORT_ACTIVE`, link layer Ethernet) and `ping 10.0.1.1`. RoCE v2 uses GID index 3
+Check with `ibv_devinfo -d rocep1s0f0` (`PORT_ACTIVE`, link layer Ethernet) and `ping 172.16.1.2`. RoCE v2 uses GID index 3
 on DGX OS; NCCL and the engine's RDMA all-reduce use both RDMA devices.
 
 Node A starts rank 1 on node B over ssh: set up key-based login from A to B for the user that runs the server (the
-example uses `root@10.0.1.1`). Install the release, the Python environment and the models **at the same paths on both
+example uses `root@172.16.1.2`). Install the release, the Python environment and the models **at the same paths on both
 nodes**; the launcher refuses to start if the two engine binaries differ.
 
 ### Three nodes (GLM TP3)

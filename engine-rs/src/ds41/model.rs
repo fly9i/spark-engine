@@ -268,7 +268,7 @@ fn ops_fused() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLo
 pub(super) fn rmsn(x: &Tensor, w: &Tensor, eps: f64) -> Tensor {
     if ops_fused() && x.kind() == Kind::BFloat16 && w.kind() == Kind::BFloat16 { super::kern::rms_norm(x, w, eps) } else { rms_norm(x, w, eps) }
 }
-/// SPARK_ABLATE_CLAMP on a sublayer input z (docs/05-消融.md §3): the clamp runs on fp32 rows while the DS41 stream is
+/// SPARK_ABLATE_CLAMP on a sublayer input z (docs/abliteration.md §3): the clamp runs on fp32 rows while the DS41 stream is
 /// BF16, so an upcast copy is clamped and rounded back. `ln` is the site's norm weight (registered at load with its
 /// layer and site); returns z itself when SPARK_ABLATE_CLAMP is unset (zero overhead for unablated runs).
 pub(super) fn clamp_z(ln: &Tensor, z: Tensor) -> Tensor {
@@ -277,7 +277,7 @@ pub(super) fn clamp_z(ln: &Tensor, z: Tensor) -> Tensor {
     c.apply_input(ln, &z32);
     z32.to_kind(z.kind())
 }
-/// The sublayer input z = rmsn(x, ln) (docs/05-消融.md §3a): with the clamp fused into the ds41 rms_norm vec kernel's
+/// The sublayer input z = rmsn(x, ln) (docs/abliteration.md §3): with the clamp fused into the ds41 rms_norm vec kernel's
 /// fp32 registers (GLM FUSE=2 style: no fp32 round-trip, no extra kernel) when available, else the fp32-upcast +
 /// row-kernel fallback above (STATS mode, FUSE < 2, non-vec shapes). `off` is the row base of these z's rows in the
 /// pass (the encoder two-micro-batch path's count gate).

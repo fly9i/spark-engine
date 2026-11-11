@@ -709,7 +709,7 @@ fn prefill_prompt(m: &Model, ids: &[i64]) {
 }
 
 /// `ds41-refusal-dir <ckpt> <harmful_ids.json> <harmless_ids.json> <engram_hash.json> <out.safetensors>` (all TP3
-/// ranks, rank 0 writes): the GLM `glm-refusal-dir` flow for DS41 (docs/05-消融.md §2/§3). Every prompt is prefilled
+/// ranks, rank 0 writes): the GLM `glm-refusal-dir` flow for DS41 (docs/abliteration.md §2 / §3). Every prompt is prefilled
 /// (CED, eager) with the ablate capture on; per layer the raw attention-input z's last SPARK_ABLATE_POSITIONS rows
 /// (default 8, the assistant turn's opening tokens) are recorded, and mean(harmful) - mean(harmless) per layer and
 /// position gives `directions_pos` / `directions` / `scores` / `direction`. Run with SPARK_ABLATE_CLAMP unset and
@@ -736,7 +736,7 @@ pub fn refusal_dir(ckpt: &Path, harmful: &Path, harmless: &Path, hash: &Path, ou
 }
 
 /// `ds41-feed <ckpt> <engram_hash.json> <ids.json>` (all TP3 ranks): teacher-forced prefill of every prompt, no
-/// generation -- the calibration feed for SPARK_ABLATE_CLAMP_STATS (docs/05-消融.md §3): the clamp STATS mode itself
+/// generation -- the calibration feed for SPARK_ABLATE_CLAMP_STATS (docs/abliteration.md §3): the clamp STATS mode itself
 /// appends every site's projections to <dir>/L<layer>-<site>.f32 and the row counts to <dir>/calls.txt (rank 0). Use a
 /// +-inf threshold skeleton file so nothing is edited while recording, and keep the feed order (normal corpus first,
 /// then the 256 harmless prompts) that clamp_fit.py expects.
@@ -755,7 +755,7 @@ pub fn feed(ckpt: &Path, hash: &Path, ids_json: &Path) {
 }
 
 /// `ds41-clamp-test` (single GPU, SPARK_ABLATE_CLAMP=<file> [SPARK_ABLATE_CLAMP_MIN=m]): the fused rms_norm vec
-/// epilogue (shim/ds41_ops.cu, docs/05-消融.md §3a) against the ATen reference -- fp32 z = w * x * rstd from the same
+/// epilogue (shim/ds41_ops.cu, docs/abliteration.md §3) against the ATen reference -- fp32 z = w * x * rstd from the same
 /// BF16 inputs, per-site clamp with the count gate and the reset at site (0, 0), two chained sites like one layer.
 pub fn clamp_norm_test() {
     let _g = tch::no_grad_guard();

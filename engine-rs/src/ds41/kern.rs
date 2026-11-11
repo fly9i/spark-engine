@@ -669,7 +669,7 @@ pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Tensor {
     assert_eq!(unsafe { ds41_rms_norm(x.data_ptr(), w.data_ptr(), y.data_ptr(), (x.numel() as i64 / n) as i32, n as i32, eps as f32, rs_current_stream()) }, 0, "ds41_rms_norm");
     y
 }
-/// rms_norm with the conditional-clamp epilogue fused into the vec kernel (docs/05-消融.md §3a, GLM FUSE=2 style):
+/// rms_norm with the conditional-clamp epilogue fused into the vec kernel (docs/abliteration.md §3, GLM FUSE=2 style):
 /// the site's z is clamped on its fp32 register values before the BF16 store -- no fp32 round-trip, no extra kernel.
 /// `a`'s count pointer may already be offset to the caller's row base (encoder two-micro-batch). None when the shape
 /// has no fused path (non-BF16, n not vec-eligible, or the kernel declined) -- the caller falls back to the row kernel.

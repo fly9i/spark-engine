@@ -117,9 +117,9 @@ pub fn apply_marked(layer: usize, y: &Tensor) { if let Some(a) = get() { if a.co
 /// target (e.g. the harmless median) instead of the nearest threshold: z - sum_j [c_j outside] (c_j - target_j) d_j.
 /// SPARK_ABLATE_CLAMP_MIN=m (default 1 = every triggered site edits): count gate over the sublayer inputs of one forward
 /// pass -- a row is edited at a triggered site only once m sites (this one included, from layer 0's attention input on)
-/// have triggered for it, so isolated threshold crossings in ordinary text pass through (q56 stats: tokens edited
-/// 11.7% -> 2.4% at m = 8, harmful prompts' last token still covered). The final site is not gated (its rows are not
-/// the pass's rows in prefill). Needs SPARK_ABLATE_CLAMP_FUSE >= 1.
+/// have triggered for it, so isolated threshold crossings in ordinary text pass through (the count is per row and per
+/// forward pass; a larger m needs more triggered sites per row before an edit). The final site is not gated (its
+/// rows are not the pass's rows in prefill). Needs SPARK_ABLATE_CLAMP_FUSE >= 1.
 pub struct Clamp { d: Tensor, tau: Tensor, tau_lo: Tensor, tau_final: Tensor, tau_final_lo: Tensor, target: Option<Tensor>, target_final: Option<Tensor>, sites: std::sync::Mutex<std::collections::HashMap<usize, (usize, usize)>>,
                    min: i32, count: Tensor }
 /// Rows of one forward pass the count gate can track.
@@ -198,7 +198,7 @@ impl Clamp {
         let (l, s) = (layer as i64, site as i64);
         Some(self.args(&self.tau.get(l).get(s), &self.tau_lo.get(l).get(s), self.target.as_ref().map(|t| t.get(l).get(s)).as_ref(), Some((layer, site)), rows))
     }
-    /// The same fused-site args for the DS41 rms_norm vec epilogue (docs/05-消融.md §3a), with the count-gate rows
+    /// The same fused-site args for the DS41 rms_norm vec epilogue (docs/abliteration.md §3), with the count-gate rows
     /// based at `off`: the encoder two-micro-batch path's batch-B z rows are the pass's rows [off, off + rows), so its
     /// count pointer is offset (GLM's mhc launcher does the same by bumping the pointer).
     pub fn norm_args(&self, ln: &Tensor, rows: i64) -> Option<ClampArgs> { self.norm_args_off(ln, rows, 0) }

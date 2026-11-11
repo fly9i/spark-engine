@@ -18,8 +18,8 @@ Three layers of settings:
 | `SPARK_PORT` | `8888` | HTTP port of the OpenAI-compatible API (all models use it; one model runs at a time). |
 | `GLM_MODEL` | `/models/GLM-5.3-Flash-tr3-4bpw` | GLM-5.3-Flash EXL3 checkpoint directory (both nodes). |
 | `GLM_DRAFTER` | `/models/GLM-5.3-Flash-DFlash2` | DFlash2 drafter directory (both nodes). |
-| `SPARK_WORKERS` | `"root@10.0.1.1 root@10.0.3.2"` | ssh targets of ranks 1 and 2 (key-based login from rank 0's node); two-node runs use the first. Replaces `GLM_WORKER`, which still works. |
-| `SPARK_MASTER_ADDRS` | `"10.0.1.2 10.0.1.2 10.0.3.1"` | Address of rank 0 as seen from rank 0, 1, 2 (each worker over its own RoCE link). Replaces `GLM_MASTER_ADDR` (one address for every rank), which still works. |
+| `SPARK_WORKERS` | `"root@172.16.1.2 root@172.16.3.2"` | ssh targets of ranks 1 and 2 (key-based login from rank 0's node); two-node runs use the first. Replaces `GLM_WORKER`, which still works. |
+| `SPARK_MASTER_ADDRS` | `"172.16.1.1 172.16.1.1 172.16.3.1"` | Address of rank 0 as seen from rank 0, 1, 2 (each worker over its own RoCE link). Replaces `GLM_MASTER_ADDR` (one address for every rank), which still works. |
 | `SPARK_TP3_IFNAME` | — | Optional (three nodes). Since v0.3.11 TP3 builds no NCCL group (`GLM53_TP_NCCL=0`) and needs no shared network; only a `GLM53_TP_NCCL=1` debugging run bootstraps NCCL over this interface. |
 | `GLM_WORLD` | `2` | Nodes for GLM: 2 or 3 (`start.sh glm3` runs 3 regardless). |
 | `GLM_MASTER_PORT` | `29931` | TCP port of the rendezvous store. |

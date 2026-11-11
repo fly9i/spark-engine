@@ -33,13 +33,13 @@ sudo sysctl --system
 
 | 接口 | 节点 A（rank 0，主节点） | 节点 B（rank 1，工作节点） |
 | --- | --- | --- |
-| `enp1s0f0np0`（RDMA 设备 `rocep1s0f0`） | 10.0.1.2/30 | 10.0.1.1/30 |
-| `enP2p1s0f0np0`（RDMA 设备 `roceP2p1s0f0`） | 10.0.2.2/30 | 10.0.2.1/30 |
+| `enp1s0f0np0`（RDMA 设备 `rocep1s0f0`） | 172.16.1.1/30 | 172.16.1.2/30 |
+| `enP2p1s0f0np0`（RDMA 设备 `roceP2p1s0f0`） | 172.16.2.1/30 | 172.16.2.2/30 |
 
-用 `ibv_devinfo -d rocep1s0f0`（`PORT_ACTIVE`，链路层为 Ethernet）和 `ping 10.0.1.1` 检查。在 DGX OS 上 RoCE v2 使用 GID 索引 3；
+用 `ibv_devinfo -d rocep1s0f0`（`PORT_ACTIVE`，链路层为 Ethernet）和 `ping 172.16.1.2` 检查。在 DGX OS 上 RoCE v2 使用 GID 索引 3；
 NCCL 和引擎自带的 RDMA all-reduce 会同时使用两个 RDMA 设备。
 
-节点 A 通过 ssh 在节点 B 上启动 rank 1：为运行服务的用户配置从 A 到 B 的密钥登录（示例使用 `root@10.0.1.1`）。在**两个节点的相同路径下**安装发布包、Python 环境和模型；如果两个节点的引擎二进制不一致，启动脚本会拒绝启动。
+节点 A 通过 ssh 在节点 B 上启动 rank 1：为运行服务的用户配置从 A 到 B 的密钥登录（示例使用 `root@172.16.1.2`）。在**两个节点的相同路径下**安装发布包、Python 环境和模型；如果两个节点的引擎二进制不一致，启动脚本会拒绝启动。
 
 ### 三节点（GLM TP3）
 

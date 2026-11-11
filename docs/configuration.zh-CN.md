@@ -18,8 +18,8 @@
 | `SPARK_PORT` | `8888` | OpenAI 兼容 API 的 HTTP 端口（所有模型共用；同一时间只运行一个模型）。 |
 | `GLM_MODEL` | `/models/GLM-5.3-Flash-tr3-4bpw` | GLM-5.3-Flash EXL3 checkpoint 目录（两个节点）。 |
 | `GLM_DRAFTER` | `/models/GLM-5.3-Flash-DFlash2` | DFlash2 草稿模型目录（两个节点）。 |
-| `SPARK_WORKERS` | `"root@10.0.1.1 root@10.0.3.2"` | rank 1 和 rank 2 的 ssh 目标（需从 rank 0 所在节点以密钥登录）；两节点运行时用第一个。取代 `GLM_WORKER`（仍然可用）。 |
-| `SPARK_MASTER_ADDRS` | `"10.0.1.2 10.0.1.2 10.0.3.1"` | 从 rank 0、1、2 看到的 rank 0 地址（每个工作节点经各自的 RoCE 链路）。取代 `GLM_MASTER_ADDR`（所有 rank 用同一地址，仍然可用）。 |
+| `SPARK_WORKERS` | `"root@172.16.1.2 root@172.16.3.2"` | rank 1 和 rank 2 的 ssh 目标（需从 rank 0 所在节点以密钥登录）；两节点运行时用第一个。取代 `GLM_WORKER`（仍然可用）。 |
+| `SPARK_MASTER_ADDRS` | `"172.16.1.1 172.16.1.1 172.16.3.1"` | 从 rank 0、1、2 看到的 rank 0 地址（每个工作节点经各自的 RoCE 链路）。取代 `GLM_MASTER_ADDR`（所有 rank 用同一地址，仍然可用）。 |
 | `SPARK_TP3_IFNAME` | — | 可选（三节点）。v0.3.11 起 TP3 不建 NCCL 组（`GLM53_TP_NCCL=0`），不需要三台共享的网络；只有 `GLM53_TP_NCCL=1` 排查时用这个接口引导 NCCL。 |
 | `GLM_WORLD` | `2` | GLM 的节点数：2 或 3（`start.sh glm3` 总是用 3）。 |
 | `GLM_MASTER_PORT` | `29931` | 汇合存储（rendezvous store）的 TCP 端口。 |
