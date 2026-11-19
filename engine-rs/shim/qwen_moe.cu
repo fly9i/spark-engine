@@ -110,9 +110,9 @@ int qwen_moe_gate_scale(const void* gl, int64_t ldg, int col, const void* d, voi
 }
 size_t qwen_moe_ws_bytes(int R, int S) { return moex::ws_bytes<moex::QwenMoe>(R, S); }
 int qwen_moe_experts(const void* x, int64_t ldx, int R, const void* idx, const void* w, const void* tab,
-                     const void* add, void* out, void* ws, int S, cudaStream_t st)
+                     const void* add, void* out, void* ws, int S, int kmask, cudaStream_t st)
 {
-    return moex::experts<moex::QwenMoe>(x, ldx, R, idx, w, tab, add, out, ws, S, st);
+    return moex::experts<moex::QwenMoe>(x, ldx, R, idx, w, tab, add, out, ws, S, st, nullptr, kmask);
 }
 
 }

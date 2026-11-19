@@ -81,7 +81,7 @@ streams prose 69.3 / 97.7 / 129.4, structured 127.1 / 180.0 / 219.4, code 112.3 
 
 | Component | GLM-5.3-Flash | DeepSeek-V4.1-Flash | Qwen3.8-Flash-Next |
 | --- | --- | --- | --- |
-| Routed experts (weights) | EXL3 **4 bpw**, mcg codebook | official **MXFP4** (E2M1 + E8M0 / 32) | EXL3 **4.05 bpw** (head 6, MTP 4), mul1 codebook |
+| Routed experts (weights) | EXL3 **4 bpw**, mcg codebook | official **MXFP4** (E2M1 + E8M0 / 32) | EXL3 **4.05 bpw** (head 6, MTP 4), mul1 codebook; experts and dense layers at K = 2..6 also load |
 | Dense weights — prefill | source precision (FP16), cuBLAS | official FP8 (32×32 block scales) / BF16, block-scaled tensor-core MMA | source precision |
 | Dense weights — decode | **Q8** (int8 + FP32 scale / 128, ~0.67% RMS; lossless 12-bit C12 optional) | official FP8 / BF16, block-scaled GEMV | FP16 (int8 copies optional) |
 | Attention compute | MLA/DSA in FP32/TF32; DSA indexer sparse | sparse attention, FP32 accumulate; FP4 indexer, official KV formats | QSA FP32 accumulate; learned sparse selection |

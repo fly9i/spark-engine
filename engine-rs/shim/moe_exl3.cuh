@@ -236,7 +236,7 @@ static __global__ void pexp_kernel(const int* __restrict__ G, const int* __restr
     for (int j = threadIdx.x; j < gcnt[g]; j += blockDim.x) pexp[goff[g] + j] = gexp[g];
 }
 
-// Mixed-K layers (E3): every expert has its own trellis width K in 3..6, stored as a value in row 9 of the pointer table.
+// Mixed-K layers (E3): every expert has its own trellis width K in 2..6, stored as a value in row 9 of the pointer table.
 // Decode kernels run BITS = 0 and dispatch per item (MOEX_WITH_BITS); prefill kernels run once per K present with KF =
 // true (CTAs of other experts return). BITS != 0 / KF = false: exactly the previous instances.
 template <class C> __device__ __forceinline__ int expert_bits(const uint64_t* tab, int e) { return (int) tab[9 * C::E + e]; }
@@ -244,6 +244,7 @@ template <class C> __device__ __forceinline__ int expert_bits(const uint64_t* ta
     do {                                                                                                                  \
         if constexpr ((BITS) != 0) { constexpr int KB = (BITS); constexpr bool DYN = false; __VA_ARGS__; }                \
         else switch (KX) {                                                                                                \
+            case 2: { constexpr int KB = 2; constexpr bool DYN = true; __VA_ARGS__; } break;                              \
             case 3: { constexpr int KB = 3; constexpr bool DYN = true; __VA_ARGS__; } break;                              \
             case 4: { constexpr int KB = 4; constexpr bool DYN = false; __VA_ARGS__; } break;                             \
             case 5: { constexpr int KB = 5; constexpr bool DYN = true; __VA_ARGS__; } break;                              \
@@ -1166,7 +1167,7 @@ __global__ __launch_bounds__(512) void gu_gemm_kernel(const half* __restrict__ x
         for (int kk = 0; kk < KC / 16; ++kk)
         {
             const uint32_t* p = W + (kk * 8 + wn) * NW;
-            qexl3::decode_tile<BITS, C::CBK>(p[lane], NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u, lane, bb[kk]);
+            qexl3::decode_tile<BITS, C::CBK>(NW >= 32 || lane < NW ? p[lane] : 0u, NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u, lane, bb[kk]);
         }
         #pragma unroll
         for (int kk = 0; kk < KC / 16; ++kk)
@@ -1481,6 +1482,7 @@ template <class C, int NS, int KCG>
 void gu2_mixed(int kmask, const half* xh1, const uint64_t* tab, const int* G, const int* gexp, const int* goff, const int* gcnt,
                const int* prow, half* xh2, int Gmax, cudaStream_t st)
 {
+    if (kmask & (1 << 2)) gu2_k<C, 2, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
     if (kmask & (1 << 3)) gu2_k<C, 3, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
     if (kmask & (1 << 4)) gu2_k<C, 4, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
     if (kmask & (1 << 5)) gu2_k<C, 5, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
@@ -1491,6 +1493,7 @@ void gux_mixed(int kmask, const XT* x, int64_t ldx, const uint64_t* tab, const i
                const int* prow, half* xh2, int Gmax, cudaStream_t st)
 {
     const dim3 grid(C::I / 128, 2 * Gmax);
+    if (kmask & (1 << 2)) gux_kernel<C, 2, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
     if (kmask & (1 << 3)) gux_kernel<C, 3, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
     if (kmask & (1 << 4)) gux_kernel<C, 4, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
     if (kmask & (1 << 5)) gux_kernel<C, 5, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
@@ -1501,6 +1504,7 @@ void down_mixed(int kmask, const half* xh2, const uint64_t* tab, const int* G, c
                 int P, OT* yd, cudaStream_t st)
 {
     const dim3 grid(C::H / 128, Gmax);
+    if (kmask & (1 << 2)) gemm_grouped_kernel<C, 2, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
     if (kmask & (1 << 3)) gemm_grouped_kernel<C, 3, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
     if (kmask & (1 << 4)) gemm_grouped_kernel<C, 4, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
     if (kmask & (1 << 5)) gemm_grouped_kernel<C, 5, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
@@ -1517,7 +1521,7 @@ int experts(const void* x, int64_t ldx, int R, const void* idx, const void* w, c
     if (C::VARW && shared) { fprintf(stderr, "[moe] variable-width experts take no shared input scales\n"); abort(); }
     // kmask: bit K set when an expert of the layer has trellis width K. 1 << 4 (uniform 4-bit): the previous kernels exactly.
     const bool mixed = kmask != (1 << 4);
-    if (mixed && (kmask & ~0x78)) { fprintf(stderr, "[moe] unsupported expert K mask 0x%x (K must be 3..6)\n", kmask); abort(); }
+    if (mixed && (kmask & ~0x7c)) { fprintf(stderr, "[moe] unsupported expert K mask 0x%x (K must be 2..6)\n", kmask); abort(); }
     constexpr int H = C::H, I = C::I, E = C::E;
     using XT = typename C::XT;
     using IT = typename C::IT;
