@@ -70,6 +70,9 @@ impl Exl3 {
     pub fn load(ck: &Checkpoint, key: &str) -> Self {
         let tr = ck.get(&format!("{key}.trellis"));
         let s = tr.size();
+        // 16 K uint16 per 16x16 tile; a width that is not a multiple of 16 (exllamav3's K = 2.5) must not round down
+        assert!(s[2] % 16 == 0 && (2..=6).contains(&(s[2] / 16)),
+                "{key}: unsupported trellis width {} uint16 per tile (K = {})", s[2], s[2] as f64 / 16.0);
         Exl3 { suh: ck.get(&format!("{key}.suh")), svh: ck.get(&format!("{key}.svh")), k: s[0] * 16, n: s[1] * 16,
                bits: (s[2] / 16) as i32, cnt: Tensor::zeros([s[1] / 8], (Kind::Int, Device::Cuda(0))), tr }
     }
@@ -429,15 +432,20 @@ impl Qsa {
     }
 }
 
-pub struct Moe { gate: F16Lin, sh: [Exl3; 3], tab: Tensor, _experts: Vec<Exl3> }
+pub struct Moe { gate: F16Lin, sh: [Exl3; 3], tab: Tensor, kmask: i32, _experts: Vec<Exl3> }
 impl Moe {
     fn load(ck: &Checkpoint, key: &str) -> Self {
         let mut experts = Vec::with_capacity(512 * 3);
-        let mut ptrs = vec![0i64; 9 * 512];
+        // rows 0..9: tensor pointers (3 tensors x gate / up / down); row 9: each expert's trellis width (mixed-K kernels)
+        let mut ptrs = vec![0i64; 10 * 512];
+        let mut kmask = 0i32;
         for e in 0..512 {
             for (t, n) in ["gate", "up", "down"].iter().enumerate() {
                 let x = Exl3::load(ck, &format!("{key}.experts.{e}.{n}_proj"));
                 for (j, ten) in x.tensors().iter().enumerate() { ptrs[(j * 3 + t) * 512 + e] = ten.data_ptr() as i64; }
+                assert!(t == 0 || x.bits as i64 == ptrs[9 * 512 + e], "expert {e} of {key}: gate / up / down widths differ");
+                ptrs[9 * 512 + e] = x.bits as i64;
+                kmask |= 1 << x.bits;
                 experts.push(x);
             }
         }
@@ -448,7 +456,7 @@ impl Moe {
         let sg = ck.get(&format!("{key}.shared_expert_gate.weight"));
         let gate = Tensor::cat(&[g.to_kind(Kind::Half), sg.to_kind(Kind::Half), Tensor::zeros([3, D], (Kind::Half, Device::Cuda(0)))], 0);
         Moe { gate: F16Lin::tagged(gate, "router"),
-              sh, tab: Tensor::from_slice(&ptrs).view([9, 512]).to_device(Device::Cuda(0)), _experts: experts }
+              sh, tab: Tensor::from_slice(&ptrs).view([10, 512]).to_device(Device::Cuda(0)), kmask, _experts: experts }
     }
     /// MoE on a block input: decode rows run the shared expert's gate / up first (one multi launch that also mixes the
     /// input), then the router on the mixed rows.
@@ -472,7 +480,7 @@ impl Moe {
         let ws = emp(&[ffi::moe_ws_bytes(r, 4)], Kind::Uint8);
         let out = emp(&[r, D], Kind::Float);
         let (idx, w) = moe_pad(idx, w);
-        ffi::moe_experts(&x, r, &idx, &w, &self.tab, Some(&sh), &out, &ws, 4);
+        ffi::moe_experts(&x, r, &idx, &w, &self.tab, Some(&sh), &out, &ws, 4, self.kmask);
         out
     }
     fn fwd(&self, x: &Tensor) -> Tensor {
@@ -524,7 +532,7 @@ impl Moe {
         let ws = emp(&[ffi::moe_ws_bytes(r, s)], Kind::Uint8);
         let out = emp(&[r, D], Kind::Float);
         let (idx, w) = moe_pad(idx, w);
-        ffi::moe_experts(x, r, &idx, &w, &self.tab, Some(&shared), &out, &ws, s);
+        ffi::moe_experts(x, r, &idx, &w, &self.tab, Some(&shared), &out, &ws, s, self.kmask);
         out
     }
 }
