@@ -68,7 +68,7 @@ structured 127.1 / 180.0 / 219.4，code 112.3 / 150.4 / 176.5 tok/s；预填 8K 
 
 | 部件 | GLM-5.3-Flash | DeepSeek-V4.1-Flash | Qwen3.8-Flash-Next |
 | --- | --- | --- | --- |
-| 路由专家（权重） | EXL3 **4 bpw**，mcg 码本 | 官方 **MXFP4**（E2M1 + 每 32 一个 E8M0） | EXL3 **4.05 bpw**（头 6、MTP 4），mul1 码本；专家和稠密层为 K = 2..6 的版本也可加载 |
+| 路由专家（权重） | EXL3 **4 bpw**，mcg 码本 | 官方 **MXFP4**（E2M1 + 每 32 一个 E8M0） | EXL3 **4.05 bpw**（头 6、MTP 4），mul1 码本；专家和稠密层为 K = 2..6 的版本也可加载，专家还可为 K = 2.5（自校准版本） |
 | 稠密权重 — prefill | 原精度（FP16），cuBLAS | 官方 FP8（32×32 块 scale）/ BF16，块缩放张量核 MMA | 原精度 |
 | 稠密权重 — decode | **Q8**（int8 + 每 128 一个 FP32 scale，约 0.67% RMS；可选无损 12-bit C12） | 官方 FP8 / BF16，块缩放 GEMV | FP16（可选 int8 副本） |
 | 注意力计算 | MLA/DSA 用 FP32/TF32；DSA indexer 稀疏 | 稀疏注意力，FP32 累加；FP4 indexer，官方 KV 格式 | QSA FP32 累加；学习式稀疏选择 |
