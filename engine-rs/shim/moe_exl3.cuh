@@ -236,7 +236,8 @@ static __global__ void pexp_kernel(const int* __restrict__ G, const int* __restr
     for (int j = threadIdx.x; j < gcnt[g]; j += blockDim.x) pexp[goff[g] + j] = gexp[g];
 }
 
-// Mixed-K layers (E3): every expert has its own trellis width K in 3..6, stored as a value in row 9 of the pointer table.
+// Mixed-K layers (E3): every expert has its own trellis width K in 2..6 or 2.5 (code 25, qexl3::ktile_h), stored as a value
+// in row 9 of the pointer table.
 // Decode kernels run BITS = 0 and dispatch per item (MOEX_WITH_BITS); prefill kernels run once per K present with KF =
 // true (CTAs of other experts return). BITS != 0 / KF = false: exactly the previous instances.
 template <class C> __device__ __forceinline__ int expert_bits(const uint64_t* tab, int e) { return (int) tab[9 * C::E + e]; }
@@ -244,9 +245,11 @@ template <class C> __device__ __forceinline__ int expert_bits(const uint64_t* ta
     do {                                                                                                                  \
         if constexpr ((BITS) != 0) { constexpr int KB = (BITS); constexpr bool DYN = false; __VA_ARGS__; }                \
         else switch (KX) {                                                                                                \
+            case 2: { constexpr int KB = 2; constexpr bool DYN = true; __VA_ARGS__; } break;                              \
             case 3: { constexpr int KB = 3; constexpr bool DYN = true; __VA_ARGS__; } break;                              \
             case 4: { constexpr int KB = 4; constexpr bool DYN = false; __VA_ARGS__; } break;                             \
             case 5: { constexpr int KB = 5; constexpr bool DYN = true; __VA_ARGS__; } break;                              \
+            case 25: { constexpr int KB = 25; constexpr bool DYN = true; __VA_ARGS__; } break;                            \
             default: { constexpr int KB = 6; constexpr bool DYN = true; __VA_ARGS__; } break;                             \
         }                                                                                                                 \
     } while (0)
@@ -321,7 +324,7 @@ template <int BITS, int PF, int WARPS, int CBK>
 __device__ __forceinline__ void gemv_block_wide(const half* __restrict__ xh, const uint32_t* __restrict__ tr,
                                                 float* __restrict__ out, int M, int K, int N, int nblk, int kt0, int kts)
 {
-    constexpr int TPW = 4, NW = 8 * BITS;
+    constexpr int TPW = 4, NW = qexl3::ktile_words(BITS);
     static_assert(NW == 32, "4-bit only");
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int Nt = N / 16, Kt = K / 16;
@@ -523,7 +526,7 @@ __global__ __launch_bounds__(WARPS * 32) void gemm_grouped_kernel(const half* __
                                                            const int* __restrict__ goff, const int* __restrict__ gcnt, int Gmax,
                                                            int P, int K, int N, OT* __restrict__ part, int svh_slot)
 {
-    constexpr int NW = 8 * BITS, TW = (KC / 16) * 8 * NW;   // trellis words of a k-chunk: 4 k-tiles x 8 n16 tiles
+    constexpr int NW = qexl3::ktile_words(BITS), TW = (KC / 16) * 8 * NW;   // trellis words of a k-chunk: 4 k-tiles x 8 n16 tiles
     __shared__ __align__(16) half sa[2][GM * SA];
     __shared__ __align__(16) uint32_t sw[2][TW];
     const int tg = blockIdx.y, t = tg / Gmax, g = tg % Gmax;
@@ -668,7 +671,7 @@ __global__ __launch_bounds__(256, 2) void gux_kernel(const typename C::XT* __res
                                                      const int* __restrict__ G, const int* __restrict__ gexp, const int* __restrict__ goff,
                                                      const int* __restrict__ gcnt, const int* __restrict__ prow, half* __restrict__ xh2)
 {
-    constexpr int NW = 8 * BITS, K = C::H, N = C::I;
+    constexpr int NW = qexl3::ktile_words(BITS), K = C::H, N = C::I;
     __shared__ __align__(16) half sg[H2 * SA2], su[H2 * SA2];
     const int g = blockIdx.y >> 1, hf = blockIdx.y & 1;
     if (g >= *G) return;
@@ -818,7 +821,7 @@ __global__ __launch_bounds__(256, 2) void gux_shared_kernel(const half* __restri
                                                      const int* __restrict__ G, const int* __restrict__ gexp, const int* __restrict__ goff,
                                                      const int* __restrict__ gcnt, const int* __restrict__ prow, half* __restrict__ xh2)
 {
-    constexpr int NW = 8 * BITS, K = C::H, N = C::I, Nt = N / 16;
+    constexpr int NW = qexl3::ktile_words(BITS), K = C::H, N = C::I, Nt = N / 16;
     __shared__ __align__(16) half sa[2][H2 * SA2];
     const int g = blockIdx.y >> 1, hf = blockIdx.y & 1;
     if (g >= *G) return;
@@ -1121,7 +1124,7 @@ __global__ __launch_bounds__(512) void gu_gemm_kernel(const half* __restrict__ x
                                                       const int* __restrict__ G, const int* __restrict__ gexp, const int* __restrict__ goff,
                                                       const int* __restrict__ gcnt, const int* __restrict__ prow, half* __restrict__ xh2)
 {
-    constexpr int NW = 8 * BITS, K = C::H, N = C::I, Nt = N / 16, TW = (KC / 16) * 8 * NW;
+    constexpr int NW = qexl3::ktile_words(BITS), K = C::H, N = C::I, Nt = N / 16, TW = (KC / 16) * 8 * NW;
     extern __shared__ __align__(16) unsigned char gu_smem[];
     half* sa = (half*) gu_smem;                                           // [STAGES][GM * SA]
     uint32_t* sw = (uint32_t*) (gu_smem + STAGES * GM * SA * sizeof(half));   // [STAGES][gate TW | up TW]
@@ -1166,7 +1169,7 @@ __global__ __launch_bounds__(512) void gu_gemm_kernel(const half* __restrict__ x
         for (int kk = 0; kk < KC / 16; ++kk)
         {
             const uint32_t* p = W + (kk * 8 + wn) * NW;
-            qexl3::decode_tile<BITS, C::CBK>(p[lane], NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u, lane, bb[kk]);
+            qexl3::decode_tile<BITS, C::CBK>(NW >= 32 || lane < NW ? p[lane] : 0u, NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u, lane, bb[kk]);
         }
         #pragma unroll
         for (int kk = 0; kk < KC / 16; ++kk)
@@ -1234,7 +1237,7 @@ __global__ __launch_bounds__(256, MINB) void gu2_gemm_kernel(const half* __restr
                                                       const int* __restrict__ G, const int* __restrict__ gexp, const int* __restrict__ goff,
                                                       const int* __restrict__ gcnt, const int* __restrict__ prow, half* __restrict__ xh2)
 {
-    constexpr int NW = 8 * BITS, K = C::H, N = C::I, Nt = N / 16, SAG = KCG + 8, TW = (KCG / 16) * 8 * NW, GMR = 16 * MTN, PARTS = GM / GMR;
+    constexpr int NW = qexl3::ktile_words(BITS), K = C::H, N = C::I, Nt = N / 16, SAG = KCG + 8, TW = (KCG / 16) * 8 * NW, GMR = 16 * MTN, PARTS = GM / GMR;
     extern __shared__ __align__(16) unsigned char gu_smem[];
     half* sa = (half*) gu_smem;                                           // [STAGES][GMR * SAG]
     uint32_t* sw = (uint32_t*) (gu_smem + STAGES * GMR * SAG * sizeof(half));   // [STAGES][gate TW | up TW]
@@ -1370,7 +1373,7 @@ __global__ __launch_bounds__(256, MINB) void gu2_gemm_kernel(const half* __restr
 }
 template <int STAGES, int KCG = KC, int ROWS = GM, int BITS = 4> constexpr size_t gu_smem_bytes()
 {
-    constexpr size_t a = STAGES * (ROWS * (KCG + 8) * sizeof(half) + 2 * (KCG / 16) * 8 * (8 * BITS) * sizeof(uint32_t));
+    constexpr size_t a = STAGES * (ROWS * (KCG + 8) * sizeof(half) + 2 * (KCG / 16) * 8 * qexl3::ktile_words(BITS) * sizeof(uint32_t));
     return a > 2 * 16 * 128 * sizeof(float) ? a : 2 * 16 * 128 * sizeof(float);   // the epilogue's fp32 row tiles
 }
 
@@ -1481,30 +1484,36 @@ template <class C, int NS, int KCG>
 void gu2_mixed(int kmask, const half* xh1, const uint64_t* tab, const int* G, const int* gexp, const int* goff, const int* gcnt,
                const int* prow, half* xh2, int Gmax, cudaStream_t st)
 {
+    if (kmask & (1 << 2)) gu2_k<C, 2, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
     if (kmask & (1 << 3)) gu2_k<C, 3, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
     if (kmask & (1 << 4)) gu2_k<C, 4, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
     if (kmask & (1 << 5)) gu2_k<C, 5, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
     if (kmask & (1 << 6)) gu2_k<C, 6, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
+    if (kmask & (1 << 25)) gu2_k<C, 25, NS, KCG>(xh1, tab, G, gexp, goff, gcnt, prow, xh2, Gmax, st);
 }
 template <class C, typename XT>
 void gux_mixed(int kmask, const XT* x, int64_t ldx, const uint64_t* tab, const int* G, const int* gexp, const int* goff, const int* gcnt,
                const int* prow, half* xh2, int Gmax, cudaStream_t st)
 {
     const dim3 grid(C::I / 128, 2 * Gmax);
+    if (kmask & (1 << 2)) gux_kernel<C, 2, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
     if (kmask & (1 << 3)) gux_kernel<C, 3, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
     if (kmask & (1 << 4)) gux_kernel<C, 4, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
     if (kmask & (1 << 5)) gux_kernel<C, 5, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
     if (kmask & (1 << 6)) gux_kernel<C, 6, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
+    if (kmask & (1 << 25)) gux_kernel<C, 25, true><<<grid, 256, 0, st>>>(x, ldx, tab, G, gexp, goff, gcnt, prow, xh2);
 }
 template <class C, typename OT>
 void down_mixed(int kmask, const half* xh2, const uint64_t* tab, const int* G, const int* gexp, const int* goff, const int* gcnt, int Gmax,
                 int P, OT* yd, cudaStream_t st)
 {
     const dim3 grid(C::H / 128, Gmax);
+    if (kmask & (1 << 2)) gemm_grouped_kernel<C, 2, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
     if (kmask & (1 << 3)) gemm_grouped_kernel<C, 3, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
     if (kmask & (1 << 4)) gemm_grouped_kernel<C, 4, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
     if (kmask & (1 << 5)) gemm_grouped_kernel<C, 5, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
     if (kmask & (1 << 6)) gemm_grouped_kernel<C, 6, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
+    if (kmask & (1 << 25)) gemm_grouped_kernel<C, 25, 8, OT, true><<<grid, 256, 0, st>>>(xh2, tab, 2, G, gexp, goff, gcnt, Gmax, P, C::I, C::H, yd, 8);
 }
 
 // x [R, H] (row stride ldx), idx / w [R, TOPK], out [R, H] fp32 (+ add [R, H] fp32 if given).
@@ -1515,9 +1524,10 @@ int experts(const void* x, int64_t ldx, int R, const void* idx, const void* w, c
 {
     const bool shared = suh0 != nullptr;
     if (C::VARW && shared) { fprintf(stderr, "[moe] variable-width experts take no shared input scales\n"); abort(); }
-    // kmask: bit K set when an expert of the layer has trellis width K. 1 << 4 (uniform 4-bit): the previous kernels exactly.
+    // kmask: bit K set when an expert of the layer has trellis width code K (bit 25: 2.5). 1 << 4 (uniform 4-bit): the previous
+    // kernels exactly.
     const bool mixed = kmask != (1 << 4);
-    if (mixed && (kmask & ~0x78)) { fprintf(stderr, "[moe] unsupported expert K mask 0x%x (K must be 3..6)\n", kmask); abort(); }
+    if (mixed && (kmask & ~(0x7c | 1 << 25))) { fprintf(stderr, "[moe] unsupported expert K mask 0x%x (K must be 2..6 or 2.5)\n", kmask); abort(); }
     constexpr int H = C::H, I = C::I, E = C::E;
     using XT = typename C::XT;
     using IT = typename C::IT;

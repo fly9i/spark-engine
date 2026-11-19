@@ -9,10 +9,21 @@
 // tensor-core order (lane t holds positions 8t..8t+7 = rows (t%4)*2+{0,1,8,9}, cols t/4 and t/4+8).
 // Tile bitstream: 8*BITS uint32 (little-endian halves of the int16 words), read MSB-first; the state
 // of position p is the 16 bits starting at ((p+1)*BITS - 16) mod (256*BITS) (tail-biting).
+// Half-integer rates (exllamav3 >= 1.5.1, mul1 only) take BITS = 10 K (15 / 25 / 35), see ktile_h.
 #include <cuda_fp16.h>
 #include <cstdint>
 
 namespace qexl3 {
+
+// Trellis width codes (template BITS, MoE table row 9): 1..8 = integer K; 10 K for a half-integer K = KA + 0.5
+// (25 = 2.5 bits). Half rates alternate KA- and (KA + 1)-bit steps, the odd positions carrying the extra bit
+// (exllamav3 frac_k: MASK 0xAAAA), so with H = 2 K position p's 16-bit window ends at ring bit ((p + 1) H) / 2
+// and a tile is 4 H words. For integer K these are exactly (p + 1) K and 8 K.
+__host__ __device__ constexpr int ktile_h(int bits) { return bits > 8 ? bits / 5 : 2 * bits; }
+__host__ __device__ constexpr int ktile_words(int bits) { return 4 * ktile_h(bits); }
+// first state bit of position 8 lane (mod the 128 H-bit ring) and position 8 lane + j's offset from it (lane-invariant)
+__device__ __forceinline__ int ktile_s0(int bits, int lane) { const int h = ktile_h(bits); return (4 * lane * h + h / 2 - 16 + 128 * h) % (128 * h); }
+__host__ __device__ constexpr int ktile_off(int bits, int j) { return (j + 1) * ktile_h(bits) / 2 - ktile_h(bits) / 2; }
 
 __device__ __forceinline__ half mul1_decode(uint32_t state)
 {
@@ -87,8 +98,8 @@ __device__ __forceinline__ void decode_tile(uint32_t r0, uint32_t r1, int lane, 
         for (int q = 0; q < 4; ++q) b[q] = decode_pair<CBK>(st[2 * q], st[2 * q + 1]);
         return;
     }
-    constexpr int NW = 8 * BITS, L = 256 * BITS;
-    const int s0 = ((8 * lane + 1) * BITS - 16 + L) % L;          // first state bit of position 8*lane
+    constexpr int NW = ktile_words(BITS);
+    const int s0 = ktile_s0(BITS, lane);                           // first state bit of position 8*lane
     const int i0 = s0 >> 5;
     uint32_t w[3];
     #pragma unroll
@@ -105,7 +116,7 @@ __device__ __forceinline__ void decode_tile(uint32_t r0, uint32_t r1, int lane, 
     #pragma unroll
     for (int j = 0; j < 8; ++j)
     {
-        int rel = (s0 & 31) + j * BITS;                             // < 32 + 7*BITS + 16 <= 90
+        int rel = (s0 & 31) + ktile_off(BITS, j);                   // < 32 + 7*BITS + 16 <= 90
         uint32_t st = rel <= 48 ? (uint32_t) (hi >> (48 - rel)) & 0xffffu
                                 : (uint32_t) (lo >> (80 - rel)) & 0xffffu;
         v[j] = CBK == 1 ? mcg_decode(st) : mul1_decode(st);
@@ -294,7 +305,7 @@ __device__ __forceinline__ void gemv_block_ld(const half* __restrict__ xh, int64
                                               float* __restrict__ out, int64_t ldo_, int M, int K, int N, int nblk, int kt0, int kts)
 {
     const int64_t lda = VAR ? lda_ : (int64_t) K, ldo = VAR ? ldo_ : (int64_t) N;
-    constexpr int NW = 8 * BITS;
+    constexpr int NW = ktile_words(BITS);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int Nt = N / 16, Kt = K / 16;
     const int nt0 = nblk * (WARPS * TPW) + warp * TPW;
@@ -443,6 +454,8 @@ __global__ __launch_bounds__(128) void gemv_multi_kernel(int M, int K, const Mul
     if (UBITS) { gemv_block<UBITS, 2, 4, 4, MT>(ml.xh[l], ml.tr[l], out, M, K, ml.N[l], nblk, s * ml.kts[l], ml.kts[l]); return; }
     switch (ml.bits[l])
     {
+        case 2: gemv_block<2, 2, 4, 4, MT>(ml.xh[l], ml.tr[l], out, M, K, ml.N[l], nblk, s * ml.kts[l], ml.kts[l]); break;
+        case 3: gemv_block<3, 2, 4, 4, MT>(ml.xh[l], ml.tr[l], out, M, K, ml.N[l], nblk, s * ml.kts[l], ml.kts[l]); break;
         case 4: gemv_block<4, 2, 4, 4, MT>(ml.xh[l], ml.tr[l], out, M, K, ml.N[l], nblk, s * ml.kts[l], ml.kts[l]); break;
         case 5: gemv_block<5, 2, 4, 4, MT>(ml.xh[l], ml.tr[l], out, M, K, ml.N[l], nblk, s * ml.kts[l], ml.kts[l]); break;
         default: gemv_block<6, 2, 4, 4, MT>(ml.xh[l], ml.tr[l], out, M, K, ml.N[l], nblk, s * ml.kts[l], ml.kts[l]); break;
@@ -461,7 +474,7 @@ __global__ __launch_bounds__(128) void gemv_fused_kernel(const float* __restrict
                                                          const half* __restrict__ svh, float* __restrict__ y, int64_t ldy,
                                                          int* __restrict__ cnt, int M, int K, int N, int kts)
 {
-    constexpr int TPW = 2, PF = 4, WARPS = 4, NW = 8 * BITS;
+    constexpr int TPW = 2, PF = 4, WARPS = 4, NW = ktile_words(BITS);
     // MT = 1 and a slice within GF_NB 128-blocks: all its blocks transformed up front (one barrier); otherwise one
     // 128-block at a time
     constexpr int GF_NB = MT == 1 ? 8 : 1;
@@ -633,14 +646,14 @@ __global__ void finish_h_kernel(const half* __restrict__ part, const half* __res
 template <int BITS>
 __global__ void reconstruct_kernel(const uint32_t* __restrict__ tr, half* __restrict__ w, int K, int N)
 {
-    constexpr int NW = 8 * BITS;
+    constexpr int NW = ktile_words(BITS);
     int64_t tile = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
     int Nt = N / 16;
     if (tile >= (int64_t) (K / 16) * Nt) return;
     int kt = tile / Nt, nt = tile % Nt;
     const uint32_t* p = tr + tile * NW;
-    uint32_t r0 = p[lane], r1 = NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u;
+    uint32_t r0 = NW >= 32 || lane < NW ? p[lane] : 0u, r1 = NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u;
     uint32_t b[4];
     decode_tile<BITS>(r0, r1, lane, b);
     int k0 = kt * 16 + (lane & 3) * 2, n0 = nt * 16 + (lane >> 2);
@@ -661,7 +674,7 @@ template <int BITS>
 __global__ __launch_bounds__(256) void fold_kernel(const uint32_t* __restrict__ tr, const half* __restrict__ suh, const half* __restrict__ svh,
                                                    int K, int N, half* __restrict__ out, int64_t ldo)
 {
-    constexpr int NW = 8 * BITS;
+    constexpr int NW = ktile_words(BITS);
     extern __shared__ float fs[];   // [128][FOLD_LD], k-major
     const int nb = blockIdx.x, kb = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31, Nt = N / 16;
     for (int t = warp; t < 64; t += 8)
@@ -669,7 +682,7 @@ __global__ __launch_bounds__(256) void fold_kernel(const uint32_t* __restrict__ 
         const int kt = kb * 8 + t / 8, nt = nb * 8 + t % 8;
         const uint32_t* p = tr + ((int64_t) kt * Nt + nt) * NW;
         uint32_t b[4];
-        decode_tile<BITS>(p[lane], NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u, lane, b);
+        decode_tile<BITS>(NW >= 32 || lane < NW ? p[lane] : 0u, NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u, lane, b);
         const int k0 = (t / 8) * 16 + (lane & 3) * 2, n0 = (t % 8) * 16 + (lane >> 2);
         auto lo = [](uint32_t v) { return __half2float(__ushort_as_half((unsigned short) (v & 0xffff))); };
         auto hi = [](uint32_t v) { return __half2float(__ushort_as_half((unsigned short) (v >> 16))); };
@@ -725,8 +738,8 @@ template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile(
 template <int BITS, int CBK>
 __device__ __forceinline__ void decode_tile_sm(const uint32_t* t, int lane, uint32_t* b)
 {
-    constexpr int NW = 8 * BITS, L = 256 * BITS;
-    const int s0 = ((8 * lane + 1) * BITS - 16 + L) % L;
+    constexpr int NW = ktile_words(BITS);
+    const int s0 = ktile_s0(BITS, lane);
     const int i0 = s0 >> 5, o = s0 & 31;
     const uint32_t w0 = t[i0], w1 = t[(i0 + 1) % NW], w2 = t[(i0 + 2) % NW];
     half v[8];
@@ -736,7 +749,7 @@ __device__ __forceinline__ void decode_tile_sm(const uint32_t* t, int lane, uint
         #pragma unroll
         for (int j = 0; j < 8; ++j)
         {
-            const int rel = o + j * BITS;
+            const int rel = o + ktile_off(BITS, j);
             const uint32_t st = rel <= 48 ? (uint32_t) (hi >> (48 - rel)) & 0xffffu : (uint32_t) (lo >> (80 - rel)) & 0xffffu;
             v[j] = CBK == 1 ? mcg_decode(st) : mul1_decode(st);
         }
@@ -747,7 +760,7 @@ __device__ __forceinline__ void decode_tile_sm(const uint32_t* t, int lane, uint
         #pragma unroll
         for (int j = 0; j < 8; ++j)
         {
-            const int r = j * BITS;
+            const int r = ktile_off(BITS, j);
             const uint32_t st = r + 16 <= 32 ? (a0 >> (16 - r)) & 0xffffu : r >= 32 ? (a1 >> (48 - r)) & 0xffffu : __funnelshift_l(a1, a0, r) >> 16;
             v[j] = CBK == 1 ? mcg_decode(st) : mul1_decode(st);
         }
@@ -759,8 +772,8 @@ __device__ __forceinline__ void decode_tile_sm(const uint32_t* t, int lane, uint
 template <int BITS>
 __device__ __forceinline__ void decode_tile_smem(const uint32_t* t, int lane, uint32_t* b)
 {
-    constexpr int NW = 8 * BITS, L = 256 * BITS;
-    const int s0 = ((8 * lane + 1) * BITS - 16 + L) % L;
+    constexpr int NW = ktile_words(BITS);
+    const int s0 = ktile_s0(BITS, lane);
     const int i0 = s0 >> 5;
     uint32_t w0 = t[i0], w1 = t[(i0 + 1) % NW], w2 = t[(i0 + 2) % NW];
     const uint64_t hi = ((uint64_t) w0 << 32) | w1;
@@ -769,7 +782,7 @@ __device__ __forceinline__ void decode_tile_smem(const uint32_t* t, int lane, ui
     #pragma unroll
     for (int j = 0; j < 8; ++j)
     {
-        int rel = (s0 & 31) + j * BITS;
+        int rel = (s0 & 31) + ktile_off(BITS, j);
         uint32_t st = rel <= 48 ? (uint32_t) (hi >> (48 - rel)) & 0xffffu : (uint32_t) (lo >> (80 - rel)) & 0xffffu;
         v[j] = mul1_decode(st);
     }
@@ -781,7 +794,7 @@ template <int BITS, int STAGES = 6>
 __device__ __forceinline__ void gemv_block_v2(const half* __restrict__ xh, const uint32_t* __restrict__ tr,
                                               float* __restrict__ out, int M, int K, int N, int nblk, int kt0, int kts)
 {
-    constexpr int NW = 8 * BITS, ROWW = 8 * NW;            // words per k-step (8 n-tiles)
+    constexpr int NW = ktile_words(BITS), ROWW = 8 * NW;            // words per k-step (8 n-tiles)
     constexpr int CHUNKS = ROWW / 4;                         // 16-byte chunks per k-step
     __shared__ __align__(16) uint32_t ring[STAGES][ROWW];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;

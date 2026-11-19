@@ -68,10 +68,23 @@ fn fold_on() -> bool { std::env::var("QWEN_EXL3_FOLD").as_deref() == Ok("1") }
 pub struct Exl3 { tr: Tensor, suh: Tensor, svh: Tensor, pub k: i64, pub n: i64, bits: i32, cnt: Tensor }
 impl Exl3 {
     pub fn load(ck: &Checkpoint, key: &str) -> Self {
+        let x = Self::load_any(ck, key);
+        assert!(x.bits <= 6, "{key}: half-integer trellis width (code {}) is supported for routed experts only", x.bits);
+        x
+    }
+    /// `load` that also takes exllamav3's (>= 1.5.1) half-integer width K = 2.5 (40 uint16 per tile): `bits` is then the
+    /// code 25 (10 K, qexl3::ktile_h), which only the MoE expert kernels decode.
+    fn load_any(ck: &Checkpoint, key: &str) -> Self {
         let tr = ck.get(&format!("{key}.trellis"));
         let s = tr.size();
+        // 16 K uint16 per 16x16 tile
+        let bits = match (s[2] % 16, s[2] / 16) {
+            (0, k @ 2..=6) => k as i32,
+            (8, 2) => 25,
+            _ => panic!("{key}: unsupported trellis width {} uint16 per tile (K = {})", s[2], s[2] as f64 / 16.0),
+        };
         Exl3 { suh: ck.get(&format!("{key}.suh")), svh: ck.get(&format!("{key}.svh")), k: s[0] * 16, n: s[1] * 16,
-               bits: (s[2] / 16) as i32, cnt: Tensor::zeros([s[1] / 8], (Kind::Int, Device::Cuda(0))), tr }
+               bits, cnt: Tensor::zeros([s[1] / 8], (Kind::Int, Device::Cuda(0))), tr }
     }
     /// K slices: about 512 blocks per launch (8+ waves on 48 SMs) while keeping >= 8 k-tiles per slice; 10 for K = 6144 and 6
     /// for N >= 6144 (QWEN_EXL3_SLICES_TUNED=0, read per call: the general rule). 2026-10-07: the tuned slices are 1..2% faster
@@ -429,15 +442,20 @@ impl Qsa {
     }
 }
 
-pub struct Moe { gate: F16Lin, sh: [Exl3; 3], tab: Tensor, _experts: Vec<Exl3> }
+pub struct Moe { gate: F16Lin, sh: [Exl3; 3], tab: Tensor, kmask: i32, _experts: Vec<Exl3> }
 impl Moe {
     fn load(ck: &Checkpoint, key: &str) -> Self {
         let mut experts = Vec::with_capacity(512 * 3);
-        let mut ptrs = vec![0i64; 9 * 512];
+        // rows 0..9: tensor pointers (3 tensors x gate / up / down); row 9: each expert's trellis width (mixed-K kernels)
+        let mut ptrs = vec![0i64; 10 * 512];
+        let mut kmask = 0i32;
         for e in 0..512 {
             for (t, n) in ["gate", "up", "down"].iter().enumerate() {
-                let x = Exl3::load(ck, &format!("{key}.experts.{e}.{n}_proj"));
+                let x = Exl3::load_any(ck, &format!("{key}.experts.{e}.{n}_proj"));
                 for (j, ten) in x.tensors().iter().enumerate() { ptrs[(j * 3 + t) * 512 + e] = ten.data_ptr() as i64; }
+                assert!(t == 0 || x.bits as i64 == ptrs[9 * 512 + e], "expert {e} of {key}: gate / up / down widths differ");
+                ptrs[9 * 512 + e] = x.bits as i64;
+                kmask |= 1 << x.bits;
                 experts.push(x);
             }
         }
@@ -448,7 +466,7 @@ impl Moe {
         let sg = ck.get(&format!("{key}.shared_expert_gate.weight"));
         let gate = Tensor::cat(&[g.to_kind(Kind::Half), sg.to_kind(Kind::Half), Tensor::zeros([3, D], (Kind::Half, Device::Cuda(0)))], 0);
         Moe { gate: F16Lin::tagged(gate, "router"),
-              sh, tab: Tensor::from_slice(&ptrs).view([9, 512]).to_device(Device::Cuda(0)), _experts: experts }
+              sh, tab: Tensor::from_slice(&ptrs).view([10, 512]).to_device(Device::Cuda(0)), kmask, _experts: experts }
     }
     /// MoE on a block input: decode rows run the shared expert's gate / up first (one multi launch that also mixes the
     /// input), then the router on the mixed rows.
@@ -472,7 +490,7 @@ impl Moe {
         let ws = emp(&[ffi::moe_ws_bytes(r, 4)], Kind::Uint8);
         let out = emp(&[r, D], Kind::Float);
         let (idx, w) = moe_pad(idx, w);
-        ffi::moe_experts(&x, r, &idx, &w, &self.tab, Some(&sh), &out, &ws, 4);
+        ffi::moe_experts(&x, r, &idx, &w, &self.tab, Some(&sh), &out, &ws, 4, self.kmask);
         out
     }
     fn fwd(&self, x: &Tensor) -> Tensor {
@@ -524,7 +542,7 @@ impl Moe {
         let ws = emp(&[ffi::moe_ws_bytes(r, s)], Kind::Uint8);
         let out = emp(&[r, D], Kind::Float);
         let (idx, w) = moe_pad(idx, w);
-        ffi::moe_experts(x, r, &idx, &w, &self.tab, Some(&shared), &out, &ws, s);
+        ffi::moe_experts(x, r, &idx, &w, &self.tab, Some(&shared), &out, &ws, s, self.kmask);
         out
     }
 }

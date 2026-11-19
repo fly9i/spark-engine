@@ -60,6 +60,8 @@ static void gemv_multi_mt(int M, int K, const qexl3::Multi& ml, cudaStream_t st)
     if (!uni) gemv_multi_ub<0>(M, K, ml, st);
     else if (ml.bits[0] == 6) gemv_multi_ub<6>(M, K, ml, st);
     else if (ml.bits[0] == 5) gemv_multi_ub<5>(M, K, ml, st);
+    else if (ml.bits[0] == 3) gemv_multi_ub<3>(M, K, ml, st);
+    else if (ml.bits[0] == 2) gemv_multi_ub<2>(M, K, ml, st);
     else gemv_multi_ub<4>(M, K, ml, st);
 }
 
@@ -100,7 +102,7 @@ int qwen_exl3_multi(const void* x, int64_t ldx, const void* mg, const void* mn, 
         ml.suh[i] = (const half*) suh[i]; ml.xh[i] = (half*) xh[i]; ml.tr[i] = (const uint32_t*) trellis[i]; ml.part[i] = (float*) part[i];
         ml.N[i] = N[i]; ml.S[i] = S[i]; ml.kts[i] = (K / 16 + S[i] - 1) / S[i];
         ml.svh[i] = (const half*) svh[i]; ml.y[i] = (float*) y[i]; ml.ldy[i] = ldy[i];
-        if (bits[i] < 4 || bits[i] > 6) return -2;
+        if (bits[i] < 2 || bits[i] > 6) return -2;
         ml.bits[i] = bits[i];
         ml.blk0[i] = blk; blk += N[i] / 128 * S[i];
         fw += M * (N[i] / 128);
@@ -116,6 +118,8 @@ int qwen_exl3_multi(const void* x, int64_t ldx, const void* mg, const void* mn, 
             const dim3 grid(N[i] / 128, S[i]);
             switch (bits[i])
             {
+                case 2: gemv_mt<2>(ml.xh[i], ml.tr[i], ml.part[i], M, K, N[i], ml.kts[i], grid, st); break;
+                case 3: gemv_mt<3>(ml.xh[i], ml.tr[i], ml.part[i], M, K, N[i], ml.kts[i], grid, st); break;
                 case 4: gemv_mt<4>(ml.xh[i], ml.tr[i], ml.part[i], M, K, N[i], ml.kts[i], grid, st); break;
                 case 5: gemv_mt<5>(ml.xh[i], ml.tr[i], ml.part[i], M, K, N[i], ml.kts[i], grid, st); break;
                 default: gemv_mt<6>(ml.xh[i], ml.tr[i], ml.part[i], M, K, N[i], ml.kts[i], grid, st); break;
@@ -159,6 +163,8 @@ int qwen_exl3_linear(const void* x, int64_t ldx, const void* suh, const void* tr
     const uint32_t* t = (const uint32_t*) trellis;
     switch (bits)
     {
+        case 2: gemv_fused_mt<2>(xf, ldx, su, t, (float*) part, sv, (float*) y, ldy, (int*) cnt, M, K, N, kts, grid, st); break;
+        case 3: gemv_fused_mt<3>(xf, ldx, su, t, (float*) part, sv, (float*) y, ldy, (int*) cnt, M, K, N, kts, grid, st); break;
         case 4: gemv_fused_mt<4>(xf, ldx, su, t, (float*) part, sv, (float*) y, ldy, (int*) cnt, M, K, N, kts, grid, st); break;
         case 5: gemv_fused_mt<5>(xf, ldx, su, t, (float*) part, sv, (float*) y, ldy, (int*) cnt, M, K, N, kts, grid, st); break;
         case 6: gemv_fused_mt<6>(xf, ldx, su, t, (float*) part, sv, (float*) y, ldy, (int*) cnt, M, K, N, kts, grid, st); break;
@@ -175,6 +181,8 @@ int qwen_exl3_gemv(const void* xh, const void* trellis, void* part, int M, int K
     dim3 grid(N / 128, S);
     switch (bits)
     {
+        case 2: gemv_mt<2>(xh, trellis, part, M, K, N, kts, grid, st); break;
+        case 3: gemv_mt<3>(xh, trellis, part, M, K, N, kts, grid, st); break;
         case 4: gemv_mt<4>(xh, trellis, part, M, K, N, kts, grid, st); break;
         case 5: gemv_mt<5>(xh, trellis, part, M, K, N, kts, grid, st); break;
         case 6: gemv_mt<6>(xh, trellis, part, M, K, N, kts, grid, st); break;
@@ -212,7 +220,7 @@ int qwen_exl3_fold(const void* trellis, const void* suh, const void* svh, int K,
     dim3 grid(N / 128, K / 128);
     #define FOLD(B) do { static bool a = false; if (!a) { cudaFuncSetAttribute(qexl3::fold_kernel<B>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm); a = true; } \
         qexl3::fold_kernel<B><<<grid, 256, sm, st>>>((const uint32_t*) trellis, (const half*) suh, (const half*) svh, K, N, (half*) out, ldo); } while (0)
-    switch (bits) { case 4: FOLD(4); break; case 5: FOLD(5); break; case 6: FOLD(6); break; default: return -2; }
+    switch (bits) { case 2: FOLD(2); break; case 3: FOLD(3); break; case 4: FOLD(4); break; case 5: FOLD(5); break; case 6: FOLD(6); break; default: return -2; }
     #undef FOLD
     return (int) cudaGetLastError();
 }
@@ -224,6 +232,8 @@ int qwen_exl3_reconstruct(const void* trellis, void* w, int K, int N, int bits, 
     unsigned blocks = (unsigned) ((tiles * 32 + 255) / 256);
     switch (bits)
     {
+        case 2: qexl3::reconstruct_kernel<2><<<blocks, 256, 0, st>>>((const uint32_t*) trellis, (half*) w, K, N); break;
+        case 3: qexl3::reconstruct_kernel<3><<<blocks, 256, 0, st>>>((const uint32_t*) trellis, (half*) w, K, N); break;
         case 4: qexl3::reconstruct_kernel<4><<<blocks, 256, 0, st>>>((const uint32_t*) trellis, (half*) w, K, N); break;
         case 5: qexl3::reconstruct_kernel<5><<<blocks, 256, 0, st>>>((const uint32_t*) trellis, (half*) w, K, N); break;
         case 6: qexl3::reconstruct_kernel<6><<<blocks, 256, 0, st>>>((const uint32_t*) trellis, (half*) w, K, N); break;

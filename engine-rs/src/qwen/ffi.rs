@@ -18,7 +18,7 @@ extern "C" {
     fn qwen_moe_route(logits: *const c_void, r: i32, idx: *mut c_void, w: *mut c_void, st: St) -> i32;
     fn qwen_moe_ws_bytes(r: i32, s: i32) -> usize;
     fn qwen_moe_experts(x: *const c_void, ldx: i64, r: i32, idx: *const c_void, w: *const c_void, tab: *const c_void,
-                        add: *const c_void, out: *mut c_void, ws: *mut c_void, s: i32, st: St) -> i32;
+                        add: *const c_void, out: *mut c_void, ws: *mut c_void, s: i32, kmask: i32, st: St) -> i32;
     fn qwen_hc_ws_bytes(r: i32) -> usize;
     fn qwen_f16_ws_bytes(m: i32, n: i32, k: i32) -> usize;
     fn qwen_hc_norm(x: *const c_void, r: i32, w1: *const c_void, n: *mut c_void, st: St) -> i32;
@@ -130,8 +130,10 @@ pub fn moe_route(logits: &Tensor, r: i64, idx: &Tensor, w: &Tensor) {
 }
 pub fn moe_ws_bytes(r: i64, s: i32) -> i64 { unsafe { qwen_moe_ws_bytes(r as i32, s) as i64 } }
 #[allow(clippy::too_many_arguments)]
-pub fn moe_experts(x: &Tensor, r: i64, idx: &Tensor, w: &Tensor, tab: &Tensor, add: Option<&Tensor>, out: &Tensor, ws: &Tensor, s: i32) {
-    ok(unsafe { qwen_moe_experts(p(x), x.stride()[0], r as i32, p(idx), p(w), p(tab), opt(add), p(out), p(ws), s, st()) }, "moe_experts");
+/// kmask: bit K set for every expert trellis width K in the layer (1 << 4: the uniform 4-bit kernels; anything else the mixed-K path,
+/// which reads each expert's width from row 9 of `tab`).
+pub fn moe_experts(x: &Tensor, r: i64, idx: &Tensor, w: &Tensor, tab: &Tensor, add: Option<&Tensor>, out: &Tensor, ws: &Tensor, s: i32, kmask: i32) {
+    ok(unsafe { qwen_moe_experts(p(x), x.stride()[0], r as i32, p(idx), p(w), p(tab), opt(add), p(out), p(ws), s, kmask, st()) }, "moe_experts");
 }
 pub fn hc_ws_bytes(r: i64) -> i64 { unsafe { qwen_hc_ws_bytes(r as i32) as i64 } }
 #[allow(clippy::too_many_arguments)]
