@@ -22,7 +22,7 @@ on; "set" means any value (presence) counts.
 | --- | --- | --- | --- |
 | `QWEN_MODEL` | none (set in `spark.env`) | Model directory (EXL3 checkpoint), passed by `start-qwen.sh` to the engine (`qwen-serve`) and to the front end (`--model-dir`). | — |
 | `QWEN_ASSETS` | the model directory (`start-qwen.sh` sets `$SPARK_HOME/assets/qwen38`) | Directory with `draft_vocab_<N>.json`. The release ships `assets/qwen38/draft_vocab_65536.json`. | — |
-| `QWEN_VISION` | engine: off (`=1`); `start-qwen.sh`: `1` | `1` loads the vision tower (about 0.5 GB) and accepts image / video requests; also starts the front end with `--vision on`. `0` = text only; media requests then get an error. | — |
+| `QWEN_VISION` | engine: off (`=1`); `start-qwen.sh`: `1` | `1` loads the vision tower (about 0.5 GB) and accepts image / video requests; also starts the front end with `--vision on`. `0` = text only; media requests then get an error. `start-qwen.sh` falls back to `0` when the model directory has no `vision_k6.safetensors` (only the 4.05 bpw revision ships it). | — |
 | `QWEN_MEMGUARD_GIB` | `8` | `start-qwen.sh` watchdog: polls `MemAvailable` every 0.5 s and kills the engine if it falls below this many GiB (unified-memory exhaustion can hang the GB10). | — |
 | `QWEN_SERVE_MAX_SEQS` | `8` (clamped to 1..8) | Sequences decoded concurrently (one batched speculative round per turn). | L0 |
 | `QWEN_SERVE_STORES` | `8` (at least `QWEN_SERVE_MAX_SEQS`) | Sequence stores: each keeps its committed history for exact-prefix reuse (the recurrent GDN state cannot rewind, so only exact prefixes are reused). | L0 |

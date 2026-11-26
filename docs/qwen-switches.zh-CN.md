@@ -20,7 +20,7 @@ Qwen 路径没有 profile 文件：所有默认值都编译在代码里，并且
 | --- | --- | --- | --- |
 | `QWEN_MODEL` | 无（在 `spark.env` 中设置） | 模型目录（EXL3 检查点），由 `start-qwen.sh` 传给引擎（`qwen-serve`）和前端（`--model-dir`）。 | — |
 | `QWEN_ASSETS` | 模型目录（`start-qwen.sh` 设为 `$SPARK_HOME/assets/qwen38`） | 存放 `draft_vocab_<N>.json` 的目录。发布包自带 `assets/qwen38/draft_vocab_65536.json`。 | — |
-| `QWEN_VISION` | 引擎：关（`=1`）；`start-qwen.sh`：`1` | `1` 加载视觉塔（约 0.5 GB），接受图片 / 视频请求，同时以 `--vision on` 启动前端。`0` 只处理文本，带媒体的请求返回错误。 | — |
+| `QWEN_VISION` | 引擎：关（`=1`）；`start-qwen.sh`：`1` | `1` 加载视觉塔（约 0.5 GB），接受图片 / 视频请求，同时以 `--vision on` 启动前端。`0` 只处理文本，带媒体的请求返回错误。模型目录里没有 `vision_k6.safetensors` 时（只有 4.05 bpw 版本带），`start-qwen.sh` 自动按 `0` 启动。 | — |
 | `QWEN_MEMGUARD_GIB` | `8` | `start-qwen.sh` 的看门狗：每 0.5 s 检查 `MemAvailable`，低于这个 GiB 数就杀掉引擎（统一内存耗尽可能让 GB10 卡死）。 | — |
 | `QWEN_SERVE_MAX_SEQS` | `8`（限制在 1..8） | 同时 decode 的序列数（每轮一次批量推测解码）。 | L0 |
 | `QWEN_SERVE_STORES` | `8`（不少于 `QWEN_SERVE_MAX_SEQS`） | 序列存储数：每个存储保留已提交的历史，用于完全相同前缀的复用（GDN 递推状态无法回退，所以只复用完全相同的前缀）。 | L0 |

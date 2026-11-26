@@ -6,6 +6,10 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 socket=/tmp/spark-qwen.sock
 export QWEN_VISION=${QWEN_VISION:-1}            # vision tower (~0.5 GB) + image/video requests; 0 = text only
+# Only the 4.05 bpw revision ships the tower the engine reads (vision_k6.safetensors); the others start text-only.
+if [[ $QWEN_VISION == 1 && ! -f $QWEN_MODEL/vision_k6.safetensors ]]; then
+  echo "no vision_k6.safetensors in $QWEN_MODEL: starting text-only (QWEN_VISION=0)"; export QWEN_VISION=0
+fi
 export QWEN_ASSETS=${QWEN_ASSETS:-$SPARK_HOME/assets/qwen38}
 vision=$([[ $QWEN_VISION == 1 ]] && echo on || echo off)
 bash "$here/stop-qwen.sh" > /dev/null 2>&1 || true
