@@ -68,13 +68,23 @@ fn fold_on() -> bool { std::env::var("QWEN_EXL3_FOLD").as_deref() == Ok("1") }
 pub struct Exl3 { tr: Tensor, suh: Tensor, svh: Tensor, pub k: i64, pub n: i64, bits: i32, cnt: Tensor }
 impl Exl3 {
     pub fn load(ck: &Checkpoint, key: &str) -> Self {
+        let x = Self::load_any(ck, key);
+        assert!(x.bits <= 6, "{key}: half-integer trellis width (code {}) is supported for routed experts only", x.bits);
+        x
+    }
+    /// `load` that also takes exllamav3's (>= 1.5.1) half-integer width K = 2.5 (40 uint16 per tile): `bits` is then the
+    /// code 25 (10 K, qexl3::ktile_h), which only the MoE expert kernels decode.
+    fn load_any(ck: &Checkpoint, key: &str) -> Self {
         let tr = ck.get(&format!("{key}.trellis"));
         let s = tr.size();
-        // 16 K uint16 per 16x16 tile; a width that is not a multiple of 16 (exllamav3's K = 2.5) must not round down
-        assert!(s[2] % 16 == 0 && (2..=6).contains(&(s[2] / 16)),
-                "{key}: unsupported trellis width {} uint16 per tile (K = {})", s[2], s[2] as f64 / 16.0);
+        // 16 K uint16 per 16x16 tile
+        let bits = match (s[2] % 16, s[2] / 16) {
+            (0, k @ 2..=6) => k as i32,
+            (8, 2) => 25,
+            _ => panic!("{key}: unsupported trellis width {} uint16 per tile (K = {})", s[2], s[2] as f64 / 16.0),
+        };
         Exl3 { suh: ck.get(&format!("{key}.suh")), svh: ck.get(&format!("{key}.svh")), k: s[0] * 16, n: s[1] * 16,
-               bits: (s[2] / 16) as i32, cnt: Tensor::zeros([s[1] / 8], (Kind::Int, Device::Cuda(0))), tr }
+               bits, cnt: Tensor::zeros([s[1] / 8], (Kind::Int, Device::Cuda(0))), tr }
     }
     /// K slices: about 512 blocks per launch (8+ waves on 48 SMs) while keeping >= 8 k-tiles per slice; 10 for K = 6144 and 6
     /// for N >= 6144 (QWEN_EXL3_SLICES_TUNED=0, read per call: the general rule). 2026-10-07: the tuned slices are 1..2% faster
@@ -441,7 +451,7 @@ impl Moe {
         let mut kmask = 0i32;
         for e in 0..512 {
             for (t, n) in ["gate", "up", "down"].iter().enumerate() {
-                let x = Exl3::load(ck, &format!("{key}.experts.{e}.{n}_proj"));
+                let x = Exl3::load_any(ck, &format!("{key}.experts.{e}.{n}_proj"));
                 for (j, ten) in x.tensors().iter().enumerate() { ptrs[(j * 3 + t) * 512 + e] = ten.data_ptr() as i64; }
                 assert!(t == 0 || x.bits as i64 == ptrs[9 * 512 + e], "expert {e} of {key}: gate / up / down widths differ");
                 ptrs[9 * 512 + e] = x.bits as i64;
