@@ -443,6 +443,8 @@ __global__ __launch_bounds__(128) void gemv_multi_kernel(int M, int K, const Mul
     if (UBITS) { gemv_block<UBITS, 2, 4, 4, MT>(ml.xh[l], ml.tr[l], out, M, K, ml.N[l], nblk, s * ml.kts[l], ml.kts[l]); return; }
     switch (ml.bits[l])
     {
+        case 2: gemv_block<2, 2, 4, 4, MT>(ml.xh[l], ml.tr[l], out, M, K, ml.N[l], nblk, s * ml.kts[l], ml.kts[l]); break;
+        case 3: gemv_block<3, 2, 4, 4, MT>(ml.xh[l], ml.tr[l], out, M, K, ml.N[l], nblk, s * ml.kts[l], ml.kts[l]); break;
         case 4: gemv_block<4, 2, 4, 4, MT>(ml.xh[l], ml.tr[l], out, M, K, ml.N[l], nblk, s * ml.kts[l], ml.kts[l]); break;
         case 5: gemv_block<5, 2, 4, 4, MT>(ml.xh[l], ml.tr[l], out, M, K, ml.N[l], nblk, s * ml.kts[l], ml.kts[l]); break;
         default: gemv_block<6, 2, 4, 4, MT>(ml.xh[l], ml.tr[l], out, M, K, ml.N[l], nblk, s * ml.kts[l], ml.kts[l]); break;
@@ -640,7 +642,7 @@ __global__ void reconstruct_kernel(const uint32_t* __restrict__ tr, half* __rest
     if (tile >= (int64_t) (K / 16) * Nt) return;
     int kt = tile / Nt, nt = tile % Nt;
     const uint32_t* p = tr + tile * NW;
-    uint32_t r0 = p[lane], r1 = NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u;
+    uint32_t r0 = NW >= 32 || lane < NW ? p[lane] : 0u, r1 = NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u;
     uint32_t b[4];
     decode_tile<BITS>(r0, r1, lane, b);
     int k0 = kt * 16 + (lane & 3) * 2, n0 = nt * 16 + (lane >> 2);
@@ -669,7 +671,7 @@ __global__ __launch_bounds__(256) void fold_kernel(const uint32_t* __restrict__ 
         const int kt = kb * 8 + t / 8, nt = nb * 8 + t % 8;
         const uint32_t* p = tr + ((int64_t) kt * Nt + nt) * NW;
         uint32_t b[4];
-        decode_tile<BITS>(p[lane], NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u, lane, b);
+        decode_tile<BITS>(NW >= 32 || lane < NW ? p[lane] : 0u, NW > 32 && lane + 32 < NW ? p[32 + lane] : 0u, lane, b);
         const int k0 = (t / 8) * 16 + (lane & 3) * 2, n0 = (t % 8) * 16 + (lane >> 2);
         auto lo = [](uint32_t v) { return __half2float(__ushort_as_half((unsigned short) (v & 0xffff))); };
         auto hi = [](uint32_t v) { return __half2float(__ushort_as_half((unsigned short) (v >> 16))); };
