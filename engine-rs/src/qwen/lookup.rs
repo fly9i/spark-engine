@@ -40,7 +40,11 @@ impl Lookup {
         let tail: Vec<i64> = (len - n..len).map(at).collect();
         let &e = self.map.get(&Self::key(&tail))?;
         if (0..n).any(|i| at(e + 1 - n + i) != tail[i]) { return None; }   // hash collision
-        let v: Vec<i64> = (e + 1..(e + 1 + max).min(len)).map(at).collect();
+        // Stop at media: the history holds an image's or video's rows as pseudo ids (vision::MM_BASE and up), which are
+        // not tokens. The batched verify embeds its rows as they are, so one of them as a draft is an out-of-range
+        // embedding index (CUDA device-side assert in index_select; seen when the output repeated a caption line that an
+        // image follows).
+        let v: Vec<i64> = (e + 1..(e + 1 + max).min(len)).map(at).take_while(|&t| t < super::vision::MM_BASE).collect();
         (!v.is_empty()).then(|| (v, self.conf()))
     }
 
