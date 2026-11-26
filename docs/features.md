@@ -114,7 +114,9 @@ embeddings (PLE) from a 39 GB table, an MTP head, and a ViT vision tower.
 - **Kernels.** All EXL3 products run on the engine's kernels (no exllamav3 runtime): fused multi-linear decode launches
   that share the input transform, GDN recurrence and convolution kernels with multi-sequence segments, QSA pooling,
   selection and attention kernels, fused hyper-connection mixes. The n-gram embedding rows are gathered from the memory
-  mapped table with prefetch hints on parallel threads.
+  mapped table with prefetch hints on parallel threads. The table may be one tensor or exllamav3's row shards, at any
+  code width (NG6 in the 4.05 bpw revision; NG4, NG5 and NG8 in others), and the MTP mixer is also read from the
+  separate `mtp_hyper_connection_mixer_patch.safetensors` that some revisions ship outside their index.
 - **Speculative decoding.** The native MTP head drafts autoregressively; its output layer is a 4-bit copy of the
   lm_head restricted to the 65,536 most frequent tokens (`assets/qwen38/draft_vocab_65536.json`, tiled layout), so a
   draft step reads 84 MB instead of the full head. Prompt-lookup drafts are used where the context repeats. Up to 8

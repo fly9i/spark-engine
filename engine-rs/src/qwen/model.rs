@@ -596,16 +596,21 @@ impl Ple {
         let pre = format!("{key}.ple_embedding.ngram_embedding.");
         let i64s = |n: &str| -> Vec<i64> { Vec::<i64>::try_from(ck.get_on(&format!("{pre}{n}"), Device::Cpu)).unwrap() };
         let (m, o, s) = (i64s("layer_multipliers"), i64s("head_offsets"), i64s("head_vocab_sizes"));
-        let tk = format!("{pre}trellis");
-        ck.advise_random(&tk);
-        let words = ck.tensors[&tk].shape[1];
+        // single tensor or row shards (load.rs row_table); K from the row width, 1 + 160 K / 16 words
+        // (exllamav3 ngram_codec.words_per_row): NG4 41, NG6 61, NG8 81
+        let (tp, tlen, rows, words) = ck.row_table_random(&pre);
+        assert!((words - 1) * 16 % 160 == 0, "n-gram row width {words} is not 1 + 160 K / 16");
+        let bits = ((words - 1) * 16 / 160) as i32;
+        assert!((1..=8).contains(&bits), "n-gram table K = {bits}");
+        assert!(o[15] + s[15] <= rows, "n-gram heads address {} rows, table has {rows}", o[15] + s[15]);
+        eprintln!("[qwen] n-gram table: {rows} rows, K = {bits}, {:.1} GB", tlen as f64 / 1e9);
         let g1 = |n: &str| (f32(&ck.get(&format!("{key}.{n}.weight"))) + 1.0).contiguous();
         Ple { kp: F16Lin::tagged(ck.get(&format!("{key}.key_proj.weight")), "ple"),
               vp: F16Lin::tagged(ck.get(&format!("{key}.value_proj.weight")), "ple"),
               nk1: g1("norm_key"), nq1: g1("norm_query"), nc1: g1("norm_conv"),
               conv: ck.get(&format!("{key}.conv1d.weight")).contiguous(), bias: ck.get(&format!("{pre}head_bias")).contiguous(),
               mult: [m[0], m[1], m[2]], off: o.try_into().unwrap(), size: s.try_into().unwrap(), eos,
-              bits: 6, words, table: ck.raw_ptr(&tk), tiers: std::sync::Mutex::new(NgramTiers::open((words * 2) as usize)) }
+              bits, words, table: (tp, tlen), tiers: std::sync::Mutex::new(NgramTiers::open((words * 2) as usize)) }
     }
     /// Global table rows [rows, 16] for positions [p0, p0 + n), the token at position i given by `id(i)`: only positions
     /// t - 2..t are read (token t - s belongs to t's segment unless an EOS lies in t - s..t - 1).
@@ -1159,8 +1164,12 @@ pub struct Pending { gdn: Vec<Option<(Tensor, Tensor, Tensor, Tensor)>>, ple_nrm
 impl Model {
     pub fn load(dir: &Path) -> Self {
         let vis = super::vision::enabled();
-        let extra: &[&str] = if vis { &["ngram_embedding.safetensors", "vision_k6.safetensors"] } else { &["ngram_embedding.safetensors"] };
-        let ck = Checkpoint::open(dir, extra, Device::Cuda(0));
+        let mut extra = vec!["ngram_embedding.safetensors"];
+        if vis { extra.push("vision_k6.safetensors"); }
+        // The 2.05 and 3.05 bpw revisions ship the MTP mixer in a file of its own that their index does not list.
+        const MTP_MIXER: &str = "mtp_hyper_connection_mixer_patch.safetensors";
+        if dir.join(MTP_MIXER).exists() { extra.push(MTP_MIXER); }
+        let ck = Checkpoint::open(dir, &extra, Device::Cuda(0));
         let c = ck.text_cfg();
         let n = c["num_hidden_layers"].as_i64().unwrap();
         let types: Vec<String> = c["layer_types"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().into()).collect();

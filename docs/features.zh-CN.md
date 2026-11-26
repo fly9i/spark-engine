@@ -95,7 +95,9 @@ top-10 MoE，4 流 hyper-connection，来自 39 GB 表的逐层 n-gram 嵌入（
 
 - **内核。** 所有 EXL3 乘法都运行在引擎自有内核上（不使用 exllamav3 运行时）：共享输入变换的融合多线性层 decode 启动、
   支持多序列分段的 GDN 递推和卷积内核、QSA 池化/选择/注意力内核、融合的 hyper-connection 混合。n-gram 嵌入行由并行线程
-  从内存映射表中收集，并带有预取提示。
+  从内存映射表中收集，并带有预取提示。该表可以是单个张量，也可以是 exllamav3 的行分片，码宽不限（4.05 bpw 版本为 NG6，
+  其他版本有 NG4、NG5、NG8）；部分版本把 MTP mixer 放在未列入索引的 `mtp_hyper_connection_mixer_patch.safetensors`
+  中，引擎也会读取它。
 - **投机解码。** 原生 MTP 头以自回归方式生成草稿；其输出层是 lm_head 的 4 bit 副本，仅保留 65,536 个最高频 token
   （`assets/qwen38/draft_vocab_65536.json`，分块布局），因此每个草稿步只读取 84 MB，而不是完整的输出头。上下文出现重复时
   使用 prompt-lookup 草稿。最多 8 个序列在一次批量前向中完成验证。

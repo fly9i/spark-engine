@@ -49,7 +49,7 @@ impl Checkpoint {
         let mut files: Vec<String> = idx["weight_map"].as_object().unwrap().values().map(|v| v.as_str().unwrap().to_string()).collect();
         files.sort();
         files.dedup();
-        files.extend(extra_files.iter().map(|s| s.to_string()));
+        for f in extra_files { if !files.iter().any(|g| g == f) { files.push(f.to_string()); } }
         let mut ck = Checkpoint { dir: dir.into(), cfg, maps: vec![], names: vec![], tensors: HashMap::new(), dev,
                                   cache: Default::default(), staging: Default::default(), ahead: Default::default() };
         for (fi, name) in files.iter().enumerate() {
@@ -95,7 +95,7 @@ impl Checkpoint {
 
     fn preload_keys(&self, prefix: &str) -> Vec<&String> {
         let mut keys: Vec<&String> = self.tensors.keys()
-            .filter(|k| k.starts_with(prefix) && !k.ends_with("ngram_embedding.trellis")).collect();
+            .filter(|k| k.starts_with(prefix) && !(k.contains(".ngram_embedding.") && k.ends_with(".trellis"))).collect();
         keys.sort();
         keys
     }
@@ -220,6 +220,40 @@ impl Checkpoint {
     /// Raw pointer + length of a tensor in the mmap (for row gathers from the n-gram table).
     pub fn raw_ptr(&self, k: &str) -> (*const u8, usize) { let b = self.bytes(k); (b.as_ptr(), b.len()) }
 
+    /// A row table stored as `<pre>trellis` or split into row shards `<pre>shard_<i>.trellis` (exllamav3's
+    /// RowTable layout: equal row counts, the last shard may be short). Shards must sit back to back in one file, as
+    /// exllamav3's n-gram converter writes them, so the table is one mmapped span either way.
+    /// Returns (pointer, bytes, rows, row width in elements).
+    pub fn row_table(&self, pre: &str) -> (*const u8, usize, i64, i64) {
+        let single = format!("{pre}trellis");
+        if self.has(&single) {
+            let t = &self.tensors[&single];
+            let (p, n) = self.raw_ptr(&single);
+            return (p, n, t.shape[0], t.shape[1]);
+        }
+        let mut shards = Vec::new();
+        while let Some(t) = self.tensors.get(&format!("{pre}shard_{}.trellis", shards.len())) { shards.push(t); }
+        assert!(!shards.is_empty(), "missing tensor {single} (and no {pre}shard_<i>.trellis)");
+        let (t0, last) = (shards[0], shards.len() - 1);
+        let mut end = t0.offset;
+        for (i, t) in shards.iter().enumerate() {
+            assert!(t.file == t0.file && t.offset == end && t.shape[1] == t0.shape[1] && t.dtype == t0.dtype
+                    && (t.shape[0] == t0.shape[0] || (i == last && t.shape[0] < t0.shape[0])),
+                    "{pre}shard_{i}.trellis: n-gram shards must be equal-sized and back to back in one file");
+            end += t.len;
+        }
+        let rows = shards.iter().map(|t| t.shape[0]).sum();
+        (self.maps[t0.file][t0.offset..end].as_ptr(), end - t0.offset, rows, t0.shape[1])
+    }
+    /// `row_table` with MADV_RANDOM on its span.
+    pub fn row_table_random(&self, pre: &str) -> (*const u8, usize, i64, i64) {
+        extern "C" { fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32; }
+        let r = self.row_table(pre);
+        let a = (r.0 as usize) & !4095usize;
+        unsafe { madvise(a as *mut _, r.1 + (r.0 as usize - a), 1 /* MADV_RANDOM */); }
+        r
+    }
+
     /// Drop the page cache of every shard except `keep` (their tensors are on the device now). After a load the cached
     /// shards fill most of the memory, and the first large device allocations then wait for the kernel to reclaim and
     /// compact it: a fresh process's first 12K-token prefill took 7.6..17 s instead of 6.7 s.
@@ -237,13 +271,5 @@ impl Checkpoint {
             bytes += map.len();
         }
         eprintln!("[qwen] released the page cache of {:.1} GB of loaded shards", bytes as f64 / 1e9);
-    }
-
-    pub fn advise_random(&self, k: &str) {
-        extern "C" { fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32; }
-        let (p, n) = self.raw_ptr(k);
-        let page = 4096usize;
-        let a = (p as usize) & !(page - 1);
-        unsafe { madvise(a as *mut _, n + (p as usize - a), 1 /* MADV_RANDOM */); }
     }
 }
