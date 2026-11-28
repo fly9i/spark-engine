@@ -123,6 +123,13 @@ fn plan_verify_trees(
             // If lookup overrode inside DSpark's original prefix, drop DSpark's stale alt candidates for this sequence.
             let kept_orig = drafts[b].len() >= orig_prefix.len() && drafts[b][..orig_prefix.len()] == orig_prefix[..];
             if !kept_orig { branches[b] = None; }
+            else if sidx.len() <= super::tree::tree_max_batch() {
+                if let Some(lb) = super::lookup::find_lookup_branch(&stores[sidx[b]].history, toks[b], &drafts[b], &confs[b], rooms[b], temps[b]) {
+                    if let Some(br) = branches[b].as_mut() {
+                        br.lookup_branch = Some(lb);
+                    }
+                }
+            }
             if stores[sidx[b]].seq.pos + 32 > stores[sidx[b]].seq.cap { branches[b] = None; }
         }
     } else {
@@ -197,22 +204,29 @@ fn spec_commit(m: &Model, stores: &mut [Store], sp: SpecPending, keep: &[i64]) {
     spec_commit_paths(m, stores, sp, &paths);
 }
 fn spec_commit_paths(m: &Model, stores: &mut [Store], sp: SpecPending, paths: &[Vec<usize>]) {
+    let mut seed_hids: Vec<Tensor> = Vec::with_capacity(sp.sidx.len());
     for ((((b, &i), rb), ts), path) in sp.sidx.iter().enumerate().zip(sp.rbs).zip(sp.tstates).zip(paths) {
         if let Some(ts) = ts {
             let acc_ids: Vec<i64> = path.iter().map(|&u| ts.tree.ids[u]).collect();
             m.commit_tree(&mut stores[i].seq, rb, ts, path);
             stores[i].history.truncate(sp.hlen[b]);
             stores[i].history.extend_from_slice(&acc_ids);
+            super::lookup::record_global_tokens(&acc_ids);
             let g_rows: Vec<i64> = path.iter().map(|&u| sp.offs[b] + u as i64).collect();
-            let hid_sel = sp.hid.index_select(0, &super::kern::upload_i64(&g_rows, m.dev));
-            m.mtp_seed(&mut stores[i].seq, &hid_sel, sp.p0[b]);
+            seed_hids.push(sp.hid.index_select(0, &super::kern::upload_i64(&g_rows, m.dev)));
         } else {
             let k = path.len() as i64;
             m.spec_rollback(&mut stores[i].seq, rb, k);
             stores[i].history.truncate(sp.hlen[b] + k as usize);
-            m.mtp_seed(&mut stores[i].seq, &sp.hid.narrow(0, sp.offs[b], k), sp.p0[b]);
+            let hlen = stores[i].history.len();
+            if hlen >= sp.hlen[b] {
+                super::lookup::record_global_tokens(&stores[i].history[sp.hlen[b]..hlen]);
+            }
+            seed_hids.push(sp.hid.narrow(0, sp.offs[b], k));
         }
     }
+    let mut seqs = seqs_of(stores, &sp.sidx);
+    m.mtp_seed_batch(&mut seqs, &seed_hids, &sp.p0);
 }
 /// DS41_STEP_STATS=1: every 100 decode steps, the mean time of a scheduler iteration before the decode step
 /// (requests, prefill chunks), of the decode step (synchronized) and the whole period between steps, and the batch.
@@ -256,16 +270,16 @@ fn spec_cost() -> (f64, f64, f64) {
     static C: std::sync::OnceLock<(f64, f64, f64)> = std::sync::OnceLock::new();
     *C.get_or_init(|| {
         let v: Vec<f64> = std::env::var("DS41_SPEC_COST").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
-        if v.len() == 3 { (v[0], v[1], v[2]) } else { (22.0, 0.5, 2.5) }
+        if v.len() == 3 { (v[0], v[1], v[2]) } else { (21.0, 0.5, 2.2) }
     })
 }
 /// The acceptance model of choose_drafts: P(draft accepted | its predecessors accepted) = sigmoid(a conf + b), (a, b)
-/// per temperature class (greedy, sampled), DS41_SPEC_CALIB="a0,b0;a1,b1" (default 1,0;1,0: the confidence head as is;
-/// fit with bench/ds41/spec_calib.py on DS41_SPEC_LOG rounds). Only the number of verified drafts changes.
+/// per temperature class (greedy, sampled), DS41_SPEC_CALIB="a0,b0;a1,b1" (default 1.165,0.085;1,0: greedy fitted
+/// with bench/ds41/spec_calib.py on DS41_SPEC_LOG rounds under DS41_DRAFT_HEAD_FP4=1). Only the number of verified drafts changes.
 fn spec_calib(temp: f32) -> (f64, f64) {
     static C: std::sync::OnceLock<[(f64, f64); 2]> = std::sync::OnceLock::new();
     let c = C.get_or_init(|| {
-        let mut c = [(1.0, 0.0); 2];
+        let mut c = [(1.165, 0.085), (1.0, 0.0)];
         if let Ok(v) = std::env::var("DS41_SPEC_CALIB") {
             for (i, part) in v.split(';').take(2).enumerate() {
                 let x: Vec<f64> = part.split(',').filter_map(|t| t.trim().parse().ok()).collect();

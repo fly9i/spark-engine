@@ -9,6 +9,32 @@ pub fn prompt_lookup_on() -> bool {
     *E.get_or_init(|| std::env::var("DS41_PROMPT_LOOKUP").map_or(true, |v| v != "0"))
 }
 
+/// DS41_GLOBAL_LOOKUP (default on; 0 off): deterministic cross-request rolling token ring (updated identically on
+/// every TP rank from committed tokens) used as a >= 4-gram fallback when per-request history has no match.
+pub fn global_lookup_on() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("DS41_GLOBAL_LOOKUP").map_or(true, |v| v != "0"))
+}
+
+const GLOBAL_RING_CAP: usize = 65536;
+static GLOBAL_RING: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+
+/// Append committed tokens (identical on every TP rank under DS41_CTRL_LOCAL) to the rolling cross-request ring.
+pub fn record_global_tokens(tokens: &[i64]) {
+    if !prompt_lookup_on() || !global_lookup_on() || tokens.is_empty() {
+        return;
+    }
+    let mut ring = GLOBAL_RING.lock().unwrap();
+    if ring.capacity() == 0 {
+        ring.reserve(GLOBAL_RING_CAP);
+    }
+    ring.extend_from_slice(tokens);
+    if ring.len() > GLOBAL_RING_CAP {
+        let drop_n = ring.len() - GLOBAL_RING_CAP;
+        ring.drain(..drop_n);
+    }
+}
+
 fn lookup_max() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("DS41_LOOKUP_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(12))
@@ -154,7 +180,14 @@ pub fn apply_lookup_capped(
         return;
     }
     let q = build_query(history, tok, drafts, 8);
-    if let Some((n, cont)) = find_ngram_continuation(history, &q, 3, 8, max_total - drafts.len(), win) {
+    let m = find_ngram_continuation(history, &q, 3, 8, max_total - drafts.len(), win).or_else(|| {
+        if !global_lookup_on() {
+            return None;
+        }
+        let ring = GLOBAL_RING.lock().unwrap();
+        find_ngram_continuation(&ring, &q, 4, 8, max_total - drafts.len(), GLOBAL_RING_CAP)
+    });
+    if let Some((n, cont)) = m {
         let mut base_p = if n >= 5 { 0.90f32 } else if n == 4 { 0.85f32 } else { 0.78f32 };
         if temp > 0.0 {
             base_p *= 0.75;
@@ -164,6 +197,50 @@ pub fn apply_lookup_capped(
             confs.push(logit((base_p * 0.97f32.powi(i as i32)).clamp(0.45, 0.92)));
         }
     }
+}
+
+/// Optional tree branch from n-gram lookup (when DSpark is moderately uncertain at step 0, `0.35 <= p0 < 0.85`,
+/// and a strong >= 4-gram match disagrees with `drafts[0]`, inject it as a parallel branch in `VerifyTree`).
+pub fn find_lookup_branch(
+    history: &[i64],
+    tok: i64,
+    drafts: &[i64],
+    confs: &[f32],
+    room: usize,
+    temp: f32,
+) -> Option<(usize, Vec<i64>, Vec<f32>)> {
+    if !prompt_lookup_on() || temp > 0.0 || room < 2 || drafts.is_empty() || confs.is_empty() {
+        return None;
+    }
+    let p0 = sigmoid(confs[0]);
+    if p0 >= 0.85 {
+        return None;
+    }
+    let max_ext = room.min(5);
+    let q = build_query(history, tok, &[], 8);
+    let win = lookup_window();
+    let hit = find_ngram_continuation(history, &q, 4, 8, max_ext, win).or_else(|| {
+        if !global_lookup_on() {
+            return None;
+        }
+        let ring = GLOBAL_RING.lock().unwrap();
+        find_ngram_continuation(&ring, &q, 4, 8, max_ext, GLOBAL_RING_CAP)
+    });
+    let (n, cont) = hit?;
+    if cont.is_empty() || cont[0] == drafts[0] {
+        return None;
+    }
+    // Scale branch root probability by (1 - p0) so the tree cost model only accepts it when competitive.
+    let base_p = (1.0 - p0) * if n >= 5 { 0.85 } else { 0.75 };
+    if base_p < 0.12 {
+        return None;
+    }
+    let mut bconfs = Vec::with_capacity(cont.len());
+    for i in 0..cont.len() {
+        let step_p = if i == 0 { base_p } else { (0.85 * 0.95f32.powi(i as i32 - 1)).clamp(0.50, 0.88) };
+        bconfs.push(logit(step_p));
+    }
+    Some((0, cont, bconfs))
 }
 
 #[cfg(test)]

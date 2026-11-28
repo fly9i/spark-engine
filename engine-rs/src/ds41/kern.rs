@@ -25,6 +25,10 @@ extern "C" {
                           ws: *const std::ffi::c_void, y: *mut std::ffi::c_void, m: i32, n: i32, k: i32, ob16: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_fp8_gemv_mx_init() -> i32;
     fn ds41_fp8_gemv_mx_smem_max() -> usize;
+    fn ds41_quant_mxfp4_dense_bf16(w_bf16: *const std::ffi::c_void, w_pack: *mut std::ffi::c_void, s_pack: *mut std::ffi::c_void, n: i32, k: i32, st: *mut std::ffi::c_void) -> i32;
+    fn ds41_quant_mxfp4_dense_fp8(w_fp8: *const std::ffi::c_void, s_fp8: *const std::ffi::c_void, w_pack: *mut std::ffi::c_void, s_pack: *mut std::ffi::c_void, n: i32, k: i32, st: *mut std::ffi::c_void) -> i32;
+    fn ds41_mxfp4_gemv_mx_q(x: *const std::ffi::c_void, aq: *const std::ffi::c_void, as_: *const std::ffi::c_void, w: *const std::ffi::c_void,
+                            ws: *const std::ffi::c_void, y: *mut std::ffi::c_void, m: i32, n: i32, k: i32, ob16: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_bf16_gemv_mx(x: *const std::ffi::c_void, w: *const std::ffi::c_void, y: *mut f32, m: i32, n: i32, k: i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_moe_mx_ws_bytes(r: i32, i: i32, topk: i32, e: i32) -> usize;
     fn ds41_moe_mx_set_s2(on: i32);
@@ -227,6 +231,87 @@ pub fn c12_markov_top2(
         logits.data_ptr() as *const f32, blk as i32, step_j as i32, b_mod as i32, m as i32, n as i32, k as i32, start,
         temps.data_ptr().cast(), keys.data_ptr().cast(), pv1.data_ptr().cast(), pi1.data_ptr().cast(), pv2.data_ptr().cast(), pi2.data_ptr().cast(),
         packet2.data_ptr().cast(), world as i32, rank as i32, NB as i32, ds41_pdl_enabled(), rs_current_stream()) }, 0, "c12_markov_top2");
+    true
+}
+
+/// Fused Markov head MXFP4 quantizer (K = 256 -> 5.9 MB vs 16.6 MB C12 / 22.1 MB BF16).
+pub fn markov_fp4_quant(w: &Tensor) -> (Tensor, Tensor) {
+    let w = w.to_kind(Kind::BFloat16).contiguous();
+    let (n, k) = (w.size()[0], w.size()[1]);
+    assert!(k == 256 && n % 16 == 0, "markov_fp4_quant [{n} x {k}]");
+    let wq = Tensor::empty([n, 128], (Kind::Uint8, w.device()));
+    let ws = Tensor::empty([n, 8], (Kind::Uint8, w.device()));
+    extern "C" { fn glm53_markov_fp4_quant_cuda(w: *const std::ffi::c_void, wq: *mut std::ffi::c_void, ws: *mut std::ffi::c_void, n: i32, st: *mut std::ffi::c_void) -> i32; }
+    assert_eq!(unsafe { glm53_markov_fp4_quant_cuda(w.data_ptr(), wq.data_ptr(), ws.data_ptr(), n as i32, rs_current_stream()) }, 0, "markov_fp4_quant");
+    (wq, ws)
+}
+
+/// Fused Markov head MXFP4 GEMV (K = 256) + logits add + Gumbel argmax (L2: drafter only).
+#[allow(clippy::too_many_arguments)]
+pub fn markov_fp4_argmax(
+    emb: &Tensor, wq: &Tensor, ws: &Tensor, logits: &Tensor, blk: i64, step_j: i64, start: i64,
+    temps: &Tensor, keys: &Tensor, packet: &Tensor, world: i64, rank: i64,
+) -> bool {
+    if !markov_fused_on() { return false; }
+    let (m, k) = (emb.size()[0], emb.size()[1]);
+    let n = wq.size()[0];
+    if !(1..=8).contains(&m) || k != 256 || n % 16 != 0 { return false; }
+    if logits.kind() != Kind::Float || !logits.is_contiguous() || logits.size() != [m * blk, n] { return false; }
+    let x = emb.to_kind(Kind::BFloat16).contiguous();
+    const NB: i64 = 192;
+    let part_v = Tensor::empty([m * NB], (Kind::Float, x.device()));
+    let part_i = Tensor::empty([m * NB], (Kind::Int, x.device()));
+    extern "C" {
+        fn glm53_markov_fp4_argmax_cuda(
+            x: *const std::ffi::c_void, wq: *const std::ffi::c_void, ws: *const std::ffi::c_void,
+            logits: *const f32, blk: i32, step_j: i32, m: i32, n: i32, start: i64,
+            temps: *const f32, keys: *const u64, part_v: *mut f32, part_i: *mut i32,
+            packet: *mut f32, world: i32, rank: i32, nb: i32, pdl: i32, st: *mut std::ffi::c_void,
+        ) -> i32;
+        fn ds41_pdl_enabled() -> i32;
+    }
+    assert_eq!(unsafe { glm53_markov_fp4_argmax_cuda(
+        x.data_ptr(), wq.data_ptr(), ws.data_ptr(), logits.data_ptr() as *const f32,
+        blk as i32, step_j as i32, m as i32, n as i32, start,
+        temps.data_ptr().cast(), keys.data_ptr().cast(), part_v.data_ptr().cast(), part_i.data_ptr().cast(),
+        packet.data_ptr().cast(), world as i32, rank as i32, NB as i32, ds41_pdl_enabled(), rs_current_stream(),
+    ) }, 0, "markov_fp4_argmax");
+    true
+}
+
+/// Fused Markov head MXFP4 GEMV (K = 256) + logits add + Gumbel top-2 argmax (L2: drafter only).
+#[allow(clippy::too_many_arguments)]
+pub fn markov_fp4_top2(
+    emb: &Tensor, wq: &Tensor, ws: &Tensor, logits: &Tensor, blk: i64, step_j: i64, b_mod: i64, start: i64,
+    temps: &Tensor, keys: &Tensor, packet2: &Tensor, world: i64, rank: i64,
+) -> bool {
+    if !markov_fused_on() { return false; }
+    let (m, k) = (emb.size()[0], emb.size()[1]);
+    let n = wq.size()[0];
+    if !(1..=8).contains(&m) || b_mod < 1 || b_mod > m || k != 256 || n % 16 != 0 { return false; }
+    if logits.kind() != Kind::Float || !logits.is_contiguous() || logits.size() != [b_mod * blk, n] { return false; }
+    let x = emb.to_kind(Kind::BFloat16).contiguous();
+    const NB: i64 = 192;
+    let pv1 = Tensor::empty([m * NB], (Kind::Float, x.device()));
+    let pi1 = Tensor::empty([m * NB], (Kind::Int, x.device()));
+    let pv2 = Tensor::empty([m * NB], (Kind::Float, x.device()));
+    let pi2 = Tensor::empty([m * NB], (Kind::Int, x.device()));
+    extern "C" {
+        fn glm53_markov_fp4_top2_cuda(
+            x: *const std::ffi::c_void, wq: *const std::ffi::c_void, ws: *const std::ffi::c_void,
+            logits: *const f32, blk: i32, step_j: i32, b_mod: i32, m: i32, n: i32, start: i64,
+            temps: *const f32, keys: *const u64, pv1: *mut f32, pi1: *mut i32, pv2: *mut f32, pi2: *mut i32,
+            packet2: *mut f32, world: i32, rank: i32, nb: i32, pdl: i32, st: *mut std::ffi::c_void,
+        ) -> i32;
+        fn ds41_pdl_enabled() -> i32;
+    }
+    assert_eq!(unsafe { glm53_markov_fp4_top2_cuda(
+        x.data_ptr(), wq.data_ptr(), ws.data_ptr(), logits.data_ptr() as *const f32,
+        blk as i32, step_j as i32, b_mod as i32, m as i32, n as i32, start,
+        temps.data_ptr().cast(), keys.data_ptr().cast(), pv1.data_ptr().cast(), pi1.data_ptr().cast(),
+        pv2.data_ptr().cast(), pi2.data_ptr().cast(), packet2.data_ptr().cast(),
+        world as i32, rank as i32, NB as i32, ds41_pdl_enabled(), rs_current_stream(),
+    ) }, 0, "markov_fp4_top2");
     true
 }
 
@@ -957,8 +1042,90 @@ pub fn fp8_gemv_mx_bf16(x: &Tensor, w: &Tensor, ws: &Tensor) -> Tensor { gemv_mx
 #[derive(Clone, Copy)]
 struct HcJobC { kind: i32, ctas: i32, h: *const std::ffi::c_void, fn_: *const f32, part: *mut f32, t: i32, d: i32, scale: *const f32, base: *const f32,
                 pre: *mut f32, post: *mut f32, comb: *mut f32, norm_eps: f32, eps: f32, iters: i32 }
-extern "C" { fn ds41_fp8_gemv_mx_job(x: *const std::ffi::c_void, aq: *const std::ffi::c_void, as_: *const std::ffi::c_void, w: *const std::ffi::c_void, ws: *const std::ffi::c_void,
-                                    y: *mut std::ffi::c_void, m: i32, n: i32, k: i32, ob16: i32, job: *const HcJobC, st: *mut std::ffi::c_void) -> i32; }
+extern "C" {
+    fn ds41_fp8_gemv_mx_job(x: *const std::ffi::c_void, aq: *const std::ffi::c_void, as_: *const std::ffi::c_void, w: *const std::ffi::c_void, ws: *const std::ffi::c_void,
+                            y: *mut std::ffi::c_void, m: i32, n: i32, k: i32, ob16: i32, job: *const HcJobC, st: *mut std::ffi::c_void) -> i32;
+    fn ds41_mxfp4_gemv_mx_job(x: *const std::ffi::c_void, aq: *const std::ffi::c_void, as_: *const std::ffi::c_void, w: *const std::ffi::c_void, ws: *const std::ffi::c_void,
+                              y: *mut std::ffi::c_void, m: i32, n: i32, k: i32, ob16: i32, job: *const HcJobC, st: *mut std::ffi::c_void) -> i32;
+}
+/// DS41_DRAFT_HEAD_FP4 (L2, default on; 0 off): quantize DSpark's draft head to MXFP4 (117 MB vs 221 MB FP8).
+pub fn draft_head_fp4_on() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("DS41_DRAFT_HEAD_FP4").map_or(true, |v| v != "0"))
+}
+/// DS41_MARKOV_FP4=1 (L2, default off until validated): quantize DSpark's markov_head [v, 256] to MXFP4 (5.9 MB vs 16.6 MB C12).
+pub fn markov_fp4_on() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("DS41_MARKOV_FP4").is_ok_and(|v| v == "1"))
+}
+/// DS41_MTP_MAIN_PROJ_FP4=1 (L2, default off until validated): quantize this rank's split of mtp.0.main_proj to MXFP4.
+pub fn mtp_main_proj_fp4_on() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("DS41_MTP_MAIN_PROJ_FP4").is_ok_and(|v| v == "1"))
+}
+/// DS41_MTP_DENSE_FP4 (L2, default 0): 0/off, "ffn" (shared+wo_b), "safe" (+wq_b, skips qakv_mine), or 1/"all" (+qakv_mine).
+pub fn mtp_dense_fp4_mode() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("DS41_MTP_DENSE_FP4").as_deref() {
+        Ok("ffn") => 1,
+        Ok("safe") => 2,
+        Ok("1") | Ok("all") => 3,
+        _ => 0,
+    })
+}
+pub fn quant_mxfp4_dense_bf16(w: &Tensor) -> (Tensor, Tensor) {
+    let w = w.to_kind(Kind::BFloat16).contiguous();
+    let (n, k) = (w.size()[0], w.size()[1]);
+    assert!(n % 8 == 0 && k % 128 == 0, "quant_mxfp4_dense_bf16 [{n} x {k}]");
+    let wp = Tensor::empty([n * (k / 2)], (Kind::Uint8, w.device()));
+    let sp = Tensor::empty([n * (k / 32)], (Kind::Uint8, w.device()));
+    assert_eq!(unsafe { ds41_quant_mxfp4_dense_bf16(w.data_ptr(), wp.data_ptr(), sp.data_ptr(), n as i32, k as i32, rs_current_stream()) }, 0, "ds41_quant_mxfp4_dense_bf16");
+    (wp, sp)
+}
+pub fn quant_mxfp4_dense_fp8(w: &Tensor, s: &Tensor) -> (Tensor, Tensor) {
+    let (w, s) = (w.contiguous(), s.contiguous());
+    let (n, k) = (w.size()[0], w.size()[1]);
+    assert!(n % 8 == 0 && k % 128 == 0, "quant_mxfp4_dense_fp8 [{n} x {k}]");
+    let wp = Tensor::empty([n * (k / 2)], (Kind::Uint8, w.device()));
+    let sp = Tensor::empty([n * (k / 32)], (Kind::Uint8, w.device()));
+    assert_eq!(unsafe { ds41_quant_mxfp4_dense_fp8(w.data_ptr(), s.data_ptr(), wp.data_ptr(), sp.data_ptr(), n as i32, k as i32, rs_current_stream()) }, 0, "ds41_quant_mxfp4_dense_fp8");
+    (wp, sp)
+}
+pub fn mxfp4_gemv_mx(x: &Tensor, w: &Tensor, ws: &Tensor, n: i64, k: i64) -> Tensor { gemv_mx4(x, w, ws, n, k, false) }
+pub fn mxfp4_gemv_mx_bf16(x: &Tensor, w: &Tensor, ws: &Tensor, n: i64, k: i64) -> Tensor { gemv_mx4(x, w, ws, n, k, true) }
+fn gemv_mx4(x: &Tensor, w: &Tensor, ws: &Tensor, n: i64, k: i64, ob16: bool) -> Tensor {
+    let x = x.to_kind(Kind::BFloat16).contiguous();
+    let m = x.size()[0];
+    assert_eq!(x.size()[1], k, "mxfp4_gemv_mx k mismatch");
+    let y = Tensor::empty([m, n], (if ob16 { Kind::BFloat16 } else { Kind::Float }, x.device()));
+    if m > 32 {
+        let (q, s) = act_quant_fp8(&x);
+        let mut r = 0;
+        while r < m {
+            let c = 32.min(m - r);
+            let job = GEMV_JOBS.with(|q| q.borrow_mut().pop_front());
+            let (xr, qr, sr, yr) = (x.narrow(0, r, c), q.narrow(0, r, c), s.narrow(0, r, c), y.narrow(0, r, c));
+            let rc = match job.as_ref().map(|(j, _)| j) {
+                Some(j) => unsafe { ds41_mxfp4_gemv_mx_job(xr.data_ptr(), qr.data_ptr(), sr.data_ptr(), w.data_ptr(), ws.data_ptr(), yr.data_ptr(), c as i32, n as i32, k as i32, ob16 as i32, j, rs_current_stream()) },
+                None => unsafe { ds41_mxfp4_gemv_mx_q(xr.data_ptr(), qr.data_ptr(), sr.data_ptr(), w.data_ptr(), ws.data_ptr(), yr.data_ptr(), c as i32, n as i32, k as i32, ob16 as i32, rs_current_stream()) },
+            };
+            assert_eq!(rc, 0, "ds41_mxfp4_gemv_mx (chunk)");
+            if let Some((_, ts)) = job { SIDE_HOLD.with(|h| if let Some(v) = h.borrow_mut().as_mut() { v.extend(ts) }); }
+            r += c;
+        }
+        return y;
+    }
+    let fits = (m * k + m * k / 32) as usize <= unsafe { ds41_fp8_gemv_mx_smem_max() } && m < gemv_preq_rows() && !(m == 1 && k >= 4096 && gemv_preq_k1());
+    let q = (!fits).then(|| act_quant_fp8(&x));
+    let (aq, asc) = q.as_ref().map_or((std::ptr::null_mut(), std::ptr::null_mut()), |(a, b)| (a.data_ptr(), b.data_ptr()));
+    let job = GEMV_JOBS.with(|q| q.borrow_mut().pop_front());
+    match &job {
+        Some((j, _)) => assert_eq!(unsafe { ds41_mxfp4_gemv_mx_job(x.data_ptr(), aq, asc, w.data_ptr(), ws.data_ptr(), y.data_ptr(), m as i32, n as i32, k as i32, ob16 as i32, j, rs_current_stream()) }, 0, "ds41_mxfp4_gemv_mx_job"),
+        None => assert_eq!(unsafe { ds41_mxfp4_gemv_mx_q(x.data_ptr(), aq, asc, w.data_ptr(), ws.data_ptr(), y.data_ptr(), m as i32, n as i32, k as i32, ob16 as i32, rs_current_stream()) }, 0, "ds41_mxfp4_gemv_mx"),
+    }
+    if let Some((_, ts)) = job { SIDE_HOLD.with(|h| if let Some(v) = h.borrow_mut().as_mut() { v.extend(ts) }); }
+    y
+}
 thread_local! {
     /// Jobs the next MX GEMVs take, in order (with the tensors they use, kept until the job is launched).
     static GEMV_JOBS: std::cell::RefCell<std::collections::VecDeque<(HcJobC, Vec<Tensor>)>> = std::cell::RefCell::new(Default::default());
@@ -2066,6 +2233,118 @@ pub fn test(ckpt: &std::path::Path) {
     }
     if std::env::var("DS41_KT_ONLY").as_deref() == Ok("s2") { s2_test(&ck, dev); return; }
     if std::env::var("DS41_KT_ONLY").as_deref() == Ok("rs") { rs_test(dev); return; }
+    if std::env::var("DS41_KT_ONLY").as_deref() == Ok("mx4") {
+        gemv_mx_init();
+        let lut: [f32; 16] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0];
+        // 1. Accuracy vs exact dequantized E2M1 + act_quant FP32 reference, plus row-invariance across m=1..32
+        let (n, k) = (256i64, 512i64);
+        let w_bf16 = (Tensor::randn([n, k], (Kind::Float, dev)) * 0.5).to_kind(Kind::BFloat16);
+        let (wp, sp) = quant_mxfp4_dense_bf16(&w_bf16);
+        // Unpack packed MXFP4 on CPU to verify exact MMA math
+        let wph: Vec<u8> = Vec::<u8>::try_from(wp.to_device(tch::Device::Cpu)).unwrap();
+        let sph: Vec<u8> = Vec::<u8>::try_from(sp.to_device(tch::Device::Cpu)).unwrap();
+        let ns = (k / 128) as usize;
+        let mut wf = vec![0f32; (n * k) as usize];
+        for tile in 0..(n / 8) as usize {
+            for s in 0..ns {
+                let bi = tile * ns + s;
+                for g in 0..8 {
+                    let r = tile * 8 + g;
+                    for b in 0..4 {
+                        let sb = sph[bi * 32 + g * 4 + b];
+                        let sc = if sb == 0 { 0.0 } else { f32::from_bits((sb as u32) << 23) };
+                        for q in 0..4 {
+                            let off = bi * 512 + (g * 4 + q) * 16 + b * 4;
+                            for t in 0..4 {
+                                let byte = wph[off + t];
+                                let k_idx = s * 128 + b * 32 + q * 8 + 2 * t;
+                                wf[r * k as usize + k_idx] = lut[(byte & 0xF) as usize] * sc;
+                                wf[r * k as usize + k_idx + 1] = lut[(byte >> 4) as usize] * sc;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let w_ref = Tensor::from_slice(&wf).view([n, k]).to_device(dev);
+        let x32 = (Tensor::randn([32, k], (Kind::Float, dev)) * 0.5).to_kind(Kind::BFloat16);
+        let x_aq = act_quant(&x32).to_kind(Kind::Float);
+        let y_ref = x_aq.matmul(&w_ref.tr());
+        let y1_row0 = mxfp4_gemv_mx(&x32.narrow(0, 0, 1), &wp, &sp, n, k);
+        let mut inv_bad = 0;
+        for &m in &[1i64, 5, 16, 20, 32] {
+            let y = mxfp4_gemv_mx(&x32.narrow(0, 0, m), &wp, &sp, n, k);
+            let err = (&y - y_ref.narrow(0, 0, m)).abs().max().double_value(&[]);
+            let inv = (y.narrow(0, 0, 1) - &y1_row0).abs().max().double_value(&[]);
+            if inv != 0.0 { inv_bad += 1; }
+            eprintln!("[ds41-kernel-test] mx4 [{n}x{k}] m={m:2}: max_err={err:.2e} row0_inv={inv:.2e}");
+            assert!(err < 1e-3, "mx4 accuracy failed: {err}");
+        }
+        assert_eq!(inv_bad, 0, "mx4 row-invariance failed");
+        // 2. Speed vs fp8_gemv_mx on draft_head shape [52096, 5376], m=5
+        let (hn, hk) = (52096i64, 5376i64);
+        let hw = Tensor::randn([hn, hk], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+        let (hwp, hsp) = quant_mxfp4_dense_bf16(&hw);
+        let h8 = super::model::quant_fp8_blocks(&hw);
+        let hx = Tensor::randn([5, hk], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+        let bench = |f: &dyn Fn() -> Tensor| {
+            for _ in 0..3 { let _ = f(); }
+            tch::Cuda::synchronize(0);
+            let t0 = std::time::Instant::now();
+            for _ in 0..20 { let _ = f(); }
+            tch::Cuda::synchronize(0);
+            t0.elapsed().as_secs_f64() * 1e6 / 20.0
+        };
+        let us8 = bench(&|| fp8_gemv_mx(&hx, &h8.w, &h8.s));
+        let us4 = bench(&|| mxfp4_gemv_mx(&hx, &hwp, &hsp, hn, hk));
+        let y8 = fp8_gemv_mx(&hx, &h8.w, &h8.s);
+        let y4 = mxfp4_gemv_mx(&hx, &hwp, &hsp, hn, hk);
+        let agree = y8.argmax(-1, false).eq_tensor(&y4.argmax(-1, false)).sum(Kind::Int64).int64_value(&[]);
+        eprintln!("[ds41-kernel-test] mx4 draft_head [{hn}x{hk}] m=5: fp8={us8:.1} us vs mxfp4={us4:.1} us ({:.2}x, saved {:.1} us), random_top1={agree}/5", us8 / us4, us8 - us4);
+        // 3. Markov MXFP4 [43136, 256]: exactness vs dequantized reference + speed vs C12
+        let mn = 43136i64;
+        let mw = (Tensor::randn([mn, 256], (Kind::Float, dev)) * 0.5).to_kind(Kind::BFloat16);
+        let (mwq, mws) = markov_fp4_quant(&mw);
+        let wqh: Vec<u8> = Vec::<u8>::try_from(mwq.view([-1]).to_device(tch::Device::Cpu)).unwrap();
+        let wsh: Vec<u8> = Vec::<u8>::try_from(mws.view([-1]).to_device(tch::Device::Cpu)).unwrap();
+        let mut mwf = vec![0f32; (mn * 256) as usize];
+        for r in 0..mn as usize {
+            for g in 0..8 {
+                let se = wsh[r * 8 + g];
+                let sc = if se == 0 { 0.0 } else { f32::from_bits((se as u32) << 23) };
+                for j in 0..16 {
+                    let b = wqh[r * 128 + g * 16 + j];
+                    mwf[r * 256 + g * 32 + 2 * j] = lut[(b & 0xf) as usize] * sc;
+                    mwf[r * 256 + g * 32 + 2 * j + 1] = lut[(b >> 4) as usize] * sc;
+                }
+            }
+        }
+        let mw_ref = Tensor::from_slice(&mwf).view([mn, 256]).to_device(dev);
+        let mx = (Tensor::randn([3, 256], (Kind::Float, dev)) * 0.5).to_kind(Kind::BFloat16);
+        let mlog = Tensor::randn([5, mn], (Kind::Float, dev));
+        let temps = Tensor::zeros([3], (Kind::Float, dev));
+        let keys = Tensor::zeros([3], (Kind::Int64, dev));
+        let pkt = Tensor::empty([1, 1, 2], (Kind::Float, dev));
+        assert!(markov_fp4_argmax(&mx.narrow(0, 0, 1), &mwq, &mws, &mlog, 5, 2, 0, &temps.narrow(0, 0, 1), &keys.narrow(0, 0, 1), &pkt, 1, 0));
+        let ref_scores = mlog.narrow(0, 2, 1) + mx.narrow(0, 0, 1).to_kind(Kind::Float).matmul(&mw_ref.tr());
+        let ref_id = ref_scores.argmax(-1, false).int64_value(&[0]);
+        let got_id = pkt.double_value(&[0, 0, 1]) as i64;
+        assert_eq!(got_id, ref_id, "markov_fp4_argmax mismatch: got {got_id} vs ref {ref_id}");
+        let pkt2 = Tensor::empty([1, 3, 4], (Kind::Float, dev));
+        assert!(markov_fp4_top2(&mx, &mwq, &mws, &mlog, 5, 2, 1, 0, &temps, &keys, &pkt2, 1, 0));
+        let (t1, t2, _) = choose_top2(&pkt2);
+        for rr in 0..3i64 {
+            let sc = mlog.narrow(0, 2, 1) + mx.narrow(0, rr, 1).to_kind(Kind::Float).matmul(&mw_ref.tr());
+            let (_, top2) = sc.topk(2, -1, true, true);
+            assert_eq!(t1.int64_value(&[rr]), top2.int64_value(&[0, 0]), "markov_fp4_top2 r={rr} top1");
+            assert_eq!(t2.int64_value(&[rr]), top2.int64_value(&[0, 1]), "markov_fp4_top2 r={rr} top2");
+        }
+        let _ = c12_register(&mw);
+        let us_c12 = bench(&|| { let _ = c12_markov_argmax(&mx.narrow(0, 0, 1), &mw, &mlog, 5, 2, 0, &temps.narrow(0, 0, 1), &keys.narrow(0, 0, 1), &pkt, 1, 0); pkt.shallow_clone() });
+        let us_fp4 = bench(&|| { let _ = markov_fp4_argmax(&mx.narrow(0, 0, 1), &mwq, &mws, &mlog, 5, 2, 0, &temps.narrow(0, 0, 1), &keys.narrow(0, 0, 1), &pkt, 1, 0); pkt.shallow_clone() });
+        eprintln!("[ds41-kernel-test] mk4 markov_head [{mn}x256] m=1: c12={us_c12:.1} us vs mxfp4={us_fp4:.1} us ({:.2}x, saved {:.1} us/step, {:.1} us/5-step round)", us_c12 / us_fp4, us_c12 - us_fp4, 5.0 * (us_c12 - us_fp4));
+        return;
+    }
     if std::env::var("DS41_KT_ONLY").as_deref() == Ok("topk") {
         // topk_idx: the multi-CTA path for few long rows (tkw) against the one-CTA-per-row kernel, bitwise: heavy ties
         // (scores on a coarse grid), -inf runs (candidate layers), rows with lens < Tc, odd widths

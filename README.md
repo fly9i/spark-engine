@@ -49,6 +49,33 @@ clock sampled every second, no throttling recorded); GLM's column is older (DGX 
 "Prose" = a long explanation (lower draft acceptance); "structured" = counting 1–200 (high acceptance). Decode speed depends on the text
 because of speculation.
 
+### DeepSeek-V4.1-Flash on v0.3.16 (2026-11-28)
+
+Release measurement of v0.3.16 on three DGX Sparks (TP3, default GPU clocks, `DS41_BATCH_INVARIANT=1`, greedy, thinking
+off, `DS41_GLOBAL_LOOKUP=0` for clean cold-prompt measurement) compared against v0.3.15
+(`bench/ds41_decode_bench.py --types prose,structured,code --conc 1,2,4`, 256 tokens per stream, median of 3):
+
+| Decode, aggregate tok/s (v0.3.15 → **v0.3.16**) | Prose | Structured | Code |
+| --- | --- | --- | --- |
+| 1 stream | 69.7 → **70.9** (+1.7%) | 127.6 → **128.5** (+0.7%) | 112.1 → **111.7** (−0.4%) |
+| 2 streams | 95.8 → **95.4** (−0.4%) | 188.2 → **189.2** (+0.5%) | 149.7 → **161.2** (+7.7%) |
+| 4 streams | 128.3 → **132.3** (+3.1%) | 247.8 → **250.5** (+1.1%) | 184.1 → **194.3** (+5.5%) |
+
+New defaults in v0.3.16 (100% L0 bit-exact main-model outputs across all 22/22 greedy checks): native `sm_121a` MXFP4
+DSpark draft head (`DS41_DRAFT_HEAD_FP4=1`, 117.3 MB vs. 220.9 MB FP8, 1.88× faster draft head, −103.6 MB/rank VRAM),
+6× lighter block-split BF16 All-Gather for Engram (`DS41_ENGRAM_AG=1`) plus async Engram host gather for tree and
+17–32-row batched verification, batched multi-stream `mtp_seed` (`DS41_MTP_SEED_BATCH=1`), recalibrated speculation
+cost/confidence defaults (`DS41_SPEC_COST=21,0.5,2.2`, `DS41_SPEC_CALIB=1.165,0.085;1,0`), and a deterministic 64K-token
+cross-request lookup ring (`DS41_GLOBAL_LOOKUP=1`).
+
+> **Limitations of `DS41_GLOBAL_LOOKUP=1` (on by default for single-user / small-team Spark clusters)**: outputs remain
+> 100% L0 bit-exact (main model verifies every draft), so content never leaks across requests. However, (1) in
+> multi-tenant serving, cross-request n-gram hits create a timing side-channel — set `DS41_GLOBAL_LOOKUP=0` for
+> multi-tenant isolation; (2) when running repeated-prompt cold benchmarks, set `DS41_GLOBAL_LOOKUP=0` so cross-run
+> memorization does not inflate numbers (all release benchmark tables above use `DS41_GLOBAL_LOOKUP=0`).
+
+Details: [docs/release-notes.md](docs/release-notes.md), [docs/ds41.md](docs/ds41.md#5-settings).
+
 ### DeepSeek-V4.1-Flash on v0.3.15 (2026-11-28)
 
 Release measurement of v0.3.15 on three DGX Sparks (TP3, default GPU clocks, `DS41_BATCH_INVARIANT=1`, greedy, thinking

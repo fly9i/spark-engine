@@ -40,6 +40,24 @@ DeepSeek 预填 2026-10-30，Qwen 预填 2026-10-29，启动 2026-10-28。更多
 
 "prose" = 长篇解释（草稿接受率低）；"structured" = 从 1 数到 200（接受率高）。因为有投机，解码速度和文本相关。
 
+### DeepSeek-V4.1-Flash：v0.3.16（2026-11-28）
+
+v0.3.16 在三台 DGX Spark（TP3，默认 GPU 时钟，`DS41_BATCH_INVARIANT=1`，贪心、关思考，为保证冷请求公平对比设
+`DS41_GLOBAL_LOOKUP=0`）上相对 v0.3.15 的实测对比（`bench/ds41_decode_bench.py --types prose,structured,code --conc 1,2,4`，
+每路 256 token，3 次取中位数）：
+
+| 解码，聚合 tok/s（v0.3.15 → **v0.3.16**） | prose | structured | code |
+| --- | --- | --- | --- |
+| 1 路 | 69.7 → **70.9**（+1.7%） | 127.6 → **128.5**（+0.7%） | 112.1 → **111.7**（−0.4%） |
+| 2 路 | 95.8 → **95.4**（−0.4%） | 188.2 → **189.2**（+0.5%） | 149.7 → **161.2**（+7.7%） |
+| 4 路 | 128.3 → **132.3**（+3.1%） | 247.8 → **250.5**（+1.1%） | 184.1 → **194.3**（+5.5%） |
+
+v0.3.16 默认新增优化（全部 22/22 贪心校验 100% L0 逐位一致）：原生 `sm_121a` MXFP4 草稿头（`DS41_DRAFT_HEAD_FP4=1`，117.3 MB vs. 220.9 MB FP8，草稿头提速 1.88×、每卡省 103.6 MB 显存）、Engram 分块 BF16 All-Gather（`DS41_ENGRAM_AG=1`，RDMA 字节降 6×）及树验证 / 17–32 行多流后台异步 gather、批量多流 `mtp_seed`（`DS41_MTP_SEED_BATCH=1`）、重标定投机代价与置信度默认值（`DS41_SPEC_COST=21,0.5,2.2`、`DS41_SPEC_CALIB=1.165,0.085;1,0`），以及跨请求 64K token 确定性环形查找缓存（`DS41_GLOBAL_LOOKUP=1`）。
+
+> **`DS41_GLOBAL_LOOKUP=1` 的局限性说明（面向个人/小团队工作站默认开启）**：主模型对每条草稿都做严格校验，输出保持 100% L0 逐位一致，绝不会跨请求泄露内容；但（1）在多租户隔离服务中，跨请求 n-gram 命中会带来时序侧信道（响应加速），多租户场景请设 `DS41_GLOBAL_LOOKUP=0`；（2）运行重复提示词的冷请求基准测试时请设 `DS41_GLOBAL_LOOKUP=0`，避免跨轮记忆虚高跑分（上表全部发布数据均在 `DS41_GLOBAL_LOOKUP=0` 下测得）。
+
+详见 [docs/release-notes.md](docs/release-notes.md)、[docs/ds41.zh-CN.md](docs/ds41.zh-CN.md#5-设置)。
+
 ### DeepSeek-V4.1-Flash：v0.3.15（2026-11-28）
 
 v0.3.15 在三台 DGX Spark（TP3，默认 GPU 时钟，`DS41_BATCH_INVARIANT=1`，贪心、关思考）上相对 v0.3.13 / v0.3.14

@@ -31,29 +31,55 @@ use tch::{Device, Kind, Tensor};
 pub struct Mtp {
     pub layers: Vec<Layer>,
     main_proj: Fp8W,
+    main_proj_mine: Option<Fp8W>,
     main_norm: Tensor,
     norm: Tensor,
     markov_embed: Tensor,   // [vocab, rank] BF16, every row (looked up by token)
     markov_head: Tensor,    // [v1 - v0, rank] BF16, this rank's vocabulary rows
+    markov_fp4: Option<(Tensor, Tensor)>, // optional L2 MXFP4 [v1 - v0, 128] + [v1 - v0, 8]
     conf: Tensor,           // [dim + rank] FP32
 }
 
 impl Mtp {
     pub(super) fn markov_head(&self) -> &Tensor { &self.markov_head }
+    pub(super) fn markov_fp4_enabled(&self) -> bool { self.markov_fp4.is_some() }
     pub fn load(ck: &Checkpoint, c: &Cfg, sp: &Split, fp4: &Tensor, dev: Device) -> Mtp {
-        let layers = (0..c.n_mtp).map(|i| {
+        let mut layers: Vec<Layer> = (0..c.n_mtp).map(|i| {
             let mut l = Model::load_block(ck, c, sp, &format!("mtp.{i}"), c.n_layers + i, c.mtp_experts, c.mtp_active, fp4);
             Model::pack_experts(&mut l, dev);
             l
         }).collect();
+        let mode = super::kern::mtp_dense_fp4_mode();
+        if dev.is_cuda() && mode > 0 {
+            let saved: i64 = layers.iter_mut().map(|l| Model::quantize_mtp_fp4(l, mode)).sum();
+            eprintln!("[ds41] rank{} MTP dense MXFP4 (mode={}): saved {:.1} MB", sp.rank, mode, saved as f64 / 1e6);
+        }
         let last = c.n_mtp - 1;
+        let main_proj = Model::fp8(ck, "mtp.0.main_proj");
+        let main_proj_mine = (dev.is_cuda() && super::kern::mtp_main_proj_fp4_on() && sp.world >= 2).then(|| {
+            let blocks = main_proj.n() / 32;
+            let (world, rank) = (sp.world as i64, sp.rank as i64);
+            let b0 = |r: i64| blocks * r / world;
+            let mut mine = main_proj.rows(b0(rank) * 32, (b0(rank + 1) - b0(rank)) * 32);
+            let saved = mine.quantize_fp4();
+            eprintln!("[ds41] rank{} MTP main_proj slice MXFP4: saved {:.1} MB", sp.rank, saved as f64 / 1e6);
+            mine
+        });
+        let markov_head = ck.rows(&format!("mtp.{last}.markov_head.head.weight"), sp.v0, sp.v1 - sp.v0, Kind::BFloat16);
+        let markov_fp4 = (dev.is_cuda() && super::kern::markov_fp4_on() && markov_head.size()[1] == 256 && markov_head.size()[0] % 16 == 0).then(|| {
+            let (wq, ws) = super::kern::markov_fp4_quant(&markov_head);
+            eprintln!("[ds41] rank{} markov_head MXFP4: {:.1} MB (vs {:.1} MB BF16)", sp.rank, (wq.numel() + ws.numel()) as f64 / 1e6, (markov_head.numel() * 2) as f64 / 1e6);
+            (wq, ws)
+        });
         Mtp {
             layers,
-            main_proj: Model::fp8(ck, "mtp.0.main_proj"),
+            main_proj,
+            main_proj_mine,
             main_norm: ck.get("mtp.0.main_norm.weight", Kind::BFloat16),
             norm: ck.get(&format!("mtp.{last}.norm.weight"), Kind::BFloat16),
             markov_embed: ck.get(&format!("mtp.{last}.markov_head.embed.weight"), Kind::BFloat16),
-            markov_head: ck.rows(&format!("mtp.{last}.markov_head.head.weight"), sp.v0, sp.v1 - sp.v0, Kind::BFloat16),
+            markov_head,
+            markov_fp4,
             conf: ck.get(&format!("mtp.{last}.confidence_head.proj.weight"), Kind::Float).view(-1),
         }
     }
@@ -158,8 +184,13 @@ fn head_rows(x: &Tensor, w: &Tensor) -> Tensor {
     Tensor::cat(&parts, 0)
 }
 impl Model {
-    /// The draft rows' head logits: the FP8 copy when present (act-quantized input, 16 rows per GEMV), else BF16.
+    /// The draft rows' head logits: MXFP4 (DS41_DRAFT_HEAD_FP4=1), else FP8 copy (DS41_DRAFT_HEAD_FP8), else BF16.
     fn draft_head(&self, x: &Tensor) -> Tensor {
+        if let Some(h4) = &self.head4 {
+            let m = x.size()[0];
+            let parts: Vec<Tensor> = (0..m).step_by(32).map(|r| super::kern::mxfp4_gemv_mx(&x.narrow(0, r, 32.min(m - r)), &h4.w, &h4.s, h4.n, h4.k)).collect();
+            return Tensor::cat(&parts, 0);
+        }
         let Some(h8) = &self.head8 else { return head_rows(x, &self.head) };
         let m = x.size()[0];
         let parts: Vec<Tensor> = (0..m).step_by(16).map(|r| super::kern::fp8_gemv_mx(&x.narrow(0, r, 16.min(m - r)), &h8.w, &h8.s)).collect();
@@ -212,13 +243,16 @@ impl Model {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let (world, rank) = (self.sp.world as i64, self.sp.rank as i64);
         let n = hidden.size()[0];
-        if !*ON.get_or_init(|| std::env::var("DS41_MTP_SEED_SPLIT").map_or(true, |v| v != "0")) || world < 2 || n > 16 || crate::tp::graph::capturing() {
+        if !*ON.get_or_init(|| std::env::var("DS41_MTP_SEED_SPLIT").map_or(true, |v| v != "0")) || world < 2 || n > super::kern::wide_rows() || crate::tp::graph::capturing() {
             return w.mm(hidden);
         }
         let blocks = w.n() / 32;
         let b0 = |r: i64| blocks * r / world;
         let bmax = (0..world).map(|r| b0(r + 1) - b0(r)).max().unwrap();
-        let mine = w.rows(b0(rank) * 32, (b0(rank + 1) - b0(rank)) * 32).mm(hidden);           // [n, my rows] BF16
+        let mine = match self.mtp.as_ref().and_then(|mt| mt.main_proj_mine.as_ref()) {
+            Some(m) => m.mm(hidden),
+            None => w.rows(b0(rank) * 32, (b0(rank + 1) - b0(rank)) * 32).mm(hidden),
+        };           // [n, my rows] BF16
         let pad = Tensor::zeros([n, bmax * 32], (Kind::BFloat16, self.dev));
         let _ = pad.narrow(1, 0, mine.size()[1]).copy_(&mine);
         let all = super::model::sp_ag_pub(&pad, world * n).view([world, n, bmax * 32]);
@@ -237,6 +271,57 @@ impl Model {
             let a = &layer.attn;
             let kv = super::kern::act_quant(&rot(&rmsn(&a.wkv.mm(&main_x), &a.kv_norm, c.norm_eps), &a.rope, &pos, c.rope_dim, false));
             let _ = seq.mtp_win[i].index_copy_(0, &pos.remainder(c.window), &kv);
+        }
+    }
+
+    /// Batched `mtp_seed` across multiple sequences (DS41_MTP_SEED_BATCH, default on): reads `main_proj` and
+    /// `mtp.{0..2}.attn.wkv` once (and runs one RDMA all-gather) instead of once per sequence. Bit-identical to
+    /// calling `mtp_seed` per sequence whenever total rows <= `wide_rows()` (up to 32 under DS41_BATCH_INVARIANT).
+    pub fn mtp_seed_batch(&self, seqs: &mut [&mut Seq], hids: &[Tensor], pos0s: &[i64]) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("DS41_MTP_SEED_BATCH").map_or(true, |v| v != "0"));
+        let Some(mt) = &self.mtp else { return };
+        if !on || seqs.len() <= 1 {
+            for ((s, h), &p0) in seqs.iter_mut().zip(hids).zip(pos0s) {
+                self.mtp_seed(s, h, p0);
+            }
+            return;
+        }
+        let c = &self.c;
+        let mut keeps = Vec::with_capacity(seqs.len());
+        let mut slices = Vec::with_capacity(seqs.len());
+        let mut posv = Vec::new();
+        for (h, &p0) in hids.iter().zip(pos0s) {
+            let n = h.size()[0];
+            let keep = n.min(c.window);
+            let p_start = p0 + n - keep;
+            keeps.push(keep);
+            slices.push(h.narrow(0, n - keep, keep));
+            posv.extend(p_start..p_start + keep);
+        }
+        let tot: i64 = keeps.iter().sum();
+        if tot == 0 { return; }
+        let _wide = super::kern::WideScope::new();
+        if tot > super::kern::wide_rows() {
+            for ((s, h), &p0) in seqs.iter_mut().zip(hids).zip(pos0s) {
+                self.mtp_seed(s, h, p0);
+            }
+            return;
+        }
+        let hid_cat = Tensor::cat(&slices, 0);
+        let pos = super::kern::upload_i64(&posv, self.dev);
+        let main_x = rmsn(&self.mtp_main_proj(&mt.main_proj, &hid_cat), &mt.main_norm, c.norm_eps);
+        let slot_all = pos.remainder(c.window);
+        for (i, layer) in mt.layers.iter().enumerate() {
+            let a = &layer.attn;
+            let kv = super::kern::act_quant(&rot(&rmsn(&a.wkv.mm(&main_x), &a.kv_norm, c.norm_eps), &a.rope, &pos, c.rope_dim, false));
+            let mut off = 0i64;
+            for (s, &keep) in seqs.iter_mut().zip(&keeps) {
+                if keep > 0 {
+                    let _ = s.mtp_win[i].index_copy_(0, &slot_all.narrow(0, off, keep), &kv.narrow(0, off, keep));
+                    off += keep;
+                }
+            }
         }
     }
 
@@ -521,19 +606,22 @@ impl Model {
         mk.g.replay();
         match &mk.qloc { Some(ql) => self.keep_draft_q(ql, temps), None => *self.draft_q.borrow_mut() = None }
         let stride = mk.out.size()[2] as usize;
-        let host: Vec<f32> = Vec::<f32>::try_from(mk.out.to_device(Device::Cpu).view(-1)).unwrap();   // [blk, B, 2 or 6]
+        let host: Vec<f32> = Vec::<f32>::try_from(mk.out.to_device(Device::Cpu).view(-1)).unwrap();   // [blk, B, 2, 6, or 8]
         let mut drafts = vec![Vec::with_capacity(blk); bsz];
         let mut confs = vec![Vec::with_capacity(blk); bsz];
-        if stride == 6 {
+        if stride == 6 || stride == 8 {
             let mut branches: Vec<Option<super::tree::DraftBranch>> = (0..bsz).map(|_| Some(super::tree::DraftBranch {
                 alt_toks: Vec::with_capacity(blk),
                 alt_margins: Vec::with_capacity(blk),
                 alt0_chain: Vec::with_capacity(blk.saturating_sub(1)),
                 alt0_confs: Vec::with_capacity(blk.saturating_sub(1)),
+                alt1_chain: Vec::with_capacity(blk.saturating_sub(2)),
+                alt1_confs: Vec::with_capacity(blk.saturating_sub(2)),
+                lookup_branch: None,
             })).collect();
             for j in 0..blk {
                 for b in 0..bsz {
-                    let base = (j * bsz + b) * 6;
+                    let base = (j * bsz + b) * stride;
                     drafts[b].push(host[base] as i64);
                     confs[b].push(host[base + 1]);
                     let br = branches[b].as_mut().unwrap();
@@ -542,6 +630,10 @@ impl Model {
                     if j > 0 {
                         br.alt0_chain.push(host[base + 4] as i64);
                         br.alt0_confs.push(host[base + 5]);
+                    }
+                    if stride == 8 && j > 1 {
+                        br.alt1_chain.push(host[base + 6] as i64);
+                        br.alt1_confs.push(host[base + 7]);
                     }
                 }
             }
@@ -570,48 +662,83 @@ impl Model {
         let (world, rank) = (self.sp.world as i64, self.sp.rank as i64);
         let conf_x = mt.conf.narrow(0, 0, c.dim);
         let conf_m = mt.conf.narrow(0, c.dim, c.dspark_markov_rank);
-        // DS41_SPEC_TREE (b <= tree_max_batch): capture top-2 at every step and alt0's continuation chain in the same C12 weight pass.
+        // DS41_SPEC_TREE (b <= tree_max_batch): capture top-2 at every step plus alt0 and alt1 continuation chains in the same C12 weight pass.
         if super::tree::spec_tree_on() && qloc.is_none() && super::kern::markov_fused_on() && b <= super::tree::tree_max_batch() as i64 {
+            let alt1_on = super::tree::alt1_chain_on() && 3 * b <= 8;
             let mut prev_m = prev.shallow_clone();
             let mut prev_a = prev.shallow_clone();
+            let mut prev_a1 = prev.shallow_clone();
             let mut outs = Vec::with_capacity(rows.len());
             let mut ok = true;
             for (j, r) in rows.iter().enumerate() {
                 let kj = keys.narrow(0, j as i64 * 64, 64);
                 let xf_j = xf.index_select(0, r).to_kind(Kind::Float).matmul(&conf_x);
+                let neg1 = Tensor::full([b], -1.0, (Kind::Float, self.dev));
+                let zero = Tensor::zeros([b], (Kind::Float, self.dev));
                 if j == 0 {
                     let emb = mt.markov_embed.index_select(0, &prev_m);
                     let packet2 = Tensor::empty([world, b, 4], (Kind::Float, self.dev));
-                    if !super::kern::c12_markov_top2(&emb, &mt.markov_head, logits, rows.len() as i64, 0, b, self.sp.v0, temps, &kj, &packet2, world, rank) {
+                    let ran = match &mt.markov_fp4 {
+                        Some((wq, ws)) => super::kern::markov_fp4_top2(&emb, wq, ws, logits, rows.len() as i64, 0, b, self.sp.v0, temps, &kj, &packet2, world, rank),
+                        None => super::kern::c12_markov_top2(&emb, &mt.markov_head, logits, rows.len() as i64, 0, b, self.sp.v0, temps, &kj, &packet2, world, rank),
+                    };
+                    if !ran {
                         ok = false;
                         break;
                     }
                     if world > 1 { crate::tp::allreduce(&packet2); }
                     let (tok1, tok2, margin) = super::kern::choose_top2(&packet2);
                     let cf = &xf_j + emb.to_kind(Kind::Float).matmul(&conf_m);
-                    outs.push(Tensor::stack(&[
-                        tok1.to_kind(Kind::Float), cf, tok2.to_kind(Kind::Float), margin,
-                        Tensor::full([b], -1.0, (Kind::Float, self.dev)), Tensor::zeros([b], (Kind::Float, self.dev)),
-                    ], 1));
+                    let mut cols = vec![tok1.to_kind(Kind::Float), cf, tok2.to_kind(Kind::Float), margin, neg1.shallow_clone(), zero.shallow_clone()];
+                    if alt1_on { cols.push(neg1); cols.push(zero); }
+                    outs.push(Tensor::stack(&cols, 1));
                     prev_m = tok1;
                     prev_a = tok2.clamp_min(0);
-                } else {
+                } else if j == 1 || !alt1_on {
                     let prev2 = Tensor::cat(&[prev_m.shallow_clone(), prev_a.shallow_clone()], 0);
                     let emb2 = mt.markov_embed.index_select(0, &prev2);
                     let packet2 = Tensor::empty([world, 2 * b, 4], (Kind::Float, self.dev));
-                    assert!(super::kern::c12_markov_top2(&emb2, &mt.markov_head, logits, rows.len() as i64, j as i64, b, self.sp.v0, temps, &kj, &packet2, world, rank), "c12_markov_top2");
+                    let ran = match &mt.markov_fp4 {
+                        Some((wq, ws)) => super::kern::markov_fp4_top2(&emb2, wq, ws, logits, rows.len() as i64, j as i64, b, self.sp.v0, temps, &kj, &packet2, world, rank),
+                        None => super::kern::c12_markov_top2(&emb2, &mt.markov_head, logits, rows.len() as i64, j as i64, b, self.sp.v0, temps, &kj, &packet2, world, rank),
+                    };
+                    assert!(ran, "markov_top2");
                     if world > 1 { crate::tp::allreduce(&packet2); }
                     let (t1, t2, mg) = super::kern::choose_top2(&packet2);
                     let (tok1, tok2, margin) = (t1.narrow(0, 0, b), t2.narrow(0, 0, b), mg.narrow(0, 0, b));
                     let alt_next = t1.narrow(0, b, b);
                     let cf_m = &xf_j + emb2.narrow(0, 0, b).to_kind(Kind::Float).matmul(&conf_m);
                     let cf_a = &xf_j + emb2.narrow(0, b, b).to_kind(Kind::Float).matmul(&conf_m);
-                    outs.push(Tensor::stack(&[
-                        tok1.to_kind(Kind::Float), cf_m, tok2.to_kind(Kind::Float), margin,
-                        alt_next.to_kind(Kind::Float), cf_a,
-                    ], 1));
+                    let mut cols = vec![tok1.to_kind(Kind::Float), cf_m, tok2.to_kind(Kind::Float), margin, alt_next.to_kind(Kind::Float), cf_a];
+                    if alt1_on { cols.push(neg1); cols.push(zero); }
+                    outs.push(Tensor::stack(&cols, 1));
                     prev_m = tok1;
                     prev_a = alt_next.clamp_min(0);
+                    if j == 1 { prev_a1 = tok2.clamp_min(0); }
+                } else {
+                    let prev3 = Tensor::cat(&[prev_m.shallow_clone(), prev_a.shallow_clone(), prev_a1.shallow_clone()], 0);
+                    let emb3 = mt.markov_embed.index_select(0, &prev3);
+                    let packet2 = Tensor::empty([world, 3 * b, 4], (Kind::Float, self.dev));
+                    let ran = match &mt.markov_fp4 {
+                        Some((wq, ws)) => super::kern::markov_fp4_top2(&emb3, wq, ws, logits, rows.len() as i64, j as i64, b, self.sp.v0, temps, &kj, &packet2, world, rank),
+                        None => super::kern::c12_markov_top2(&emb3, &mt.markov_head, logits, rows.len() as i64, j as i64, b, self.sp.v0, temps, &kj, &packet2, world, rank),
+                    };
+                    assert!(ran, "markov_top2 (3b)");
+                    if world > 1 { crate::tp::allreduce(&packet2); }
+                    let (t1, t2, mg) = super::kern::choose_top2(&packet2);
+                    let (tok1, tok2, margin) = (t1.narrow(0, 0, b), t2.narrow(0, 0, b), mg.narrow(0, 0, b));
+                    let alt0_next = t1.narrow(0, b, b);
+                    let alt1_next = t1.narrow(0, 2 * b, b);
+                    let cf_m = &xf_j + emb3.narrow(0, 0, b).to_kind(Kind::Float).matmul(&conf_m);
+                    let cf_a0 = &xf_j + emb3.narrow(0, b, b).to_kind(Kind::Float).matmul(&conf_m);
+                    let cf_a1 = &xf_j + emb3.narrow(0, 2 * b, b).to_kind(Kind::Float).matmul(&conf_m);
+                    outs.push(Tensor::stack(&[
+                        tok1.to_kind(Kind::Float), cf_m, tok2.to_kind(Kind::Float), margin,
+                        alt0_next.to_kind(Kind::Float), cf_a0, alt1_next.to_kind(Kind::Float), cf_a1,
+                    ], 1));
+                    prev_m = tok1;
+                    prev_a = alt0_next.clamp_min(0);
+                    prev_a1 = alt1_next.clamp_min(0);
                 }
             }
             if ok {
@@ -624,7 +751,11 @@ impl Model {
             let emb = mt.markov_embed.index_select(0, &prev);                                         // [B, rank]
             let packet = Tensor::empty([world, b, 2], (Kind::Float, self.dev));
             let kj = keys.narrow(0, j as i64 * 64, 64);
-            if !(qloc.is_none() && super::kern::c12_markov_argmax(&emb, &mt.markov_head, logits, rows.len() as i64, j as i64, self.sp.v0, temps, &kj, &packet, world, rank)) {
+            let fused_ok = qloc.is_none() && match &mt.markov_fp4 {
+                Some((wq, ws)) => super::kern::markov_fp4_argmax(&emb, wq, ws, logits, rows.len() as i64, j as i64, self.sp.v0, temps, &kj, &packet, world, rank),
+                None => super::kern::c12_markov_argmax(&emb, &mt.markov_head, logits, rows.len() as i64, j as i64, self.sp.v0, temps, &kj, &packet, world, rank),
+            };
+            if !fused_ok {
                 let bias = super::kern::bf16_gemv(&emb, &mt.markov_head);                             // [B, v1 - v0]
                 let lg = (logits.index_select(0, r) + bias).to_kind(Kind::Float).contiguous();
                 let width = lg.size()[1];

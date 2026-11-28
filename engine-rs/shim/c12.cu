@@ -472,7 +472,7 @@ __global__ void __launch_bounds__(256) c12_markov_top2_part(
   float bv1[M],bv2[M];int bi1[M],bi2[M];int rseq[M];
 #pragma unroll
   for(int r=0;r<M;++r){
-    const int rb=r<m?(r<b_mod?r:r-b_mod):0;
+    const int rb=r<m?(r%b_mod):0;
     rseq[r]=rb;
     tm[r]=r<m?temps[rb]:0.f;
     ky[r]=r<m?keys[rb]:0ULL;
@@ -613,5 +613,314 @@ extern "C" int glm53_c12_markov_top2_cuda(
 extern "C" int glm53_choose_top2_cuda(const float* packet2,int world,int rows,long long* tok1,long long* tok2,float* margin,cudaStream_t st){
   if(rows<1||rows>64||world<1)return int(cudaErrorInvalidValue);
   choose_top2_kernel<<<1,64,0,st>>>(packet2,world,rows,tok1,tok2,margin);
+  return int(cudaGetLastError());
+}
+
+// ---------- L2 MXFP4 Markov head (K = 256): 5.9 MB vs 16.6 MB C12 / 22.1 MB BF16 ----------
+__device__ __forceinline__ uint32_t mfp4_e2m1_enc(float v){
+  const uint32_t s=(v<0.f)?8u:0u;
+  const float a=fabsf(v);
+  uint32_t c;
+  if(a<=0.25f)c=0u;
+  else if(a<0.75f)c=1u;
+  else if(a<=1.25f)c=2u;
+  else if(a<1.75f)c=3u;
+  else if(a<=2.5f)c=4u;
+  else if(a<3.5f)c=5u;
+  else if(a<=5.0f)c=6u;
+  else c=7u;
+  return s|c;
+}
+__device__ __forceinline__ float mfp4_e2m1_dec(uint32_t n){
+  const uint32_t m=n&7u;
+  const float a=(m<=4u)?((float)m*0.5f):((m==7u)?6.f:(float)(m-2u));
+  return __uint_as_float(__float_as_uint(a)|((n&8u)<<28));
+}
+__global__ void __launch_bounds__(256) markov_fp4_quant_kernel(
+    const __nv_bfloat16* __restrict__ w,uint8_t* __restrict__ wq,uint8_t* __restrict__ ws,int n){
+  constexpr int WARPS=8;
+  const int tid=threadIdx.x,lane=tid&31,warp=tid>>5;
+  const int row=blockIdx.x*WARPS+warp;
+  if(row>=n)return;
+  const uint4 ld=*reinterpret_cast<const uint4*>(w+(size_t)row*256+lane*8);
+  const __nv_bfloat162* xb=reinterpret_cast<const __nv_bfloat162*>(&ld);
+  float v[8];float mx=0.f;
+#pragma unroll
+  for(int j=0;j<4;++j){
+    const float2 f=__bfloat1622float2(xb[j]);
+    v[2*j]=f.x;v[2*j+1]=f.y;
+    mx=fmaxf(mx,fmaxf(fabsf(f.x),fabsf(f.y)));
+  }
+  mx=fmaxf(mx,__shfl_xor_sync(0xffffffffu,mx,1));
+  mx=fmaxf(mx,__shfl_xor_sync(0xffffffffu,mx,2));
+  uint8_t se=0;float inv=0.f;
+  if(mx>0.f){
+    const float ratio=mx*(1.f/6.f);
+    const uint32_t u=__float_as_uint(ratio);
+    int e=(int)((u>>23)&0xffu);
+    if(u&0x7fffffu)e+=1;
+    if(e<1)e=1;
+    if(e>254)e=254;
+    se=(uint8_t)e;
+    inv=__uint_as_float((uint32_t)(254-e)<<23);
+  }
+  uint32_t pk=0u;
+#pragma unroll
+  for(int j=0;j<8;++j){
+    pk|=mfp4_e2m1_enc(v[j]*inv)<<(j*4);
+  }
+  *reinterpret_cast<uint32_t*>(wq+(size_t)row*128+lane*4)=pk;
+  if((lane&3)==0)ws[(size_t)row*8+(lane>>2)]=se;
+}
+template<int M>
+__global__ void __launch_bounds__(256) markov_fp4_argmax_part(
+    const __nv_bfloat16* __restrict__ x,const uint8_t* __restrict__ wq,const uint8_t* __restrict__ ws,
+    int n,const float* __restrict__ logits,int blk,int step_j,long long col_offset,
+    const float* __restrict__ temps,const unsigned long long* __restrict__ keys,
+    int m,float* __restrict__ part_v,int* __restrict__ part_i){
+  pdl_trigger();
+  constexpr int WARPS=8;
+  const int tid=threadIdx.x,lane=tid&31,warp=tid>>5,c=lane*8,sg=lane>>2;
+  const int stride=gridDim.x*WARPS;
+  const int row0=blockIdx.x*WARPS+warp;
+  uint32_t q_cur=0u;uint8_t s_cur=0u;
+  if(row0<n){
+    q_cur=__ldg(reinterpret_cast<const uint32_t*>(wq+(size_t)row0*128+lane*4));
+    s_cur=__ldg(ws+(size_t)row0*8+sg);
+  }
+  pdl_wait();
+  __shared__ __nv_bfloat16 sx[M][256];
+  for(int i=tid;i<m*32;i+=256){
+    const int r=i>>5,col=(i&31)*8;
+    *reinterpret_cast<uint4*>(&sx[r][col])=*reinterpret_cast<const uint4*>(x+(long long)r*256+col);
+  }
+  __syncthreads();
+  float tm[M];unsigned long long ky[M];
+  float bv[M];int bi[M];
+#pragma unroll
+  for(int r=0;r<M;++r){
+    tm[r]=r<m?temps[r]:0.f;
+    ky[r]=r<m?keys[r]:0ULL;
+    bv[r]=-INFINITY;bi[r]=0x7fffffff;
+  }
+  float xf[M<=4?M:1][8];
+  if constexpr(M<=4){
+#pragma unroll
+    for(int r=0;r<M;++r){
+      if(r<m){
+        const uint4 xp=*reinterpret_cast<const uint4*>(&sx[r][c]);
+        const __nv_bfloat162* xb=reinterpret_cast<const __nv_bfloat162*>(&xp);
+#pragma unroll
+        for(int j=0;j<4;++j){const float2 f=__bfloat1622float2(xb[j]);xf[r][2*j]=f.x;xf[r][2*j+1]=f.y;}
+      }
+    }
+  }
+  for(int row=row0;row<n;row+=stride){
+    const int next_row=row+stride;
+    uint32_t q_nxt=0u;uint8_t s_nxt=0u;
+    if(next_row<n){
+      q_nxt=__ldg(reinterpret_cast<const uint32_t*>(wq+(size_t)next_row*128+lane*4));
+      s_nxt=__ldg(ws+(size_t)next_row*8+sg);
+    }
+    const float sc=s_cur?__uint_as_float((uint32_t)s_cur<<23):0.f;
+    float wv[8];
+#pragma unroll
+    for(int j=0;j<8;++j)wv[j]=mfp4_e2m1_dec((q_cur>>(j*4))&0xfu);
+#pragma unroll
+    for(int r=0;r<M;++r){
+      if(r<m){
+        float acc=0.f;
+        if constexpr(M<=4){
+#pragma unroll
+          for(int j=0;j<4;++j){acc=__fmaf_rn(xf[r][2*j],wv[2*j],acc);acc=__fmaf_rn(xf[r][2*j+1],wv[2*j+1],acc);}
+        }else{
+          const uint4 xp=*reinterpret_cast<const uint4*>(&sx[r][c]);
+          const __nv_bfloat162* xb=reinterpret_cast<const __nv_bfloat162*>(&xp);
+#pragma unroll
+          for(int j=0;j<4;++j){const float2 f=__bfloat1622float2(xb[j]);acc=__fmaf_rn(f.x,wv[2*j],acc);acc=__fmaf_rn(f.y,wv[2*j+1],acc);}
+        }
+        acc*=sc;
+        for(int o=16;o;o>>=1)acc+=__shfl_down_sync(0xffffffffu,acc,o);
+        if(lane==0){
+          const float l=logits[((long long)r*blk+step_j)*n+row]+acc;
+          const float tr=tm[r];
+          if(!(tr>0.f)){
+            if(bi[r]==0x7fffffff||gumbel_better(l,row,bv[r],bi[r])){bv[r]=l;bi[r]=row;}
+          }else{
+            const long long gid=(long long)row+col_offset;
+            const float s=l+gumbel_estimate(ky[r],gid,tr);
+            const float eps=isfinite(s)?tr*1e-4f+1e-5f*fabsf(s):0.f;
+            if(bi[r]==0x7fffffff||!isfinite(s)||(bv[r]==bv[r]&&s+eps>=bv[r])){
+              const float v=l+gumbel_exact(ky[r],gid,tr);
+              if(bi[r]==0x7fffffff||gumbel_better(v,row,bv[r],bi[r])){bv[r]=v;bi[r]=row;}
+            }
+          }
+        }
+      }
+    }
+    q_cur=q_nxt;s_cur=s_nxt;
+  }
+  __shared__ float sv[M][WARPS];__shared__ int si[M][WARPS];
+  if(lane==0){
+#pragma unroll
+    for(int r=0;r<M;++r){sv[r][warp]=bv[r];si[r][warp]=bi[r];}
+  }
+  __syncthreads();
+  if(tid<m){
+    const int r=tid;
+    float rv=-INFINITY;int ri=0x7fffffff;
+#pragma unroll
+    for(int w0=0;w0<WARPS;++w0){
+      const int ci=si[r][w0];
+      if(ci!=0x7fffffff&&(ri==0x7fffffff||gumbel_better(sv[r][w0],ci,rv,ri))){rv=sv[r][w0];ri=ci;}
+    }
+    part_v[r*gridDim.x+blockIdx.x]=rv;part_i[r*gridDim.x+blockIdx.x]=ri;
+  }
+}
+template<int M>
+__global__ void __launch_bounds__(256) markov_fp4_top2_part(
+    const __nv_bfloat16* __restrict__ x,const uint8_t* __restrict__ wq,const uint8_t* __restrict__ ws,
+    int n,const float* __restrict__ logits,int blk,int step_j,int b_mod,long long col_offset,
+    const float* __restrict__ temps,const unsigned long long* __restrict__ keys,
+    int m,float* __restrict__ pv1,int* __restrict__ pi1,float* __restrict__ pv2,int* __restrict__ pi2){
+  pdl_trigger();
+  constexpr int WARPS=8;
+  const int tid=threadIdx.x,lane=tid&31,warp=tid>>5,c=lane*8,sg=lane>>2;
+  const int stride=gridDim.x*WARPS;
+  const int row0=blockIdx.x*WARPS+warp;
+  uint32_t q_cur=0u;uint8_t s_cur=0u;
+  if(row0<n){
+    q_cur=__ldg(reinterpret_cast<const uint32_t*>(wq+(size_t)row0*128+lane*4));
+    s_cur=__ldg(ws+(size_t)row0*8+sg);
+  }
+  pdl_wait();
+  __shared__ __nv_bfloat16 sx[M][256];
+  for(int i=tid;i<m*32;i+=256){
+    const int r=i>>5,col=(i&31)*8;
+    *reinterpret_cast<uint4*>(&sx[r][col])=*reinterpret_cast<const uint4*>(x+(long long)r*256+col);
+  }
+  __syncthreads();
+  float tm[M];unsigned long long ky[M];
+  float bv1[M],bv2[M];int bi1[M],bi2[M];int rseq[M];
+#pragma unroll
+  for(int r=0;r<M;++r){
+    const int rb=r<m?(r%b_mod):0;
+    rseq[r]=rb;
+    tm[r]=r<m?temps[rb]:0.f;
+    ky[r]=r<m?keys[rb]:0ULL;
+    bv1[r]=-INFINITY;bi1[r]=0x7fffffff;bv2[r]=-INFINITY;bi2[r]=0x7fffffff;
+  }
+  float xf[M<=4?M:1][8];
+  if constexpr(M<=4){
+#pragma unroll
+    for(int r=0;r<M;++r){
+      if(r<m){
+        const uint4 xp=*reinterpret_cast<const uint4*>(&sx[r][c]);
+        const __nv_bfloat162* xb=reinterpret_cast<const __nv_bfloat162*>(&xp);
+#pragma unroll
+        for(int j=0;j<4;++j){const float2 f=__bfloat1622float2(xb[j]);xf[r][2*j]=f.x;xf[r][2*j+1]=f.y;}
+      }
+    }
+  }
+  for(int row=row0;row<n;row+=stride){
+    const int next_row=row+stride;
+    uint32_t q_nxt=0u;uint8_t s_nxt=0u;
+    if(next_row<n){
+      q_nxt=__ldg(reinterpret_cast<const uint32_t*>(wq+(size_t)next_row*128+lane*4));
+      s_nxt=__ldg(ws+(size_t)next_row*8+sg);
+    }
+    const float sc=s_cur?__uint_as_float((uint32_t)s_cur<<23):0.f;
+    float wv[8];
+#pragma unroll
+    for(int j=0;j<8;++j)wv[j]=mfp4_e2m1_dec((q_cur>>(j*4))&0xfu);
+#pragma unroll
+    for(int r=0;r<M;++r){
+      if(r<m){
+        float acc=0.f;
+        if constexpr(M<=4){
+#pragma unroll
+          for(int j=0;j<4;++j){acc=__fmaf_rn(xf[r][2*j],wv[2*j],acc);acc=__fmaf_rn(xf[r][2*j+1],wv[2*j+1],acc);}
+        }else{
+          const uint4 xp=*reinterpret_cast<const uint4*>(&sx[r][c]);
+          const __nv_bfloat162* xb=reinterpret_cast<const __nv_bfloat162*>(&xp);
+#pragma unroll
+          for(int j=0;j<4;++j){const float2 f=__bfloat1622float2(xb[j]);acc=__fmaf_rn(f.x,wv[2*j],acc);acc=__fmaf_rn(f.y,wv[2*j+1],acc);}
+        }
+        acc*=sc;
+        for(int o=16;o;o>>=1)acc+=__shfl_down_sync(0xffffffffu,acc,o);
+        if(lane==0){
+          const float l=logits[((long long)rseq[r]*blk+step_j)*n+row]+acc;
+          const float tr=tm[r];
+          if(!(tr>0.f)){
+            top2_push(l,row,bv1[r],bi1[r],bv2[r],bi2[r]);
+          }else{
+            const long long gid=(long long)row+col_offset;
+            const float s=l+gumbel_estimate(ky[r],gid,tr);
+            const float eps=isfinite(s)?tr*1e-4f+1e-5f*fabsf(s):0.f;
+            if(bi2[r]==0x7fffffff||!isfinite(s)||(bv2[r]==bv2[r]&&s+eps>=bv2[r])){
+              const float v=l+gumbel_exact(ky[r],gid,tr);
+              top2_push(v,row,bv1[r],bi1[r],bv2[r],bi2[r]);
+            }
+          }
+        }
+      }
+    }
+    q_cur=q_nxt;s_cur=s_nxt;
+  }
+  __shared__ float sv1[M][WARPS],sv2[M][WARPS];__shared__ int si1[M][WARPS],si2[M][WARPS];
+  if(lane==0){
+#pragma unroll
+    for(int r=0;r<M;++r){sv1[r][warp]=bv1[r];si1[r][warp]=bi1[r];sv2[r][warp]=bv2[r];si2[r][warp]=bi2[r];}
+  }
+  __syncthreads();
+  if(tid<m){
+    const int r=tid;
+    float r1=-INFINITY,r2=-INFINITY;int j1=0x7fffffff,j2=0x7fffffff;
+#pragma unroll
+    for(int w0=0;w0<WARPS;++w0){
+      top2_push(sv1[r][w0],si1[r][w0],r1,j1,r2,j2);
+      top2_push(sv2[r][w0],si2[r][w0],r1,j1,r2,j2);
+    }
+    const int idx=r*gridDim.x+blockIdx.x;
+    pv1[idx]=r1;pi1[idx]=j1;pv2[idx]=r2;pi2[idx]=j2;
+  }
+}
+extern "C" int glm53_markov_fp4_quant_cuda(const void* w,void* wq,void* ws,int n,cudaStream_t st){
+  if(n<1||n%16!=0)return int(cudaErrorInvalidValue);
+  markov_fp4_quant_kernel<<<(n+7)/8,256,0,st>>>((const __nv_bfloat16*)w,(uint8_t*)wq,(uint8_t*)ws,n);
+  return int(cudaGetLastError());
+}
+extern "C" int glm53_markov_fp4_argmax_cuda(
+    const void* x,const void* wq,const void* ws,const float* logits,int blk,int step_j,
+    int m,int n,long long start,const float* temps,const unsigned long long* keys,
+    float* part_v,int* part_i,float* packet,int world,int rank,int nb,int pdl,cudaStream_t st){
+  if(m<1||m>8||n<1||n%16!=0||blk<1||step_j<0||step_j>=blk||world<1||rank<0||rank>=world||nb<1)return int(cudaErrorInvalidValue);
+  const __nv_bfloat16* xx=(const __nv_bfloat16*)x;
+  const uint8_t* q=(const uint8_t*)wq;const uint8_t* s=(const uint8_t*)ws;
+  const dim3 g((unsigned)nb),b(256);const bool p=pdl!=0;
+  switch(m){
+    case 1:pdl_launch_if(p,markov_fp4_argmax_part<1>,g,b,0,st,xx,q,s,n,logits,blk,step_j,start,temps,keys,m,part_v,part_i);break;
+    case 2:pdl_launch_if(p,markov_fp4_argmax_part<2>,g,b,0,st,xx,q,s,n,logits,blk,step_j,start,temps,keys,m,part_v,part_i);break;
+    case 3:case 4:pdl_launch_if(p,markov_fp4_argmax_part<4>,g,b,0,st,xx,q,s,n,logits,blk,step_j,start,temps,keys,m,part_v,part_i);break;
+    default:pdl_launch_if(p,markov_fp4_argmax_part<8>,g,b,0,st,xx,q,s,n,logits,blk,step_j,start,temps,keys,m,part_v,part_i);break;
+  }
+  c12_markov_argmax_fin<<<1,256,0,st>>>(part_v,part_i,nb,m,world,rank,start,packet);
+  return int(cudaGetLastError());
+}
+extern "C" int glm53_markov_fp4_top2_cuda(
+    const void* x,const void* wq,const void* ws,const float* logits,int blk,int step_j,int b_mod,
+    int m,int n,long long start,const float* temps,const unsigned long long* keys,
+    float* pv1,int* pi1,float* pv2,int* pi2,float* packet2,int world,int rank,int nb,int pdl,cudaStream_t st){
+  if(m<1||m>8||b_mod<1||b_mod>m||n<1||n%16!=0||blk<1||step_j<0||step_j>=blk||world<1||rank<0||rank>=world||nb<1)return int(cudaErrorInvalidValue);
+  const __nv_bfloat16* xx=(const __nv_bfloat16*)x;
+  const uint8_t* q=(const uint8_t*)wq;const uint8_t* s=(const uint8_t*)ws;
+  const dim3 g((unsigned)nb),b(256);const bool p=pdl!=0;
+  switch(m){
+    case 1:pdl_launch_if(p,markov_fp4_top2_part<1>,g,b,0,st,xx,q,s,n,logits,blk,step_j,b_mod,start,temps,keys,m,pv1,pi1,pv2,pi2);break;
+    case 2:pdl_launch_if(p,markov_fp4_top2_part<2>,g,b,0,st,xx,q,s,n,logits,blk,step_j,b_mod,start,temps,keys,m,pv1,pi1,pv2,pi2);break;
+    case 3:case 4:pdl_launch_if(p,markov_fp4_top2_part<4>,g,b,0,st,xx,q,s,n,logits,blk,step_j,b_mod,start,temps,keys,m,pv1,pi1,pv2,pi2);break;
+    default:pdl_launch_if(p,markov_fp4_top2_part<8>,g,b,0,st,xx,q,s,n,logits,blk,step_j,b_mod,start,temps,keys,m,pv1,pi1,pv2,pi2);break;
+  }
+  c12_markov_top2_fin<<<1,256,0,st>>>(pv1,pi1,pv2,pi2,nb,m,world,rank,start,packet2);
   return int(cudaGetLastError());
 }

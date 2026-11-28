@@ -1099,6 +1099,216 @@ __global__ __launch_bounds__(256) void fp8_gemv_mx(const __nv_bfloat16* __restri
   }
 }
 
+// ---- Dense MXFP4 (E2M1 + per-32 UE8M0) quantizer & block-scaled MMA GEMV (L2 draft head / MTP dense projections):
+// Same tile layout as routed experts (`up_mx`): per (tile = n0/8, sp = 0..K/128), 512 packed weight bytes where
+// lane (g, q) holds uint4 {b0, b1, b2, b3} (each uint32_t = 8 E2M1 nibbles for K [128*sp + 32*b + 8*q .. +7], low
+// nibble even K, high nibble odd K) and 32 scale bytes where row g holds uint32_t {s_b0, s_b1, s_b2, s_b3}.
+__device__ __forceinline__ uint32_t quant_e2m1_nib(float v) {
+  const uint32_t sign = v < 0.f ? 8u : 0u;
+  const float a = fabsf(v);
+  uint32_t mag;
+  if (a <= 0.25f) mag = 0u;
+  else if (a < 0.75f) mag = 1u;
+  else if (a <= 1.25f) mag = 2u;
+  else if (a < 1.75f) mag = 3u;
+  else if (a <= 2.50f) mag = 4u;
+  else if (a < 3.50f) mag = 5u;
+  else if (a <= 5.00f) mag = 6u;
+  else mag = 7u;
+  return sign | mag;
+}
+__device__ __forceinline__ uint32_t mxfp4_scale_byte(float amax) {
+  if (!(amax > 0.f)) return 0u;
+  const float ratio = fmaxf(amax * (1.0f / 6.0f), 1e-30f);
+  const unsigned bits = __float_as_uint(ratio);
+  int e = (int)((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0);
+  if (e < 0) e = 0;
+  if (e > 254) e = 254;
+  return (uint32_t)e;
+}
+// Grid: ((N / 8) * (K / 128)), 128 threads/CTA: g = tid >> 4 (row 0..7), b = (tid >> 2) & 3 (32-block 0..3), q = tid & 3.
+template <bool IS_FP8>
+__global__ __launch_bounds__(128) void quant_mxfp4_dense_kernel(
+    const void* __restrict__ w_src, const uint8_t* __restrict__ s_fp8,
+    uint8_t* __restrict__ w_pack, uint8_t* __restrict__ s_pack, int n, int k) {
+  const int ns = k >> 7;
+  const int tile = blockIdx.x / ns;
+  const int sp = blockIdx.x - tile * ns;
+  const int tid = threadIdx.x;
+  const int g = tid >> 4, b = (tid >> 2) & 3, q = tid & 3;
+  const int r = tile * 8 + g;
+  const int k0 = (sp << 7) + (b << 5) + (q << 3);
+  float f[8], amax = 0.f;
+  if constexpr (IS_FP8) {
+    const int kb = k >> 5;
+    const uint8_t sb = s_fp8[(long long)(r >> 5) * kb + (sp << 2) + b];
+    const float sc = __uint_as_float((uint32_t)sb << 23);
+    const uint2 raw = *reinterpret_cast<const uint2*>(reinterpret_cast<const uint8_t*>(w_src) + (long long)r * k + k0);
+    const uint32_t ww[2] = {raw.x, raw.y};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(ww[i >> 1] >> (16 * (i & 1))), __NV_E4M3);
+      const float2 fv = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+      f[2 * i] = fv.x * sc;
+      f[2 * i + 1] = fv.y * sc;
+      amax = fmaxf(amax, fmaxf(fabsf(f[2 * i]), fabsf(f[2 * i + 1])));
+    }
+  } else {
+    const uint4 raw = *reinterpret_cast<const uint4*>(reinterpret_cast<const __nv_bfloat16*>(w_src) + (long long)r * k + k0);
+    const __nv_bfloat16* hv = reinterpret_cast<const __nv_bfloat16*>(&raw);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      f[i] = __bfloat162float(hv[i]);
+      amax = fmaxf(amax, fabsf(f[i]));
+    }
+  }
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+  const uint32_t e = mxfp4_scale_byte(amax);
+  const float inv_s = (e > 0u) ? (1.0f / __uint_as_float(e << 23)) : 0.f;
+  uint32_t word = 0u;
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    const uint32_t lo = quant_e2m1_nib(f[2 * t] * inv_s);
+    const uint32_t hi = quant_e2m1_nib(f[2 * t + 1] * inv_s);
+    word |= ((hi << 4) | lo) << (8 * t);
+  }
+  const long long blk_idx = (long long)tile * ns + sp;
+  *reinterpret_cast<uint32_t*>(w_pack + blk_idx * 512 + (g * 4 + q) * 16 + b * 4) = word;
+  if (q == 0) s_pack[blk_idx * 32 + g * 4 + b] = (uint8_t)e;
+}
+
+// Dense MXFP4 GEMV on sm_121a mma_mx (m <= 32, n % 8 == 0, k % 128 == 0): half the weight bytes of fp8_gemv_mx,
+// zero B-fragment shuffles, PDL + HcJob support, inline shared-memory act_quant when !aq.
+template <int U, int S, int MT = 1>
+__global__ __launch_bounds__(256) void mxfp4_gemv_mx(const __nv_bfloat16* __restrict__ x, const uint8_t* aq, const uint8_t* as_,
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, void* __restrict__ yv, int m, int n, int k, int ob16, HcJob job) {
+  float* y = reinterpret_cast<float*>(yv);
+  extern __shared__ __align__(16) uint8_t m4_smem[];
+  pdl_trigger();
+  if (hcj::run(job)) return;
+  const int bx = blockIdx.x - (job.kind ? job.ctas : 0);
+  const int lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
+  const int wid = threadIdx.x >> 5, slice = wid % S;
+  const int n0 = (bx * (8 / S) + wid / S) * 8;
+  const int kb = k >> 5, ns = k >> 7;
+  const int s_lo = slice * ns / S, s_hi = (slice + 1) * ns / S;
+  float acc[MT][4];
+#pragma unroll
+  for (int t = 0; t < MT; ++t) { acc[t][0] = 0.f; acc[t][1] = 0.f; acc[t][2] = 0.f; acc[t][3] = 0.f; }
+  const long long tile = (long long)min(n0, n - 8) >> 3;
+  const uint8_t* wr = w + (tile * ns) * 512 + (g * 4 + q) * 16;
+  const uint8_t* wsr = ws + (tile * ns) * 32 + g * 4;
+  auto ldw = [&](uint4* wv, uint32_t* sb, int sp0) {
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      const int sp = sp0 + u;
+      if (sp < s_hi) {
+        wv[u] = __ldg(reinterpret_cast<const uint4*>(wr + (long long)sp * 512));
+        sb[u] = __ldg(reinterpret_cast<const uint32_t*>(wsr + (long long)sp * 32));
+      }
+    }
+  };
+  uint4 wv[U]; uint32_t sb[U];
+  if (n0 < n) ldw(wv, sb, s_lo);
+  pdl_wait();
+  if (!aq) {
+    uint8_t* qs = m4_smem;
+    uint8_t* ss = m4_smem + (long long)m * k;
+    const int nb = m * kb;
+    for (int b0 = (threadIdx.x >> 2); b0 < ((nb + 63) / 64) * 64; b0 += 64) {
+      const bool ok = b0 < nb;
+      const uint4 raw = ok ? *reinterpret_cast<const uint4*>(x + (long long)b0 * 32 + 8 * (threadIdx.x & 3)) : make_uint4(0, 0, 0, 0);
+      const __nv_bfloat16* hv = reinterpret_cast<const __nv_bfloat16*>(&raw);
+      float f[8], a = 0.f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) { f[j] = __bfloat162float(hv[j]); a = fmaxf(a, fabsf(f[j])); }
+      a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
+      a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 2));
+      const uint32_t e = aq_scale(a);
+      uint32_t lo = 0, hi = 0;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) { lo |= (uint32_t)aq_byte(f[j], e) << (8 * j); hi |= (uint32_t)aq_byte(f[j + 4], e) << (8 * j); }
+      if (ok) {
+        *reinterpret_cast<uint2*>(qs + (long long)b0 * 32 + 8 * (threadIdx.x & 3)) = make_uint2(lo, hi);
+        if ((threadIdx.x & 3) == 0) ss[b0] = (uint8_t)e;
+      }
+    }
+    __syncthreads();
+    aq = qs; as_ = ss;
+  }
+  if (n0 < n) {
+    const uint8_t* a0p[MT]; const uint8_t* a1p[MT]; const uint8_t* asp[MT]; bool z0[MT], z1[MT];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+      const int r0 = g + 16 * t, r1 = g + 8 + 16 * t, rs = (lane >> 2) + 8 * (lane & 1) + 16 * t;
+      a0p[t] = aq + (long long)(r0 < m ? r0 : 0) * k + 8 * q;
+      a1p[t] = aq + (long long)(r1 < m ? r1 : 0) * k + 8 * q;
+      z0[t] = r0 >= m; z1[t] = r1 >= m;
+      asp[t] = as_ + (long long)(rs < m ? rs : 0) * kb;
+    }
+    for (int sp0 = s_lo; sp0 < s_hi; sp0 += U) {
+      uint4 nw[U]; uint32_t nsb[U];
+      if (sp0 + U < s_hi) ldw(nw, nsb, sp0 + U);
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        const int sp = sp0 + u;
+        if (sp >= s_hi) break;
+        uint32_t sfa4[MT];
+#pragma unroll
+        for (int t = 0; t < MT; ++t) sfa4[t] = *reinterpret_cast<const uint32_t*>(asp[t] + sp * 4);
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          const uint32_t wb = b == 0 ? wv[u].x : b == 1 ? wv[u].y : b == 2 ? wv[u].z : wv[u].w;
+          uint32_t b0, b1;
+          b_split(wb, b0, b1);
+          const uint32_t sfb = (sb[u] >> (8 * b)) & 0xFFu;
+#pragma unroll
+          for (int t = 0; t < MT; ++t) {
+            const uint2 r0 = z0[t] ? make_uint2(0, 0) : *reinterpret_cast<const uint2*>(a0p[t] + sp * 128 + b * 32);
+            const uint2 r1 = z1[t] ? make_uint2(0, 0) : *reinterpret_cast<const uint2*>(a1p[t] + sp * 128 + b * 32);
+            uint32_t a0, a1, a2, a3;
+            a_split(r0, a0, a2);
+            a_split(r1, a1, a3);
+            mma_mx(acc[t], a0, a1, a2, a3, b0, b1, (sfa4[t] >> (8 * b)) & 0xFFu, sfb);
+          }
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < U; ++u) { wv[u] = nw[u]; sb[u] = nsb[u]; }
+    }
+  }
+  if (S > 1) {
+    __shared__ float4 red[MT][8][32];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) red[t][wid][lane] = make_float4(acc[t][0], acc[t][1], acc[t][2], acc[t][3]);
+    __syncthreads();
+    if (slice) return;
+#pragma unroll
+    for (int t = 0; t < MT; ++t)
+      for (int j = 1; j < S; ++j) {
+        const float4 o = red[t][wid + j][lane];
+        acc[t][0] += o.x; acc[t][1] += o.y; acc[t][2] += o.z; acc[t][3] += o.w;
+      }
+  }
+  if (n0 >= n) return;
+  const int c = n0 + 2 * q;
+  if (c < n) {
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+      const int r0 = g + 16 * t, r1 = g + 8 + 16 * t;
+      if (ob16) {
+        __nv_bfloat16* yb = reinterpret_cast<__nv_bfloat16*>(yv);
+        if (r0 < m) *reinterpret_cast<__nv_bfloat162*>(yb + (long long)r0 * n + c) = __floats2bfloat162_rn(acc[t][0], acc[t][1]);
+        if (r1 < m) *reinterpret_cast<__nv_bfloat162*>(yb + (long long)r1 * n + c) = __floats2bfloat162_rn(acc[t][2], acc[t][3]);
+      } else {
+        if (r0 < m) *reinterpret_cast<float2*>(y + (long long)r0 * n + c) = make_float2(acc[t][0], acc[t][1]);
+        if (r1 < m) *reinterpret_cast<float2*>(y + (long long)r1 * n + c) = make_float2(acc[t][2], acc[t][3]);
+      }
+    }
+  }
+}
+
 
 // ---- BF16 GEMV for a few rows (vocabulary head of verify / draft rows): y [m, n] FP32 = x . W^T, x BF16 [m, k] (m <=
 // 16), W BF16 [n, k]: BF16 MMA m16n8k16 (exact products, FP32 sums). Warp = 8 weight rows; per 32-wide K span every
@@ -1406,8 +1616,44 @@ int ds41_fp8_gemv_mx_init() {
   if (done) return 0;
   for (auto f : {fp8_gemv_mx<4, 1>, fp8_gemv_mx<4, 2>, fp8_gemv_mx<4, 4>, fp8_gemv_mx<4, 8>})
     if (cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, 92 * 1024)) return 4;
+  for (auto f : {mxfp4_gemv_mx<2, 1, 1>, mxfp4_gemv_mx<2, 2, 1>, mxfp4_gemv_mx<2, 4, 1>, mxfp4_gemv_mx<2, 8, 1>})
+    if (cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, 92 * 1024)) return 4;
   done = 1;
   return 0;
+}
+int ds41_quant_mxfp4_dense_bf16(const void* w_bf16, void* w_pack, void* s_pack, int n, int k, cudaStream_t st) {
+  if (n < 8 || (n & 7) || k < 128 || (k & 127)) return 1;
+  const int blocks = (n >> 3) * (k >> 7);
+  quant_mxfp4_dense_kernel<false><<<(unsigned)blocks, 128, 0, st>>>(w_bf16, nullptr, (uint8_t*)w_pack, (uint8_t*)s_pack, n, k);
+  return (int)cudaGetLastError();
+}
+int ds41_quant_mxfp4_dense_fp8(const void* w_fp8, const void* s_fp8, void* w_pack, void* s_pack, int n, int k, cudaStream_t st) {
+  if (n < 8 || (n & 7) || k < 128 || (k & 127)) return 1;
+  const int blocks = (n >> 3) * (k >> 7);
+  quant_mxfp4_dense_kernel<true><<<(unsigned)blocks, 128, 0, st>>>(w_fp8, (const uint8_t*)s_fp8, (uint8_t*)w_pack, (uint8_t*)s_pack, n, k);
+  return (int)cudaGetLastError();
+}
+int ds41_mxfp4_gemv_mx_job(const void* x, const void* aq, const void* as_, const void* w, const void* ws, void* y, int m, int n, int k, int ob16, const HcJob* jp, cudaStream_t st) {
+  if (m < 1 || m > 32 || (k & 127) || (n & 7)) return 1;
+  HcJob job = *jp;
+  job.ctas = hcj::ctas(job.kind, job.T);
+  if (job.kind && (job.T < 1 || job.T > 32 || (4 * job.D) % (hcj::SLICES * 2 * hcj::PTH))) return 1;
+  if (m > 16 && !aq) return 1;
+  static const int force = std::getenv("DS41_GEMV_SPLIT") ? std::atoi(std::getenv("DS41_GEMV_SPLIT")) : 0;
+  int S = 8;
+  const int ns = k >> 7;
+  if (force > 0) S = force;
+  else while (S > 1 && ns / S < 2) S /= 2;
+  const int sm = aq ? 0 : m * k + m * k / 32;
+  if (sm > 48 * 1024 && ds41_fp8_gemv_mx_init()) return 4;
+#define M4_GEMV(SS, T) pdl_launch((mxfp4_gemv_mx<2, SS, T>), dim3((n / 8 + 8 / SS - 1) / (8 / SS) + job.ctas), dim3(256), (size_t)sm, st, (const __nv_bfloat16*)x, (const uint8_t*)aq, (const uint8_t*)as_, (const uint8_t*)w, (const uint8_t*)ws, y, m, n, k, ob16, job)
+  if (m <= 16) { switch (S) { case 1: M4_GEMV(1, 1); break; case 2: M4_GEMV(2, 1); break; case 4: M4_GEMV(4, 1); break; default: M4_GEMV(8, 1); } }
+  else { switch (S) { case 1: M4_GEMV(1, 2); break; case 2: M4_GEMV(2, 2); break; case 4: M4_GEMV(4, 2); break; default: M4_GEMV(8, 2); } }
+#undef M4_GEMV
+  return (int)cudaGetLastError();
+}
+int ds41_mxfp4_gemv_mx_q(const void* x, const void* aq, const void* as_, const void* w, const void* ws, void* y, int m, int n, int k, int ob16, cudaStream_t st) {
+  HcJob none{}; return ds41_mxfp4_gemv_mx_job(x, aq, as_, w, ws, y, m, n, k, ob16, &none, st);
 }
 int ds41_fp8_gemv_mx_job(const void* x, const void* aq, const void* as_, const void* w, const void* ws, void* y, int m, int n, int k, int ob16, const HcJob* jp, cudaStream_t st);
 int ds41_fp8_gemv_mx_q(const void* x, const void* aq, const void* as_, const void* w, const void* ws, void* y, int m, int n, int k, int ob16, cudaStream_t st) {

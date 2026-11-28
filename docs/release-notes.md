@@ -1,3 +1,45 @@
+spark-engine v0.3.16 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
+
+Changes since v0.3.15: native `sm_121a` MXFP4 DSpark draft head (L2, 100% L0 bit-exact main-model output), 6× lighter
+block-split BF16 All-Gather for Engram (`D8`/`P8`), batched multi-stream `mtp_seed`, recalibrated speculative
+cost/confidence defaults, and a deterministic 64K cross-request lookup ring (with documented multi-tenant and
+cold-benchmark opt-out).
+
+### DeepSeek-V4.1-Flash optimizations (100% L0 bit-exact output)
+
+- **Native `sm_121a` MXFP4 draft head** (`DS41_DRAFT_HEAD_FP4`, default `1`): adds GPU dense MXFP4 quantizer and
+  shuffle-free `mxfp4_gemv_mx` MMA kernel (`shim/ds41_mx.cu`), shrinking DSpark's draft head from 220.9 MB (FP8) to
+  117.3 MB (MXFP4) per rank (**−103.6 MB/rank VRAM**, **1.88× faster**, `1231.1 µs → 655.9 µs` at `m=5`). Main-model
+  verification is untouched (22/22 greedy exact match, 0 draft/confidence graph mismatches).
+- **6× lighter Engram RDMA & async gather (`D8`/`P8`)** (`DS41_ENGRAM_AG`, default `1`): replaces zero-padded full
+  `[t, 25600]` Engram All-Reduce with direct BF16 epilogue + `[t, 8544]` block-split `rs_sp_all_gather` (6× fewer wire
+  bytes), enables background async Engram host gather for tree verification and 17–32-row batches, and drops redundant
+  `FP32 → BF16 → +0.0` conversion in prefill `sp_engram_kv`.
+- **Batched multi-stream `mtp_seed`** (`DS41_MTP_SEED_BATCH`, default `1`): batches accepted hidden states across
+  concurrent sequences into a single `main_proj`, single `3× wkv`, and single RDMA all-gather per round.
+- **Recalibrated speculation cost & confidence defaults**: `DS41_SPEC_COST` updated to `21,0.5,2.2` and greedy
+  `DS41_SPEC_CALIB` to `1.165,0.085;1,0` (fitted with `bench/ds41/spec_calib.py` under `DS41_DRAFT_HEAD_FP4=1`).
+- **Cross-request rolling lookup ring** (`DS41_GLOBAL_LOOKUP`, default `1`): deterministic 64K-token ring updated
+  identically on every TP rank, providing `>= 4`-gram draft fallback and tree branches for repeated Agent/template
+  workloads. **Limitations**: outputs remain 100% L0 bit-exact (no content leakage), but set `DS41_GLOBAL_LOOKUP=0` in
+  multi-tenant environments (timing side-channel) and when running repeated-prompt cold benchmarks.
+- **Bug fix & optional L2 switches**: fixes `r % b_mod` indexing in `c12_markov_top2_part` (`shim/c12.cu`) and adds
+  optional `DS41_MTP_DENSE_FP4` (`ffn`/`safe`/`all`, default `0`) for code/structured-heavy batch workloads.
+
+### Performance vs. v0.3.15 (pure cold prompts, `DS41_GLOBAL_LOOKUP=0`)
+
+Measured on three DGX Sparks (TP3, default GPU clocks, `DS41_BATCH_INVARIANT=1`, greedy, thinking off,
+`DS41_GLOBAL_LOOKUP=0`; `bench/ds41_decode_bench.py --types prose,structured,code --conc 1,2,4`, 256 tokens/stream,
+median of 3):
+
+| Streams | Prose (v0.3.15 → **v0.3.16**) | Structured (v0.3.15 → **v0.3.16**) | Code (v0.3.15 → **v0.3.16**) |
+| --- | --- | --- | --- |
+| 1 stream | 69.7 → **70.9** (+1.7%) | 127.6 → **128.5** (+0.7%) | 112.1 → **111.7** (−0.4%) |
+| 2 streams | 95.8 → **95.4** (−0.4%) | 188.2 → **189.2** (+0.5%) | 149.7 → **161.2** (+7.7%) |
+| 4 streams | 128.3 → **132.3** (+3.1%) | 247.8 → **250.5** (+1.1%) | 184.1 → **194.3** (+5.5%) |
+
+---
+
 spark-engine v0.3.15 for NVIDIA DGX Spark (GB10, aarch64, CUDA 13.0, sm_121).
 
 Changes since v0.3.14: five strictly L0 bit-exact speed optimizations for DeepSeek-V4.1-Flash (all on by default, each

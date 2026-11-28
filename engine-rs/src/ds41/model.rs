@@ -15,10 +15,23 @@ use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
+pub(super) struct Mxfp4W { pub w: Tensor, pub s: Tensor, pub n: i64, pub k: i64 }
+impl Mxfp4W {
+    pub fn from_bf16(w: &Tensor) -> Self {
+        let (n, k) = (w.size()[0], w.size()[1]);
+        let (wp, sp) = super::kern::quant_mxfp4_dense_bf16(w);
+        Mxfp4W { w: wp, s: sp, n, k }
+    }
+    pub fn from_fp8(w: &Tensor, s: &Tensor) -> Self {
+        let (n, k) = (w.size()[0], w.size()[1]);
+        let (wp, sp) = super::kern::quant_mxfp4_dense_fp8(w, s);
+        Mxfp4W { w: wp, s: sp, n, k }
+    }
+}
 /// FP8 E4M3 linear weight as stored: bytes [n, k] (Uint8) and E8M0 scales per 32x32 block. `mm` quantizes the
 /// activation (UE8M0 per 32) and multiplies: up to 8 rows with the decode GEMV (ds41.cu), more rows with the BF16 MMA
 /// GEMM (ds41_fp8_mm); DS41_GEMV=0 forces the v0 exact BF16 dequantization + cuBLAS for every size.
-pub struct Fp8W { pub(super) w: Tensor, pub(super) s: Tensor }
+pub struct Fp8W { pub(super) w: Tensor, pub(super) s: Tensor, pub(super) fp4: Option<Mxfp4W> }
 /// DS41_PARITY=1 (single rank, golden checks): round every expert's output and the shared expert's output to BF16 before
 /// they are summed, like the official MoE (expert-parallel there, so each expert output is complete). With TP the
 /// partial sums are kept in FP32 instead (rounding a partial is not the official operation either).
@@ -334,10 +347,25 @@ pub(super) fn quant_fp8_blocks(w: &Tensor) -> Fp8W {
     let e = ops::log2_ceil(&(amax * (1.0 / 448.0)));
     let q = (&wf / ops::pow2(&e)).clamp(-448.0, 448.0).to_kind(Kind::Float8e4m3fn).view_dtype(Kind::Uint8).view([n, k]).contiguous();
     let s = (e + 127).clamp(0, 254).to_kind(Kind::Uint8).view([n / 32, k / 32]).contiguous();
-    Fp8W { w: q, s }
+    Fp8W { w: q, s, fp4: None }
 }
 impl Fp8W {
-    pub fn n(&self) -> i64 { self.w.size()[0] }
+    pub fn n(&self) -> i64 { self.fp4.as_ref().map_or_else(|| self.w.size()[0], |q| q.n) }
+    /// Convert this weight in place to packed MXFP4 (E2M1 + UE8M0 per 32) for L2 draft layers, dropping FP8 storage.
+    /// Returns bytes saved (`> 0`) if converted.
+    pub(super) fn quantize_fp4(&mut self) -> i64 {
+        if self.fp4.is_some() || self.w.dim() != 2 { return 0; }
+        let (n, k) = (self.w.size()[0], self.w.size()[1]);
+        if n % 8 != 0 || k % 128 != 0 || !self.w.device().is_cuda() { return 0; }
+        let old_bytes = self.w.numel() as i64 + self.s.numel() as i64;
+        let q4 = Mxfp4W::from_fp8(&self.w, &self.s);
+        let new_bytes = q4.w.numel() as i64 + q4.s.numel() as i64;
+        let dev = self.w.device();
+        self.w = Tensor::empty([0], (Kind::Uint8, dev));
+        self.s = Tensor::empty([0], (Kind::Uint8, dev));
+        self.fp4 = Some(q4);
+        old_bytes - new_bytes
+    }
     fn dequant(&self) -> Tensor { dequant_fp8(&self.w.view_dtype(Kind::Float8e4m3fn), &self.s) }
     /// x [.., k] -> BF16 [.., n] (FP32 accumulation, one rounding), like the official FP8 Linear.
     pub fn mm(&self, x: &Tensor) -> Tensor {
@@ -345,6 +373,11 @@ impl Fp8W {
         let k = *shape.last().unwrap();
         let x2 = x.reshape([-1, k]).to_kind(Kind::BFloat16);
         let m = x2.size()[0];
+        if let Some(q4) = &self.fp4 {
+            let y = super::kern::mxfp4_gemv_mx_bf16(&x2, &q4.w, &q4.s, q4.n, q4.k);
+            *shape.last_mut().unwrap() = q4.n;
+            return y.reshape(shape.as_slice());
+        }
         // the MMA paths quantize inside (E4M3 bytes); the others take the BF16 act_quant
         let xq = || super::kern::act_quant(&x2);
         let y = if !gemv_on() { xq().matmul(&self.dequant().tr()) }
@@ -356,7 +389,7 @@ impl Fp8W {
         y.reshape(shape.as_slice())
     }
     /// Rows [r0, r0 + n) (multiples of 32) as a view.
-    pub fn rows(&self, r0: i64, n: i64) -> Fp8W { Fp8W { w: self.w.narrow(0, r0, n), s: self.s.narrow(0, r0 / 32, n / 32) } }
+    pub fn rows(&self, r0: i64, n: i64) -> Fp8W { Fp8W { w: self.w.narrow(0, r0, n), s: self.s.narrow(0, r0 / 32, n / 32), fp4: None } }
     /// x [m, k] BF16 (not quantized: products with the FP8 weight are exact either way) -> FP32 [m, n].
     pub fn mm_raw(&self, x: &Tensor) -> Tensor {
         let x = x.to_kind(Kind::BFloat16).contiguous();
@@ -380,6 +413,9 @@ impl Fp8W {
     /// x [m, k] BF16 -> act_quant(x) . W^T FP32 [m, n] (no output rounding: TP partial sums). The MMA paths quantize
     /// inside; act_quant is idempotent, so an already quantized x gives the same result.
     pub fn mm_f32(&self, x: &Tensor) -> Tensor {
+        if let Some(q4) = &self.fp4 {
+            return super::kern::mxfp4_gemv_mx(x, &q4.w, &q4.s, q4.n, q4.k);
+        }
         let (m, k) = (x.size()[0], x.size()[1]);
         let xq = || super::kern::act_quant(x);
         if gemv_on() && mx_gemv_ok(m, k, self.n()) { super::kern::fp8_gemv_mx(x, &self.w, &self.s) }
@@ -440,6 +476,8 @@ pub struct Model {
     /// The DSpark drafts' copy of this rank's head rows in FP8 (32 x 32 blocks, UE8M0 scales; DS41_DRAFT_HEAD_FP8,
     /// default on): half the bytes per draft call; the verify keeps the BF16 head, so the output is unchanged
     pub(super) head8: Option<Fp8W>,
+    /// Optional L2 MXFP4 copy of this rank's draft head (DS41_DRAFT_HEAD_FP4=1): 149 MB vs 280 MB FP8.
+    pub(super) head4: Option<Mxfp4W>,
     /// The last forward's DSpark target hidden rows (mean over the hc copies of the attention input of the target
     /// layers, concatenated) for its last min(window, T) positions, when the MTP stages are loaded.
     pub last_hidden: std::cell::RefCell<Option<Tensor>>,
@@ -642,7 +680,12 @@ impl Model {
         }
         ck.finish_prefetch();
         if dev.is_cuda() { super::kern::gemv_mx_init(); }
-        let head8 = (mtp.is_some() && std::env::var("DS41_DRAFT_HEAD_FP8").map_or(true, |v| v != "0")).then(|| quant_fp8_blocks(&head));
+        let head4 = (mtp.is_some() && dev.is_cuda() && super::kern::draft_head_fp4_on() && head.size()[0] % 8 == 0 && head.size()[1] % 128 == 0).then(|| {
+            let h4 = Mxfp4W::from_bf16(&head);
+            eprintln!("[ds41] rank{rank} draft_head MXFP4: {:.1} MB (vs {:.1} MB FP8)", (h4.w.numel() + h4.s.numel()) as f64 / 1e6, head.numel() as f64 / 1e6);
+            h4
+        });
+        let head8 = (mtp.is_some() && head4.is_none() && std::env::var("DS41_DRAFT_HEAD_FP8").map_or(true, |v| v != "0")).then(|| quant_fp8_blocks(&head));
         if dev.is_cuda() && super::kern::c12_on() {
             // DS41_C12: C12 codings of the BF16 weights the decode-sized bf16_gemv reads (the sources stay for prefill)
             let mut ws: Vec<&Tensor> = vec![&head];
@@ -651,13 +694,13 @@ impl Model {
                 if let Some(cm) = &l.attn.comp { ws.push(cm.w2.as_ref().unwrap_or(&cm.wkv)); }
                 if let Some(ix) = &l.attn.idx { ws.push(&ix.weights_proj); }
             }
-            if let Some(m) = &mtp { ws.push(m.markov_head()); }
+            if let Some(m) = &mtp { if !m.markov_fp4_enabled() { ws.push(m.markov_head()); } }
             let t1 = std::time::Instant::now();
             let bytes: i64 = ws.iter().map(|w| super::kern::c12_register(w)).sum();
             let (a, _) = crate::tp::graph::memory();
             eprintln!("[ds41] rank{rank} C12 codings: {:.0} MB in {:.1}s (allocated {:.1} GiB)", bytes as f64 / 1e6, t1.elapsed().as_secs_f64(), a as f64 / (1u64 << 30) as f64);
         }
-        (Model { c, sp, ck, tables, dev, embed, head, norm, layers, hash, fp4, graph: std::cell::RefCell::new(HashMap::new()), graph_clock: std::cell::Cell::new(0), mtp, head8,
+        (Model { c, sp, ck, tables, dev, embed, head, norm, layers, hash, fp4, graph: std::cell::RefCell::new(HashMap::new()), graph_clock: std::cell::Cell::new(0), mtp, head8, head4,
                 last_hidden: std::cell::RefCell::new(None), draft_debug: std::cell::RefCell::new(None), draft_q: std::cell::RefCell::new(None),
                 mtp_graphs: std::cell::RefCell::new(HashMap::new()) }, side_out)
     }
@@ -696,17 +739,17 @@ impl Model {
     }
 
     pub(super) fn fp8(ck: &Checkpoint, name: &str) -> Fp8W {
-        Fp8W { w: ck.get(&format!("{name}.weight"), Kind::Uint8), s: ck.get(&format!("{name}.scale"), Kind::Uint8) }
+        Fp8W { w: ck.get(&format!("{name}.weight"), Kind::Uint8), s: ck.get(&format!("{name}.scale"), Kind::Uint8), fp4: None }
     }
     /// FP8 rows [r0, r0+n) (multiples of 32).
     fn fp8_rows(ck: &Checkpoint, name: &str, r0: i64, n: i64) -> Fp8W {
         assert!(r0 % 32 == 0 && n % 32 == 0);
-        Fp8W { w: ck.rows(&format!("{name}.weight"), r0, n, Kind::Uint8), s: ck.rows(&format!("{name}.scale"), r0 / 32, n / 32, Kind::Uint8) }
+        Fp8W { w: ck.rows(&format!("{name}.weight"), r0, n, Kind::Uint8), s: ck.rows(&format!("{name}.scale"), r0 / 32, n / 32, Kind::Uint8), fp4: None }
     }
     /// FP8 columns [c0, c0+n) (multiples of 32).
     fn fp8_cols(ck: &Checkpoint, name: &str, c0: i64, n: i64) -> Fp8W {
         assert!(c0 % 32 == 0 && n % 32 == 0);
-        Fp8W { w: ck.cols(&format!("{name}.weight"), c0, n, Kind::Uint8), s: ck.cols(&format!("{name}.scale"), c0 / 32, n / 32, Kind::Uint8) }
+        Fp8W { w: ck.cols(&format!("{name}.weight"), c0, n, Kind::Uint8), s: ck.cols(&format!("{name}.scale"), c0 / 32, n / 32, Kind::Uint8), fp4: None }
     }
 
     pub(crate) fn load_layer(ck: &Checkpoint, c: &Cfg, sp: &Split, l: usize, fp4: &Tensor) -> Layer {
@@ -758,7 +801,7 @@ impl Model {
              Tensor::cat(&[&wq_a0.s, &wkv0.s, &Tensor::zeros([pad / 32, k / 32], (Kind::Uint8, ck.dev))], 0))
         } else { (Tensor::cat(&[&wq_a0.w, &wkv0.w], 0), Tensor::cat(&[&wq_a0.s, &wkv0.s], 0)) };
         drop((wq_a0, wkv0));
-        let qpad = Fp8W { w: qw, s: qs };
+        let qpad = Fp8W { w: qw, s: qs, fp4: None };
         let qakv_mine = (blk < nq).then(|| {
             let part = crate::tp::Part::of(nq / 32, sp.rank, sp.world, 0);
             assert_eq!(part.start * 32, sp.rank as i64 * blk, "qakv share layout");
@@ -803,7 +846,7 @@ impl Model {
             experts
         };
         let (w1, w3) = (Self::fp8_rows(ck, &format!("{f}.shared_experts.w1"), i0, il), Self::fp8_rows(ck, &format!("{f}.shared_experts.w3"), i0, il));
-        let w13 = Fp8W { w: Tensor::cat(&[&w1.w, &w3.w], 0), s: Tensor::cat(&[&w1.s, &w3.s], 0) };
+        let w13 = Fp8W { w: Tensor::cat(&[&w1.w, &w3.w], 0), s: Tensor::cat(&[&w1.s, &w3.s], 0), fp4: None };
         drop((w1, w3));
         let shared = Mlp {
             w1: w13.rows(0, il),
@@ -838,6 +881,22 @@ impl Model {
         // sit past tau's layer count and stay unregistered (site() filters them anyway).
         if l < c.n_layers { if let Some(cl) = crate::ablate::clamp() { cl.register(&layer.attn_norm, l, 0); cl.register(&layer.ffn_norm, l, 1); } }
         layer
+    }
+
+    pub(super) fn quantize_mtp_fp4(l: &mut Layer, mode: u8) -> i64 {
+        let mut saved = 0i64;
+        if mode >= 3 {
+            if let Some(qm) = &mut l.attn.qakv_mine { saved += qm.quantize_fp4(); }
+        }
+        if mode >= 2 {
+            saved += l.attn.wq_b.quantize_fp4();
+        }
+        if mode >= 1 {
+            saved += l.attn.wo_b.quantize_fp4();
+            saved += l.moe.shared.w13.quantize_fp4();
+            saved += l.moe.shared.w2.quantize_fp4();
+        }
+        saved
     }
 
     pub fn new_seq(&self, cap: i64) -> Seq {
@@ -1368,7 +1427,7 @@ impl Model {
         // one by one on this thread (service ABBA: some runs -15..-25%), so the default stays the background gather.
         static EA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let eng_async = *EA.get_or_init(|| std::env::var("DS41_ENGRAM_ASYNC").map_or(true, |v| v != "0"));
-        if let (Some(hs), true) = (&self.hash, engram_jit_on() && total <= 16 && eng_async) {
+        if let (Some(hs), true) = (&self.hash, engram_jit_on() && total <= 32 && eng_async) {
             for (li, &l) in engram_layers.iter().enumerate() {
                 let all: Vec<i64> = hashes.iter().flat_map(|h| h[li].iter().copied()).collect();
                 let hd = engram::rows_async(&self.tables, l, all, hs.head_dim);
@@ -1745,6 +1804,15 @@ impl Model {
         let flat: Vec<i64> = trees.iter().flat_map(|t| t.ids.iter().copied()).collect();
         let e = self.embed(&super::kern::upload_i64(&flat, dev));
         let engram_layers: Vec<usize> = self.hash.as_ref().map_or(vec![], |h| h.layer_ids.iter().copied().filter(|l| self.layers.iter().any(|x| x.id == *l)).collect());
+        static EA_TREE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let eng_async = *EA_TREE.get_or_init(|| std::env::var("DS41_ENGRAM_ASYNC").map_or(true, |v| v != "0"));
+        if let (Some(hs), true) = (&self.hash, engram_jit_on() && total <= 32 && eng_async) {
+            for (li, &l) in engram_layers.iter().enumerate() {
+                let all: Vec<i64> = hashes.iter().flat_map(|h| h[li].iter().copied()).collect();
+                let hd = engram::rows_async(&self.tables, l, all, hs.head_dim);
+                ENGRAM_PENDING.with(|p| p.borrow_mut().insert(l, hd));
+            }
+        }
         let rows_now = |li: usize, l: usize| -> Tensor {
             let all: Vec<i64> = hashes.iter().flat_map(|h| h[li].iter().copied()).collect();
             self.engram_rows(l, &all, total)
@@ -2617,9 +2685,9 @@ impl Model {
     /// shares gives each element its one rank's BF16 value plus zeros, i.e. that value with -0 turned into +0 (the + 0).
     fn sp_engram_kv(&self, e: &Engram, er: &ERows, r0: i64, nr: i64, l: i64) -> Tensor {
         let kv = match er {
-            ERows::Bf16(r) => bf16(e.full.mm_f32(&r.narrow(0, r0, nr))),
-            ERows::Q(q, s) => { let (q, s) = (q.narrow(0, r0, nr), s.narrow(0, r0, nr)); e.full.mm_bf16_q(&q, &s).unwrap_or_else(|| bf16(e.full.mm_f32(&engram::dequant(&q, &s)))) }
-        } + 0.0;
+            ERows::Bf16(r) => e.full.mm(&r.narrow(0, r0, nr)),
+            ERows::Q(q, s) => { let (q, s) = (q.narrow(0, r0, nr), s.narrow(0, r0, nr)); e.full.mm_bf16_q(&q, &s).unwrap_or_else(|| e.full.mm(&engram::dequant(&q, &s))) }
+        };
         if nr == l { return kv; }
         let out = Tensor::zeros([l, kv.size()[1]], (Kind::BFloat16, self.dev));
         let _ = out.narrow(0, 0, nr).copy_(&kv);
@@ -3064,7 +3132,16 @@ impl Model {
         };
         ERows::Q(q.view([t, w]), s.view([t, w / 32]))
     }
-    pub(super) fn engram(&self, e: &Engram, h: &Tensor, rows: &Tensor) -> Tensor { self.engram_part(e, h, e.wkv.mm_f32(rows)) }
+    pub(super) fn engram(&self, e: &Engram, h: &Tensor, rows: &Tensor) -> Tensor {
+        static AG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let ag_on = *AG.get_or_init(|| std::env::var("DS41_ENGRAM_AG").map_or(true, |v| v != "0"));
+        let part = if ag_on && Self::rdma_arn_on() && self.sp.world > 1 && h.size()[0] <= 60 {
+            e.wkv.mm(rows)
+        } else {
+            e.wkv.mm_f32(rows)
+        };
+        self.engram_part(e, h, part)
+    }
     /// `engram` of the act_quant operands of the rows (ERows::Q) where the projection takes them directly.
     pub(super) fn engram_q(&self, e: &Engram, h: &Tensor, rows: &ERows) -> Tensor {
         match rows {
@@ -3075,25 +3152,62 @@ impl Model {
             }
         }
     }
-    /// The engram after the projection: `part` this rank's wkv output rows (FP32).
+    /// The engram after the projection: `part` this rank's wkv output rows (BF16 or FP32).
     fn engram_part(&self, e: &Engram, h: &Tensor, part: Tensor) -> Tensor {
         let c = &self.c;
         let t = h.size()[0];
-        // this rank's output rows, zero-padded and summed over the ranks (exact), then rounded like the full Linear
-        // decode / verify rows: the BF16-wire sum of the BF16-rounded parts (ar_b16_wire: one nonzero part per element,
-        // summed in rank order like the FP32 path -- the same bits, half the bytes)
-        let wire = (self.sp.world > 1 && t <= 64 && t * (c.hc + 1) * c.dim * 2 <= (1 << 20)).then(|| {
-            let fb = Tensor::zeros([t, (c.hc + 1) * c.dim], (Kind::BFloat16, self.dev));
-            let _ = fb.narrow(1, e.row0, part.size()[1]).copy_(&part);
-            ar_b16_wire(&fb)
-        }).flatten();
-        let kv = match wire { Some(kv) => kv, None => {
-            let full = Tensor::zeros([t, (c.hc + 1) * c.dim], (Kind::Float, self.dev));
-            let _ = full.narrow(1, e.row0, part.size()[1]).copy_(&part);
-            // (prefill: BF16 transport, the same bits here: every element has one nonzero part and is rounded to BF16)
-            if self.sp.world > 1 { ar_prefill(&full); }
-            bf16(full)                                                   // [T, (hc+1) dim]
-        } };
+        let n_full = (c.hc + 1) * c.dim;
+        let world = self.sp.world as i64;
+        let blocks = n_full / 32;
+        let bmax = (blocks + world - 1) / world;
+        let blk = bmax * 32;
+        static AG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let ag_on = *AG.get_or_init(|| std::env::var("DS41_ENGRAM_AG").map_or(true, |v| v != "0"));
+        let kv = if self.sp.world > 1 && ag_on && Self::rdma_arn_on() && t <= 64 && t * blk * 2 <= (1 << 20) {
+            // D8 (L0): all-gather each rank's 32-row block slice in BF16 (6x fewer RDMA bytes than zero-padded full AR;
+            // bitwise identical to summing one nonzero rank per element and rounding to BF16).
+            let pb = if part.kind() == Kind::BFloat16 { part } else { bf16(part) };
+            let y = if pb.size()[1] == blk {
+                pb.contiguous()
+            } else {
+                let pad = Tensor::zeros([t, blk], (Kind::BFloat16, self.dev));
+                let _ = pad.narrow(1, 0, pb.size()[1]).copy_(&pb);
+                pad
+            };
+            let out = Tensor::empty([world, t, blk], (Kind::BFloat16, self.dev));
+            extern "C" { fn rs_sp_all_gather(i: *const std::ffi::c_void, o: *mut std::ffi::c_void, bytes: i64, async_: i32) -> i32; }
+            let rc = prof("allreduce", || unsafe { rs_sp_all_gather(y.data_ptr(), out.data_ptr(), t * blk * 2, 0) });
+            assert_eq!(rc, 0, "rs_sp_all_gather (engram)");
+            let rem = blocks % world;
+            if rem == 0 || rem == world - 1 {
+                if t == 1 {
+                    out.view([1, world * blk]).narrow(1, 0, n_full)
+                } else {
+                    out.permute([1, 0, 2]).contiguous().view([t, world * blk]).narrow(1, 0, n_full)
+                }
+            } else {
+                Tensor::cat(&(0..self.sp.world).map(|r| {
+                    let (a, b) = super::cfg::share(blocks, self.sp.world, r);
+                    out.select(0, r as i64).narrow(1, 0, (b - a) * 32)
+                }).collect::<Vec<_>>(), 1)
+            }
+        } else {
+            // this rank's output rows, zero-padded and summed over the ranks (exact), then rounded like the full Linear
+            // decode / verify rows: the BF16-wire sum of the BF16-rounded parts (ar_b16_wire: one nonzero part per element,
+            // summed in rank order like the FP32 path -- the same bits, half the bytes)
+            let wire = (self.sp.world > 1 && t <= 64 && t * n_full * 2 <= (1 << 20)).then(|| {
+                let fb = Tensor::zeros([t, n_full], (Kind::BFloat16, self.dev));
+                let _ = fb.narrow(1, e.row0, part.size()[1]).copy_(&part);
+                ar_b16_wire(&fb)
+            }).flatten();
+            match wire { Some(kv) => kv, None => {
+                let full = Tensor::zeros([t, n_full], (Kind::Float, self.dev));
+                let _ = full.narrow(1, e.row0, part.size()[1]).copy_(&part);
+                // (prefill: BF16 transport, the same bits here: every element has one nonzero part and is rounded to BF16)
+                if self.sp.world > 1 { ar_prefill(&full); }
+                bf16(full)                                                   // [T, (hc+1) dim]
+            } }
+        };
         if ops_fused() && h.kind() == Kind::BFloat16 { return super::kern::engram_gate(h, &kv, &e.qk, c.norm_eps); }
         let key = kv.narrow(1, 0, c.hc * c.dim).to_kind(Kind::Float).view([t, c.hc, c.dim]);
         let value = kv.narrow(1, c.hc * c.dim, c.dim);

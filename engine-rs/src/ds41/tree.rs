@@ -30,6 +30,12 @@ fn tree_max_nodes() -> usize {
     *N.get_or_init(|| std::env::var("DS41_TREE_MAX_NODES").ok().and_then(|v| v.parse().ok()).unwrap_or(12).clamp(2, 16))
 }
 
+/// DS41_ALT1_CHAIN (default off; 1 on): also capture alt_toks[1]'s Markov continuation chain in the same C12 weight pass.
+pub fn alt1_chain_on() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("DS41_ALT1_CHAIN").is_ok_and(|v| v == "1"))
+}
+
 /// Top-2 draft branch candidates captured for one sequence alongside DSpark's primary chain.
 #[derive(Clone, Debug)]
 pub struct DraftBranch {
@@ -41,6 +47,12 @@ pub struct DraftBranch {
     pub alt0_chain: Vec<i64>,
     /// Confidence logits for `alt0_chain`.
     pub alt0_confs: Vec<f32>,
+    /// Markov continuation tokens `[alt1_2, alt1_3, ...]` following `alt_toks[1]` at steps `2..blk`.
+    pub alt1_chain: Vec<i64>,
+    /// Confidence logits for `alt1_chain`.
+    pub alt1_confs: Vec<f32>,
+    /// Optional parallel branch injected from n-gram prompt/global lookup: `(depth, tokens, conf_logits)`.
+    pub lookup_branch: Option<(usize, Vec<i64>, Vec<f32>)>,
 }
 
 /// Verification tree for one sequence: node 0 is the pending token (`depth = 0`, `parent = -1`).
@@ -195,12 +207,19 @@ pub fn build_trees(
                     let alt_key = pool.len();
                     pool.push(Cand { parent_key, tok: alt, depth: j + 1, prob: p_alt, is_branch: true });
 
-                    // For j == 0, attach alt0's pre-computed Markov continuation chain (zero extra draft cost).
-                    if j == 0 && !br.alt0_chain.is_empty() {
+                    // For j == 0 or j == 1, attach the pre-computed Markov continuation chain (zero extra draft weight reads).
+                    let cont: Option<(&[i64], &[f32], usize)> = if j == 0 && !br.alt0_chain.is_empty() {
+                        Some((&br.alt0_chain, &br.alt0_confs, 2))
+                    } else if j == 1 && !br.alt1_chain.is_empty() {
+                        Some((&br.alt1_chain, &br.alt1_confs, 3))
+                    } else {
+                        None
+                    };
+                    if let Some((ctoks, cconfs, base_d)) = cont {
                         let mut c_acc = p_alt;
                         let mut pkey = alt_key;
-                        for (ci, (&ctok, &cconf)) in br.alt0_chain.iter().zip(&br.alt0_confs).enumerate() {
-                            let d = ci + 2; // depth of alt0 is 1, so alt0_chain[0] is depth 2
+                        for (ci, (&ctok, &cconf)) in ctoks.iter().zip(cconfs).enumerate() {
+                            let d = ci + base_d;
                             if d > room || ctok < 0 {
                                 break;
                             }
@@ -212,6 +231,30 @@ pub fn build_trees(
                             let ck = pool.len();
                             pool.push(Cand { parent_key: pkey, tok: ctok, depth: d, prob: c_acc, is_branch: true });
                             pkey = ck;
+                        }
+                    }
+                }
+                // Optional lookup branch at depth 0 (when lookup disagreed with DSpark's main chain at moderate confidence).
+                if let Some((0, ltoks, lconfs)) = &br.lookup_branch {
+                    if let Some(&first_t) = ltoks.first() {
+                        let dup = pool.iter().any(|c| c.parent_key == 0 && c.tok == first_t);
+                        if !dup {
+                            let mut c_acc = 1.0f64;
+                            let mut pkey = 0usize;
+                            for (ci, (&ctok, &cconf)) in ltoks.iter().zip(lconfs).enumerate() {
+                                let d = ci + 1;
+                                if d > room || ctok < 0 {
+                                    break;
+                                }
+                                let ps = 1.0 / (1.0 + (-(a * cconf as f64 + bb)).exp());
+                                c_acc *= ps;
+                                if c_acc <= 0.01 {
+                                    break;
+                                }
+                                let ck = pool.len();
+                                pool.push(Cand { parent_key: pkey, tok: ctok, depth: d, prob: c_acc, is_branch: true });
+                                pkey = ck;
+                            }
                         }
                     }
                 }
@@ -351,6 +394,9 @@ mod tests {
             alt_margins: vec![5.0, 5.0, 5.0, 5.0, 5.0],
             alt0_chain: vec![95, 96],
             alt0_confs: vec![2.0, 2.0],
+            alt1_chain: vec![],
+            alt1_confs: vec![],
+            lookup_branch: None,
         };
         let trees = build_trees(
             &[10],
@@ -375,6 +421,9 @@ mod tests {
             alt_margins: vec![0.1, 3.0, 3.0],
             alt0_chain: vec![201, 202],
             alt0_confs: vec![3.0, 3.0],
+            alt1_chain: vec![],
+            alt1_confs: vec![],
+            lookup_branch: None,
         };
         let trees = build_trees(
             &[10],
