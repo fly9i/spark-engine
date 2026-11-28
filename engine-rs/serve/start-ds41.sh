@@ -29,14 +29,17 @@ echo "engine loading (about 20 s with the shards on a fast NVMe)..."
 started=$(date +%s)
 until grep -q "\[ds41-serve\] ready" /tmp/spark-ds41-rank0.log 2>/dev/null; do
   if (( $(date +%s) - started > 30 )) && ! pgrep -f "[d]s41-serve .* $socket" > /dev/null; then
-    pkill -f "[d]s41_server.py --socket $socket" || true; echo "rank 0 exited, see /tmp/spark-ds41-rank0.log" >&2; exit 1; fi
-  if (( $(date +%s) - started > 1200 )); then pkill -f "[d]s41_server.py --socket $socket" || true; echo "timeout, see /tmp/spark-ds41-rank*.log" >&2; exit 1; fi
+    echo "rank 0 exited, see /tmp/spark-ds41-rank0.log" >&2
+    bash "$here/stop-ds41.sh" > /dev/null 2>&1 || true; exit 1; fi
+  if (( $(date +%s) - started > 1200 )); then
+    echo "timeout, see /tmp/spark-ds41-rank*.log" >&2
+    bash "$here/stop-ds41.sh" > /dev/null 2>&1 || true; exit 1; fi
   sleep 0.1
 done
 # the engine sizes one shared KV pool from the memory left after its warm-up and reports the longest request it can take
 cap=$(grep -o "\[ds41-serve\] ready on .* (max context [0-9]*)" /tmp/spark-ds41-rank0.log | grep -o "[0-9]*)" | tr -d ')')
 echo "$cap" > "$ready.tmp" && mv "$ready.tmp" "$ready"
 for _ in $(seq 600); do [[ $(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$SPARK_PORT/health") == 200 ]] && break; sleep 0.05; done
-curl -sf "http://127.0.0.1:$SPARK_PORT/health" > /dev/null || { echo "front end not healthy, see /tmp/spark-ds41-front.log" >&2; exit 1; }
+curl -sf "http://127.0.0.1:$SPARK_PORT/health" > /dev/null || { echo "front end not healthy, see /tmp/spark-ds41-front.log" >&2; bash "$here/stop-ds41.sh" > /dev/null 2>&1 || true; exit 1; }
 compact_nodes 3
 echo "DeepSeek-V4.1-Flash ready (TP3, max context $cap): http://$(hostname -I | awk '{print $1}'):$SPARK_PORT/v1"

@@ -40,8 +40,9 @@ pub fn parse_items(v: &serde_json::Value, seg_len: impl Fn(&MmItem) -> Result<us
         if item.frames < 1 || item.height < 1 || item.width < 1 { return Err(format!("mm item has a bad canvas {}x{}x{}", item.frames, item.height, item.width)); }
         let len = seg_len(&item)?;
         let meta = std::fs::metadata(&item.path).map_err(|e| format!("mm canvas {}: {e}", item.path.display()))?;
-        let want = item.frames * item.height * item.width * 3;
-        if meta.len() as i64 != want { return Err(format!("mm canvas {} has {} bytes, expected {want}", item.path.display(), meta.len())); }
+        let want = item.frames.checked_mul(item.height).and_then(|v| v.checked_mul(item.width)).and_then(|v| v.checked_mul(3))
+            .ok_or_else(|| format!("mm canvas {}x{}x{} overflows byte size", item.frames, item.height, item.width))?;
+        if meta.len() != want as u64 { return Err(format!("mm canvas {} has {} bytes, expected {want}", item.path.display(), meta.len())); }
         for s in it["segments"].as_array().ok_or("mm item without segments")? {
             let s = s.as_array().ok_or("bad segment")?;
             let f = |i: usize| s.get(i).and_then(|x| x.as_i64()).ok_or("bad segment");
@@ -82,6 +83,8 @@ pub fn read_frames(it: &MmItem, firsts: &[i64], per: i64, dev: Device) -> Tensor
     let per_b = fb * per as usize;
     let mut buf = vec![0u8; per_b * firsts.len()];
     for (k, &first) in firsts.iter().enumerate() {
+        assert!(first >= 0 && per >= 1 && first.checked_add(per).is_some_and(|end| end <= it.frames),
+            "mm canvas {}: frame range [{first}, +{per}) exceeds {} frames", it.path.display(), it.frames);
         f.seek(SeekFrom::Start(first as u64 * fb as u64)).unwrap();
         f.read_exact(&mut buf[k * per_b..(k + 1) * per_b]).unwrap_or_else(|e| panic!("mm canvas {}: {e}", it.path.display()));
     }

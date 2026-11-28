@@ -519,17 +519,21 @@ extern "C" void rs_empty_cache() {c10::cuda::CUDACachingAllocator::emptyCache();
 // the caching allocator's cumulative counters on device 0: allocation retries (a failed cudaMalloc that freed the cache
 // and tried again) and cudaFree calls
 extern "C" int rs_cuda_alloc_stats(int64_t* retries, int64_t* frees) {
-    const auto st = c10::cuda::CUDACachingAllocator::getDeviceStats(0);
-    *retries = st.num_alloc_retries; *frees = st.num_device_free;
-    return 0;
+    try {
+        const auto st = c10::cuda::CUDACachingAllocator::getDeviceStats(0);
+        *retries = st.num_alloc_retries; *frees = st.num_device_free;
+        return 0;
+    } catch (const std::exception& e) { fprintf(stderr, "[shim] alloc_stats: %s\n", e.what()); return -1; }
 }
 extern "C" int rs_cuda_set_memory_fraction(double fraction, int64_t* total) {
-    size_t free = 0, tot = 0;
-    auto rc = cudaMemGetInfo(&free, &tot);
-    if (rc != cudaSuccess) return int(rc);
-    *total = (int64_t)tot;
-    c10::cuda::CUDACachingAllocator::setMemoryFraction(fraction, 0);
-    return 0;
+    try {
+        size_t free = 0, tot = 0;
+        auto rc = cudaMemGetInfo(&free, &tot);
+        if (rc != cudaSuccess) return int(rc);
+        *total = (int64_t)tot;
+        c10::cuda::CUDACachingAllocator::setMemoryFraction(fraction, 0);
+        return 0;
+    } catch (const std::exception& e) { fprintf(stderr, "[shim] set_memory_fraction: %s\n", e.what()); return -1; }
 }
 static int graph_begin_in(c10::MempoolId_t pool);
 extern "C" int rs_graph_begin() { return graph_begin_in(c10::MempoolId_t{0, 0}); }
@@ -582,18 +586,24 @@ static int graph_begin_in(c10::MempoolId_t pool) {
     }
 }
 
+static bool g_shutdown = false;
 extern "C" int rs_graph_end() {
+    if (!g_graph) return 1;
     try {
         g_graph->capture_end();
         delete g_sg; g_sg = nullptr; // 恢复默认流
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[shim] graph_end 异常: %s\n", e.what());
+        delete g_sg; g_sg = nullptr;
+        delete g_graph; g_graph = nullptr; g_dead_pools = true;
+        if (g_capture_raw) { cudaStreamDestroy(g_capture_raw); g_capture_raw = nullptr; }
         return 1;
     }
 }
 
 extern "C" int rs_graph_replay() {
+    if (!g_graph) return 1;
     try {
         g_graph->replay();
         return 0;
@@ -617,6 +627,7 @@ extern "C" int rs_graph_replay_owned(int64_t id) {
     catch(const std::exception& e){fprintf(stderr,"[shim] owned replay: %s\n",e.what());return 1;}
 }
 extern "C" int rs_graph_drop_owned(int64_t id) {
+    if (g_shutdown) return 0;
     // Graph first (its reset clears the workspace keyed by this stream), then the stream itself.
     const int rc = g_owned_graphs.erase(id)==1?0:1;
     if (rc == 0) g_dead_pools = true;
@@ -645,19 +656,23 @@ extern "C" int rs_graph_destroy() {
 // Bytes still allocated (live tensors) in the memory pool of the graph just captured. With graph pools shared across
 // graphs this must be 0 after every capture: a graph may only leave temporaries in the pool (other graphs reuse them).
 extern "C" int64_t rs_graph_pool_live_bytes() {
-    if (!g_graph) return -1;
-    const auto pool = g_graph->pool();
-    const auto snap = c10::cuda::CUDACachingAllocator::get()->snapshot(pool, false);
-    int64_t live = 0;
-    for (const auto& seg : snap.segments) if (seg.owner_private_pool_id == pool) live += (int64_t)seg.allocated_size;
-    return live;
+    try {
+        if (!g_graph) return -1;
+        const auto pool = g_graph->pool();
+        const auto snap = c10::cuda::CUDACachingAllocator::get()->snapshot(pool, false);
+        int64_t live = 0;
+        for (const auto& seg : snap.segments) if (seg.owner_private_pool_id == pool) live += (int64_t)seg.allocated_size;
+        return live;
+    } catch (const std::exception& e) { fprintf(stderr, "[shim] graph_pool_live_bytes: %s\n", e.what()); return -1; }
 }
 extern "C" int64_t rs_graph_count() { return (int64_t)g_owned_graphs.size() + (g_graph ? 1 : 0); }
 extern "C" int64_t rs_cublas_workspace_bytes() { return (int64_t)at::cuda::getChosenWorkspaceSize(); }
 extern "C" void rs_cuda_memory(int64_t* allocated, int64_t* reserved) {
-    auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(0);
-    *allocated = stats.allocated_bytes[0].current;
-    *reserved = stats.reserved_bytes[0].current;
+    try {
+        auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(0);
+        *allocated = stats.allocated_bytes[0].current;
+        *reserved = stats.reserved_bytes[0].current;
+    } catch (const std::exception& e) { fprintf(stderr, "[shim] cuda_memory: %s\n", e.what()); *allocated = 0; *reserved = 0; }
 }
 
 extern "C" int glm53_rdma_ar_init(int);
@@ -692,6 +707,7 @@ static int store_get(const char* k, void* v, size_t n) {
     catch (const std::exception& e) { fprintf(stderr, "[shim] store get %s: %s\n", k, e.what()); return 1; }
 }
 static bool rdma_arn_on() { const char* on = std::getenv("GLM53_RDMA_AR"); return g_rdma_arn_ready && on && std::strcmp(on, "1") == 0; }
+extern "C" int rs_rdma_arn_on() { return rdma_arn_on() ? 1 : 0; }
 extern "C" int rs_pg_init(int rank, int world, const char* master_addr, int port) {
     try {
         c10d::TCPStoreOptions so;
@@ -765,10 +781,14 @@ extern "C" int rs_pg_init(int rank, int world, const char* master_addr, int port
 // Release before CUDA/libtorch static destructors run at process exit.
 extern "C" int rs_runtime_shutdown() {
     try {
+        g_shutdown = true;
         if (g_graph || !g_owned_graphs.empty() || g_pg || g_pg_small) cudaDeviceSynchronize();
         g_owned_graphs.clear();
+        for (auto& kv : g_owned_streams) cudaStreamDestroy(kv.second);
+        g_owned_streams.clear();
         if (g_graph) { delete g_graph; g_graph = nullptr; g_dead_pools = true; }
         if (g_sg) { delete g_sg; g_sg = nullptr; }
+        if (g_capture_raw) { cudaStreamDestroy(g_capture_raw); g_capture_raw = nullptr; }
         if (g_pg_small) { g_pg_small->shutdown(); g_pg_small.reset(); }
         if (g_pg) { g_pg->shutdown(); g_pg.reset(); }
         return 0;
@@ -786,7 +806,8 @@ extern "C" int rs_runtime_shutdown() {
 // rs_allreduce_bf16t_async leaves it running and returns an event handle for rs_ar_wait.
 static cudaStream_t g_comm = nullptr;
 static bool g_comm_mode = false;
-static cudaEvent_t g_comm_ev[64];
+static constexpr int COMM_EV_N = 512;
+static cudaEvent_t g_comm_ev[COMM_EV_N];
 static int g_comm_next = 0;
 static int comm_init() {
     if (g_comm) return 0;
@@ -801,12 +822,12 @@ static int comm_init() {
     return 0;
 }
 static int comm_fork(cudaStream_t cur) {
-    cudaEvent_t e = g_comm_ev[g_comm_next]; g_comm_next = (g_comm_next + 1) % 64;
+    cudaEvent_t e = g_comm_ev[g_comm_next]; g_comm_next = (g_comm_next + 1) % COMM_EV_N;
     if (cudaEventRecord(e, cur) != cudaSuccess) return 1;
     return cudaStreamWaitEvent(g_comm, e, 0) == cudaSuccess ? 0 : 1;
 }
 static int comm_done() {   // event after the work issued so far on the comm stream: its handle
-    const int h = g_comm_next; g_comm_next = (g_comm_next + 1) % 64;
+    const int h = g_comm_next; g_comm_next = (g_comm_next + 1) % COMM_EV_N;
     return cudaEventRecord(g_comm_ev[h], g_comm) == cudaSuccess ? h : -1;
 }
 extern "C" int rs_comm_mode(int on) {
@@ -819,7 +840,7 @@ extern "C" int rs_comm_mode(int on) {
     return 0;
 }
 extern "C" int rs_ar_wait(int h) {
-    if (h < 0 || h >= 64) return 1;
+    if (h < 0 || h >= COMM_EV_N) return 1;
     return cudaStreamWaitEvent(at::cuda::getCurrentCUDAStream().stream(), g_comm_ev[h], 0) == cudaSuccess ? 0 : 1;
 }
 // in comm mode: run `f(stream)` on the comm stream, joined back (sync) or not (returns the handle)
@@ -926,10 +947,14 @@ extern "C" int rs_allreduce(void* p, int64_t numel, int dtype) {
 extern "C" int glm53_rdma_ar_send_cuda(float*,long long,cudaStream_t);
 extern "C" int glm53_rdma_ar_materialize_cuda(float*,long long,int,cudaStream_t);
 extern "C" int rs_ar_materialize(float* p, int64_t numel, int round_half) {
-    if (g_rdma_arn_ready) return glm53_rdma_arn_materialize_cuda(p, numel, round_half, at::cuda::getCurrentCUDAStream());
+    if (g_rdma_arn_ready) {
+        if (g_comm_mode) return on_comm([&](cudaStream_t s) { return glm53_rdma_arn_materialize_cuda(p, numel, round_half, s); }, true) == 0 ? 0 : 2;
+        return glm53_rdma_arn_materialize_cuda(p, numel, round_half, at::cuda::getCurrentCUDAStream());
+    }
     return glm53_rdma_ar_materialize_cuda(p, numel, round_half, at::cuda::getCurrentCUDAStream());
 }
 extern "C" int rs_allreduce_send(void* p, int64_t numel) {
+    if (g_comm_mode) return 1;
     if (rdma_arn_on()) {
         if ((size_t)numel * 4 > glm53_rdma_arn_max_bytes()) return 1;
         return glm53_rdma_arn_send_cuda(static_cast<float*>(p), numel, at::cuda::getCurrentCUDAStream()) == 0 ? 0 : 2;
@@ -1044,12 +1069,14 @@ extern "C" int rs_kda_warp_sequence(float* h,const float* q,const float* k,const
 }
 extern "C" int glm53_fp8_dense_cuda(const float*,const void*,const float*,float*,float*,int,int,int,int,int,int,cudaStream_t);
 extern "C" int rs_fp8_dense(const float* x,const void* w,const float* scales,float* y,int m,int n,int k,int rounded){
-    const char* option=std::getenv("GLM53_FP8_WMMA");int mode=option?std::atoi(option):0;
-    const char* split_option=std::getenv("GLM53_FP8_SPLITS");int selected=split_option?std::atoi(split_option):0;
-    if(!(selected==0||selected==1||selected==2||selected==4||selected==8||selected==16))return int(cudaErrorInvalidValue);
-    int splits=selected?selected:(mode>=2?8:1);
-    auto scratch=at::empty({m>1&&mode>0&&splits>1?1LL*splits*m*n:0LL},at::TensorOptions().device(at::kCUDA).dtype(at::kFloat));
-    return glm53_fp8_dense_cuda(x,w,scales,y,scratch.data_ptr<float>(),m,n,k,rounded,mode,selected,at::cuda::getCurrentCUDAStream());
+    try {
+        const char* option=std::getenv("GLM53_FP8_WMMA");int mode=option?std::atoi(option):0;
+        const char* split_option=std::getenv("GLM53_FP8_SPLITS");int selected=split_option?std::atoi(split_option):0;
+        if(!(selected==0||selected==1||selected==2||selected==4||selected==8||selected==16))return int(cudaErrorInvalidValue);
+        int splits=selected?selected:(mode>=2?8:1);
+        auto scratch=at::empty({m>1&&mode>0&&splits>1?1LL*splits*m*n:0LL},at::TensorOptions().device(at::kCUDA).dtype(at::kFloat));
+        return glm53_fp8_dense_cuda(x,w,scales,y,scratch.data_ptr<float>(),m,n,k,rounded,mode,selected,at::cuda::getCurrentCUDAStream());
+    } catch (const std::exception& e) { fprintf(stderr, "[shim] fp8_dense: %s\n", e.what()); return -1; }
 }
 extern "C" int glm53_fp8_bf16_cuda(const float*,const void*,const float*,float*,float*,int,int,int,int,cudaStream_t);
 extern "C" int glm53_fp8_bf16_skinny_cuda(const void*,const void*,const float*,float*,int,int,int,cudaStream_t);
@@ -1057,10 +1084,12 @@ extern "C" int rs_fp8_bf16_skinny(const void* x,const void* w,const float* scale
     return glm53_fp8_bf16_skinny_cuda(x,w,scales,y,m,n,k,at::cuda::getCurrentCUDAStream());
 }
 extern "C" int rs_fp8_bf16(const float* x,const void* w,const float* scales,float* y,int m,int n,int k){
-    const char* option=std::getenv("GLM53_DRAFT_FP8_SPLITS");int splits=option?std::atoi(option):8;
-    if(!(splits==1||splits==2||splits==4||splits==8||splits==16))return int(cudaErrorInvalidValue);
-    auto scratch=at::empty({m>1&&splits>1?1LL*splits*m*n:0LL},at::TensorOptions().device(at::kCUDA).dtype(at::kFloat));
-    return glm53_fp8_bf16_cuda(x,w,scales,y,scratch.data_ptr<float>(),m,n,k,splits,at::cuda::getCurrentCUDAStream());
+    try {
+        const char* option=std::getenv("GLM53_DRAFT_FP8_SPLITS");int splits=option?std::atoi(option):8;
+        if(!(splits==1||splits==2||splits==4||splits==8||splits==16))return int(cudaErrorInvalidValue);
+        auto scratch=at::empty({m>1&&splits>1?1LL*splits*m*n:0LL},at::TensorOptions().device(at::kCUDA).dtype(at::kFloat));
+        return glm53_fp8_bf16_cuda(x,w,scales,y,scratch.data_ptr<float>(),m,n,k,splits,at::cuda::getCurrentCUDAStream());
+    } catch (const std::exception& e) { fprintf(stderr, "[shim] fp8_bf16: %s\n", e.what()); return -1; }
 }
 
 extern "C" int glm53_bf16w_rows_cuda(const float*,int,const void*,float*,int,int,int,cudaStream_t);
@@ -1181,25 +1210,41 @@ std::vector<c10::cuda::CUDAStream> g_pool;
 c10::optional<c10::cuda::CUDAStream> g_main;
 }
 extern "C" int rs_stream_fork(int n){
-    if(n<1||n>8)return int(cudaErrorInvalidValue);
-    auto main=c10::cuda::getCurrentCUDAStream();g_main=main;
-    while((int)g_pool.size()<n)g_pool.push_back(c10::cuda::getStreamFromPool(false));
-    cudaEvent_t ev;if(cudaEventCreateWithFlags(&ev,cudaEventDisableTiming)!=cudaSuccess)return -1;
-    cudaEventRecord(ev,main.stream());
-    for(int i=0;i<n;++i)cudaStreamWaitEvent(g_pool[i].stream(),ev,0);
-    cudaEventDestroy(ev);
-    return int(cudaGetLastError());
+    try {
+        if(n<1||n>8)return int(cudaErrorInvalidValue);
+        auto main=c10::cuda::getCurrentCUDAStream();g_main=main;
+        while((int)g_pool.size()<n)g_pool.push_back(c10::cuda::getStreamFromPool(false));
+        cudaEvent_t ev;if(cudaEventCreateWithFlags(&ev,cudaEventDisableTiming)!=cudaSuccess)return -1;
+        cudaEventRecord(ev,main.stream());
+        for(int i=0;i<n;++i)cudaStreamWaitEvent(g_pool[i].stream(),ev,0);
+        cudaEventDestroy(ev);
+        return int(cudaGetLastError());
+    } catch (const std::exception& e) { fprintf(stderr, "[shim] stream_fork: %s\n", e.what()); return -1; }
 }
 extern "C" int rs_stream_set(int i){
-    if(!g_main)return -1;
-    c10::cuda::setCurrentCUDAStream(i<0?*g_main:g_pool.at(i));return 0;
+    try {
+        if(!g_main)return -1;
+        if(i>=0&&i>=(int)g_pool.size())return -1;
+        c10::cuda::setCurrentCUDAStream(i<0?*g_main:g_pool[i]);return 0;
+    } catch (const std::exception& e) { fprintf(stderr, "[shim] stream_set: %s\n", e.what()); return -1; }
 }
 extern "C" int rs_stream_join(int n){
-    if(!g_main)return -1;
-    for(int i=0;i<n;++i){cudaEvent_t ev;cudaEventCreateWithFlags(&ev,cudaEventDisableTiming);
-        cudaEventRecord(ev,g_pool[i].stream());cudaStreamWaitEvent(g_main->stream(),ev,0);cudaEventDestroy(ev);}
-    c10::cuda::setCurrentCUDAStream(*g_main);g_main.reset();
-    return int(cudaGetLastError());
+    try {
+        if(!g_main||n<0||n>(int)g_pool.size())return -1;
+        for(int i=0;i<n;++i){cudaEvent_t ev;cudaEventCreateWithFlags(&ev,cudaEventDisableTiming);
+            cudaEventRecord(ev,g_pool[i].stream());cudaStreamWaitEvent(g_main->stream(),ev,0);cudaEventDestroy(ev);}
+        c10::cuda::setCurrentCUDAStream(*g_main);g_main.reset();
+        return int(cudaGetLastError());
+    } catch (const std::exception& e) { fprintf(stderr, "[shim] stream_join: %s\n", e.what()); return -1; }
+}
+extern "C" int rs_tensor_record_stream(const void* t){
+    try {
+        if(!t)return 0;
+        const auto* tens=reinterpret_cast<const at::Tensor*>(t);
+        if(tens->defined()&&tens->is_cuda())
+            c10::cuda::CUDACachingAllocator::recordStream(tens->storage().data_ptr(),at::cuda::getCurrentCUDAStream());
+        return 0;
+    } catch (const std::exception& e) { fprintf(stderr, "[shim] record_stream: %s\n", e.what()); return -1; }
 }
 extern "C" int glm53_kda_decay_rows_cuda(const float*,const float*,const float*,float*,long long,int,cudaStream_t);
 extern "C" int rs_kda_decay_rows(const float* g1,const float* a,const float* dt,float* out,long long total,int heads){

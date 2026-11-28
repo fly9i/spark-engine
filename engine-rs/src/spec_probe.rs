@@ -477,7 +477,7 @@ fn calibrate(eng:&mut Engine,drafter:&Drafter,context:&crate::dflash::Context,ba
         let local=draft_ms+samples.iter().sum::<f64>()/samples.len() as f64;
         // Exchange both timings via disjoint lanes. Both ranks take the same
         // max and therefore issue identical topology/collective sequences.
-        let mut times=[0f32;2];times[crate::tp::world().rank]=local as f32;
+        let mut times=vec![0f32;crate::tp::world().world];times[crate::tp::world().rank]=local as f32;
         let times=Tensor::from_slice(&times).to_device(dev);crate::tp::allreduce(&times);
         costs[i]=times.max().double_value(&[]);
     }
@@ -1983,6 +1983,8 @@ fn serve_round_multi(eng:&mut Engine,draft:&Drafter,stores:&mut Vec<Option<Store
     // C2: the drafter appends of all continuing sequences in one forward (after selection).
     let batch_append=std::env::var("GLM53_SERVE_DRAFT_BATCH").as_deref()==Ok("1");
     let mut pending:Vec<(usize,Tensor)>=Vec::new();
+    let mut single_appends:Vec<(usize,Tensor)>=Vec::new();
+    let side_commits:std::cell::RefCell<Vec<(usize,DecodeStates,usize)>>=std::cell::RefCell::new(Vec::new());
     let side_multi=multi_commit_side() && !crate::tp::graph::capturing();
     let mut select_all=|all_states:&[VerifierStates]| {
     for (pi,((k,nodes,depth,_,store),base)) in plan.iter().zip(bases.drain(..)).enumerate() {
@@ -1991,25 +1993,42 @@ fn serve_round_multi(eng:&mut Engine,draft:&Drafter,stores:&mut Vec<Option<Store
         let (first,len)=segs[pi];
         let p=preds.narrow(0,first as i64,len as i64);let f=features.narrow(0,first as i64,len as i64);
         let commit=|parent:Option<usize>|->DecodeStates {if let Some(node)=parent {
-            if side_multi {commit_into_base_now(states,&base,node);} else {commit_into_base(states,&base,node);}}alias_states(&base).unwrap()};
+            if side_multi {side_commits.borrow_mut().push((pi,alias_states(&base).unwrap(),node));} else {commit_into_base(states,&base,node);}}alias_states(&base).unwrap()};
         let verified=select_with(&base,anchor,nodes,depth+1,&SERVE_EOS,&p,states,&f,Some(&commit));
         seq.rounds+=1;seq.accepted+=verified.tokens.len()-1;
         seq.generated.extend(verified.tokens);seq.anchor=verified.next;
         let st=stores[store].as_mut().unwrap();st.state=verified.state;
         let fin=seq.generated.len()>=seq.max_new || seq.generated.last().map_or(false,|t|SERVE_EOS.contains(t));
         let aux=verified.aux.join();
-        if fin {seq.deferred=Some(aux);} else if batch_append {pending.push((store,aux));} else {draft.append(st.context.as_mut().unwrap(),&aux);}
+        if fin {seq.deferred=Some(aux);} else if batch_append {pending.push((store,aux));} else {single_appends.push((store,aux));}
         finished[k]=fin;
     }
     };
     extern "C"{fn rs_stream_fork(n:i32)->i32;fn rs_stream_set(i:i32)->i32;}
-    if side_multi {settle_side_commit();assert_eq!(unsafe{rs_stream_fork(1)},0);assert_eq!(unsafe{rs_stream_set(0)},0);}
     match (owned_states,graph_index) {
-        (Some(s),_)=>{select_all(&s);if side_multi {SIDE_KEEP.with(|k|k.borrow_mut().extend(s));}},
-        (None,Some(i))=>MULTI_GRAPHS.with(|m|select_all(&m.borrow()[i].states)),
+        (Some(s),_)=>{
+            select_all(&s);
+            let mut sc=side_commits.borrow_mut();
+            if side_multi && !sc.is_empty() {
+                settle_side_commit();assert_eq!(unsafe{rs_stream_fork(1)},0);assert_eq!(unsafe{rs_stream_set(0)},0);
+                for (pi,base,node) in sc.drain(..) {commit_into_base_now(&s[pi],&base,node);}
+                assert_eq!(unsafe{rs_stream_set(-1)},0);SIDE_COMMIT.with(|c|c.set(true));
+                SIDE_KEEP.with(|k|k.borrow_mut().extend(s));
+            }
+        }
+        (None,Some(i))=>MULTI_GRAPHS.with(|m|{
+            let mg=m.borrow();let all=&mg[i].states;
+            select_all(all);
+            let mut sc=side_commits.borrow_mut();
+            if side_multi && !sc.is_empty() {
+                settle_side_commit();assert_eq!(unsafe{rs_stream_fork(1)},0);assert_eq!(unsafe{rs_stream_set(0)},0);
+                for (pi,base,node) in sc.drain(..) {commit_into_base_now(&all[pi],&base,node);}
+                assert_eq!(unsafe{rs_stream_set(-1)},0);SIDE_COMMIT.with(|c|c.set(true));
+            }
+        }),
         _=>unreachable!(),
     }
-    if side_multi {assert_eq!(unsafe{rs_stream_set(-1)},0);SIDE_COMMIT.with(|c|c.set(true));}
+    for (store,aux) in single_appends {draft.append(stores[store].as_mut().unwrap().context.as_mut().unwrap(),&aux);}
     tmark("select_commit",&mut tt);
     if !pending.is_empty() {
         // Distinct stores per sequence: take each context out, append together, put back.
@@ -2062,6 +2081,12 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
     tch::set_num_threads(4);let _guard=tch::no_grad_guard();let tp=crate::tp::init_from_env();assert!(tp.world>=2,"serve runs under TP (GLM53_TP_WORLD 2 or 3)");
     crate::host_memory::stage("tp init");
     for flag in ["GLM53_MHC_FUSED","GLM53_KDA_FUSED","GLM53_MLA_LATENT"]{std::env::set_var(flag,"1");}
+    if crate::kv_pool::enabled() {
+        for flag in ["GLM53_STATE_INPLACE","GLM53_CHAIN_SHARED_BASE"] {
+            if std::env::var(flag).is_err() { std::env::set_var(flag,"1"); }
+            assert_eq!(std::env::var(flag).as_deref(), Ok("1"), "GLM53_KV_POOL=1 requires {flag}=1");
+        }
+    }
     std::env::set_var("GLM53_PREFILL_BATCH","1");
     let env_num=|k:&str,d:i64|std::env::var(k).ok().and_then(|v|v.parse::<i64>().ok()).unwrap_or(d);
     let max_seqs=env_num("GLM53_SERVE_MAX_SEQS",4).clamp(1,8) as usize;
@@ -2442,13 +2467,13 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
                 continue;
             }
             if let Some(cid)=v.get("cancel") {
-                queue.retain(|q|{if &q.id==cid{false}else{true}});
+                queue.retain(|q|{if &q.id==cid{write_line(&mut conn,&json!({"id":cid,"done":true,"cancelled":true,"token_ids":[]}));false}else{true}});
                 for slot in 0..max_seqs {if ids_of[slot]==*cid && active[slot].is_some(){active[slot].as_mut().unwrap().cancel=true;}}
                 continue;
             }
             let ids:Vec<i64>=v["prompt_ids"].as_array().map(|a|a.iter().filter_map(|x|x.as_i64()).collect()).unwrap_or_default();
             let max_new=v["max_new"].as_u64().unwrap_or(256) as usize;
-            if ids.is_empty()||max_new==0||(ids.len()+max_new) as i64>budget {
+            if ids.is_empty()||max_new==0||ids.len().checked_add(max_new).map_or(true,|tot|tot as u128>budget as u128) {
                 write_line(&mut conn,&json!({"id":v["id"],"done":true,"error":format!("invalid request: {} prompt tokens + {max_new} new must be within the KV budget {budget}",ids.len())}));continue;}
             // Media items (salted placeholders): every id is a vocabulary id or covered by exactly one segment.
             let mm=match crate::vision::parse_items(&v["mm"]).and_then(|mm|{
@@ -2458,6 +2483,8 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
                 Err(e)=>{write_line(&mut conn,&json!({"id":v["id"],"done":true,"error":format!("invalid request: {e}")}));continue;}};
             let stop_ids=v["stop_token_ids"].as_array().map(|a|a.iter().filter_map(|x|x.as_i64()).collect()).unwrap_or_default();
             let temp=(v["temperature"].as_f64().unwrap_or(0.) as f32).clamp(0.,100.);
+            if temp>0. && std::env::var("GLM53_SERVE_SAMPLING").as_deref()==Ok("0") {
+                write_line(&mut conn,&json!({"id":v["id"],"done":true,"error":"sampling is disabled on this server (GLM53_SERVE_SAMPLING=0)"}));continue;}
             let seed=v["seed"].as_u64().unwrap_or_else(||std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() as u64)&0xffffff;
             queue.push_back(Queued{id:v["id"].clone(),ids,max_new,stop_ids,at:Instant::now(),temp,seed,mm});
             write_line(&mut conn,&json!({"id":v["id"],"queued":true,"position":queue.len()}));
@@ -2582,6 +2609,10 @@ pub fn serve(model:&Path,draft_dir:&Path,socket:&Path) {
                 let h=[OP_GROW as f32,store as f32,t as f32,0.,0.,0.,0.,0.];send(h,&[]);
                 let _=apply(&h,Vec::new(),&mut eng,&mut stores,&mut active,&mut clock,&mut |_,_|false);
             }
+            // Re-check library entry in case OP_GROW evictions above displaced `src` from CKPT_LIB.
+            let (action,src,which,libc)=if action==5 && !CKPT_LIB.with(|l|l.borrow().entries.iter().any(|e|e.id==src as u64)) {
+                (1,-1,0,None)
+            } else {(action,src,which,libc)};
             // Fork checkpoint (GLM53_SERVE_FORK_CKPT = min fork length, 0 off): the longest prefix the prompt shares with a
             // cached sequence it then leaves (a store's history or checkpoint, a library or disk entry). Prefill stops there
             // and saves a checkpoint, so later prompts with the same opening (system prompt, tools) and a different tail

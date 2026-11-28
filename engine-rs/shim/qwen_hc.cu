@@ -153,6 +153,7 @@ __global__ void mid2_kernel(const float* __restrict__ d, int ldd, float* __restr
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= R * NO) return;
     int r = i / NO, o = i % NO;
+    if (o >= RK && !inject) return;
     float v = d[(int64_t) r * ldd + o];
     if (o < RK) { float a = v * 0.25f; t[r * RK + o] = a / (1.0f + __expf(-a)); }
     else if (inject) post[r * H + (o - RK)] = 2.0f / (1.0f + __expf(-v * 0.25f));
@@ -244,6 +245,7 @@ __global__ void mid2h_kernel(const half* __restrict__ d, int ldd, half* __restri
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= R * NO) return;
     int r = i / NO, o = i % NO;
+    if (o >= RK && !inject) return;
     float v = __half2float(d[(int64_t) r * ldd + o]);
     if (o < RK) { float a = v * 0.25f; t[r * RK + o] = __float2half_rn(a / (1.0f + __expf(-a))); }
     else if (inject) post[r * H + (o - RK)] = 2.0f / (1.0f + __expf(-v * 0.25f));

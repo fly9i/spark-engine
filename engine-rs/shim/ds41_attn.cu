@@ -68,9 +68,13 @@ constexpr int MAXTOK = 16, MAXSPLIT = 16;
 // Several sequences in one launch (MODE 3 only; decode / verify of a batch): every token its own pools, row of
 // indices, key count and split count (the ones its sequence would get alone, so the result is the same bits);
 // workspace slots per token MAXSPLIT apart.
-struct Multi { Pools pl[MAXTOK]; const int64_t* idx[MAXTOK]; int K[MAXTOK]; int S[MAXTOK]; };
-__device__ unsigned int g_bar_cnt[MAXTOK];
-__device__ unsigned int g_bar_gen[MAXTOK];
+struct Multi { Pools pl[MAXTOK]; const int64_t* idx[MAXTOK]; int K[MAXTOK]; int S[MAXTOK]; uint8_t anc[MAXTOK][16]; uint8_t is_tree[MAXTOK]; };
+// MTP window attention (DS41_MTP_SINGLE_GRAPH): per-sequence window ring pointer and valid key count (<= W),
+// written to device memory before replaying a single captured MTP body graph.
+constexpr int MTP_MAX_B = 16, MAXBAR = 32;
+struct MtpMidDesc { const __nv_bfloat16* win[MTP_MAX_B]; int nwin[MTP_MAX_B]; };
+__device__ unsigned int g_bar_cnt[MAXBAR];
+__device__ unsigned int g_bar_gen[MAXBAR];
 __device__ __forceinline__ void token_barrier(int t, int S) {
   __threadfence();     // this CTA's partial results visible to the others
   __syncthreads();
@@ -86,7 +90,7 @@ __device__ __forceinline__ void token_barrier(int t, int S) {
 }
 // DEVM (with MULTI; DS41_MID_GRAPH): the rows' pools and index pointers come from a device copy of Multi passed in `idx`
 // (rewritten before every replay of a captured graph), with each row's K and split count (the grid has MAXSPLIT splits)
-template <int MT, int MODE, bool CACHE = false, bool MULTI = false, bool DEVM = false>
+template <int MT, int MODE, bool CACHE = false, bool MULTI = false, bool DEVM = false, bool MTP = false>
 __global__ __launch_bounds__(WARPS * 32, 1) void sparse_attn_kernel(const __nv_bfloat16* __restrict__ q, Pools pl0, const int64_t* __restrict__ idx, const float* __restrict__ sink, __nv_bfloat16* __restrict__ out, int H, int K0, float scale,
     float* __restrict__ pmx, float* __restrict__ pden, float* __restrict__ po, const __grid_constant__ Multi mt) {
   pdl_entry();
@@ -101,13 +105,19 @@ __global__ __launch_bounds__(WARPS * 32, 1) void sparse_attn_kernel(const __nv_b
   const int t = MODE == 3 ? blockIdx.y : blockIdx.x, sp_id = MODE == 3 ? blockIdx.x : blockIdx.y;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, qd = lane & 3;
   const Multi* const md = DEVM ? reinterpret_cast<const Multi*>(idx) : nullptr;
-  const Pools pl = MULTI ? (DEVM ? md->pl[t] : mt.pl[t]) : pl0;
-  const int K = MULTI ? (DEVM ? md->K[t] : mt.K[t]) : K0;
+  const MtpMidDesc* const mtp_d = MTP ? reinterpret_cast<const MtpMidDesc*>(idx) : nullptr;
+  const int mtp_b = MTP ? (t / K0) : 0;
+  const int mtp_nwin = MTP ? mtp_d->nwin[mtp_b] : 0;
+  Pools pl = MULTI ? (DEVM ? md->pl[t] : mt.pl[t]) : pl0;
+  if constexpr (MTP) { pl.a = mtp_d->win[mtp_b]; pl.b = pl0.b + (long long)mtp_b * K0 * D; }
+  const int K = MTP ? (mtp_nwin + K0) : (MULTI ? (DEVM ? md->K[t] : mt.K[t]) : K0);
   const int S = MULTI ? (DEVM ? md->S[t] : mt.S[t]) : MODE == 3 ? gridDim.x : gridDim.y;
   if (MULTI && sp_id >= S) return;                                       // (the grid has the batch's largest split)
   const int SS = MULTI ? MAXSPLIT : S;                                   // workspace slots per token
   const int K2 = K - pl.W;                                               // explicit indices per query
-  const int64_t* ix = MULTI ? (DEVM ? md->idx[t] : mt.idx[t]) : idx + (long long)t * K2;
+  const int64_t* ix = (MULTI || MTP) ? (DEVM ? md->idx[t] : mt.idx[t]) : idx + (long long)t * K2;
+  const bool tree = MULTI && (DEVM ? md->is_tree[t] : mt.is_tree[t]);
+  const uint8_t* const tanc = tree ? (DEVM ? md->anc[t] : mt.anc[t]) : nullptr;
   const long long pt = pl.W ? pl.pos[t] : 0;
   for (int i = threadIdx.x; i < H * D / 8; i += blockDim.x) {
     const int h = i / (D / 8), c = (i % (D / 8)) * 8;
@@ -119,9 +129,11 @@ __global__ __launch_bounds__(WARPS * 32, 1) void sparse_attn_kernel(const __nv_b
     if (threadIdx.x < TILE) {
       const int k = tl * TILE + threadIdx.x;
       int src = -1;
-      if (k < pl.W) {   // window key k of the query: position pt - (W - 1) + k (ring slot, or the chunk row past the ring)
+      if constexpr (MTP) {
+        src = k < mtp_nwin ? k : (k < K ? pl.na + (k - mtp_nwin) : -1);
+      } else if (k < pl.W) {   // window key k of the query: position pt - (W - 1) + k (ring slot, or the chunk row past the ring)
         const long long kp = pt - (pl.W - 1) + k;
-        src = kp < 0 || kp < pl.lo ? -1 : kp >= pl.start ? (int)(kp - pl.start) + pl.W : (int)(kp % pl.W);
+        src = kp < 0 || kp < pl.lo ? -1 : kp >= pl.start ? (tree ? (int)tanc[(int)(kp - pl.start)] : (int)(kp - pl.start)) + pl.W : (int)(kp % pl.W);
       } else if (k < K) src = (int)ix[k - pl.W];
       rows[threadIdx.x] = src;
     }
@@ -158,9 +170,11 @@ __global__ __launch_bounds__(WARPS * 32, 1) void sparse_attn_kernel(const __nv_b
   if (pipe) {
     for (int k = threadIdx.x; k < ntp * TILE; k += blockDim.x) {
       int src = -1;
-      if (k < pl.W) {
+      if constexpr (MTP) {
+        src = k < mtp_nwin ? k : (k < K ? pl.na + (k - mtp_nwin) : -1);
+      } else if (k < pl.W) {
         const long long kp = pt - (pl.W - 1) + k;
-        src = kp < 0 || kp < pl.lo ? -1 : kp >= pl.start ? (int)(kp - pl.start) + pl.W : (int)(kp % pl.W);
+        src = kp < 0 || kp < pl.lo ? -1 : kp >= pl.start ? (tree ? (int)tanc[(int)(kp - pl.start)] : (int)(kp - pl.start)) + pl.W : (int)(kp % pl.W);
       } else if (k < K) src = (int)ix[k - pl.W];
       rows_all[k] = src;
     }
@@ -728,7 +742,7 @@ extern "C" int ds41_sparse_attn(const void* q, const void* a, int na, const void
 // (n rows), compressed pool c (or null), start, lo and indices idx [n, K - W]. Every token gets the split count its
 // sequence would get alone (the same bits); <= 16 rows, each sequence's keys over >= 2 tiles, else 2 (the caller runs
 // the sequences one by one). DS41_ATTN_MULTI=2 always takes the three-launch path (tests).
-struct Ds41AttnSeq { const void* a; const void* b; const void* c; const int64_t* idx; long long start, lo; int na, n, K, pad; };
+struct Ds41AttnSeq { const void* a; const void* b; const void* c; const int64_t* idx; long long start, lo; int na, n, K, pad; const uint8_t* anc; };
 // md_dev: launch the DEVM kernels reading pools / indices from that device Multi (graph capture); host_out: only write
 // this call's Multi into host_out (the bytes to upload to md_dev before a replay) and launch nothing
 static int sparse_attn_multi_impl(const void* q, const Ds41AttnSeq* seqs, int nseq, int W, const int64_t* pos, const float* sink, void* out,
@@ -744,7 +758,11 @@ static int sparse_attn_multi_impl(const void* q, const Ds41AttnSeq* seqs, int ns
     if (d.n < 1 || d.K < 1 || T + d.n > MAXTOK || S < 2) return 2;
     Pools pl{(const __nv_bfloat16*)d.a, (const __nv_bfloat16*)d.b, (const __nv_bfloat16*)d.c, d.na, d.b ? d.n : 0, W, d.start, pos, d.lo};
     if (!d.c && !d.b) pl.na = 0x7fffffff;
-    for (int r = 0; r < d.n; ++r, ++T) { mt.pl[T] = pl; mt.idx[T] = d.idx + (long long)r * (d.K - W); mt.K[T] = d.K; mt.S[T] = S; }
+    for (int r = 0; r < d.n; ++r, ++T) {
+      mt.pl[T] = pl; mt.idx[T] = d.idx + (long long)r * (d.K - W); mt.K[T] = d.K; mt.S[T] = S;
+      mt.is_tree[T] = d.anc != nullptr ? 1 : 0;
+      if (d.anc) std::memcpy(mt.anc[T], d.anc + (size_t)r * 16, 16);
+    }
     ctas += d.n * S;
     smax = S > smax ? S : smax;
   }
@@ -805,6 +823,48 @@ extern "C" int ds41_attn_multi_build(const Ds41AttnSeq* seqs, int nseq, int W, c
   return sparse_attn_multi_impl(nullptr, seqs, nseq, W, pos, nullptr, nullptr, H, 1.f, nullptr, nullptr, nullptr, host_out);
 }
 extern "C" size_t ds41_attn_multi_bytes() { return sizeof(Multi); }
+// MTP window attention in one launch reading per-sequence (win_ptr, nwin) from device MtpMidDesc (DS41_MTP_SINGLE_GRAPH).
+// q / out [bsz * blk, H, 512] BF16, kv [bsz * blk, 512] BF16 (sequence b owns rows [b * blk, +blk)).
+extern "C" size_t ds41_mtp_mid_desc_bytes() { return sizeof(MtpMidDesc); }
+extern "C" int ds41_mtp_mid_desc_fill(const void* const* wins, const int* nwins, int bsz, void* host_out) {
+  if (bsz < 1 || bsz > MTP_MAX_B) return 1;
+  MtpMidDesc d{};
+  for (int i = 0; i < bsz; ++i) { d.win[i] = (const __nv_bfloat16*)wins[i]; d.nwin[i] = nwins[i]; }
+  std::memcpy(host_out, &d, sizeof(d));
+  return 0;
+}
+extern "C" size_t ds41_mtp_window_attn_ws_bytes(int bsz, int blk, int H, int W) {
+  const int T = bsz * blk, tiles = (W + blk + TILE - 1) / TILE, S = tiles < 16 ? tiles : 16;
+  return (T > 0 && T <= MAXBAR && S > 1) ? (size_t)T * S * (64 + (size_t)H * D) * 4 : 0;
+}
+extern "C" int ds41_mtp_window_attn(const void* q, const void* kv, const void* desc_dev, const float* sink, void* out,
+                                    int bsz, int blk, int H, int W, float scale, void* ws, cudaStream_t st) {
+  if (bsz < 1 || bsz > MTP_MAX_B || blk < 1 || H < 1 || H > 32 || (W + blk + TILE - 1) / TILE > MAXT) return 2;
+  const int T = bsz * blk;
+  const int tiles_max = (W + blk + TILE - 1) / TILE;
+  const size_t sm = smem_bytes(H);
+  static int sms = 0; if (!sms) cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+  static const bool fused_on = !(std::getenv("DS41_ATTN_FUSED") && std::getenv("DS41_ATTN_FUSED")[0] == '0');
+  static const bool pipe_on = !(std::getenv("DS41_ATTN_PIPE") && std::getenv("DS41_ATTN_PIPE")[0] == '0');
+  const int max_s = (fused_on && ws && T <= MAXBAR && tiles_max > 1) ? (sms / T) : 1;
+  const int S = max_s > 1 ? (tiles_max < max_s ? tiles_max : max_s) : 1;
+  Pools pl{nullptr, (const __nv_bfloat16*)kv, nullptr, W, blk, 0, 0, nullptr, 0, pipe_on};
+  static const Multi none{};
+  const __nv_bfloat16* Q = (const __nv_bfloat16*)q; __nv_bfloat16* O = (__nv_bfloat16*)out;
+  const int64_t* D_DEV = (const int64_t*)desc_dev;
+  float* pmx = (float*)ws; float* pden = pmx ? pmx + (size_t)T * S * 32 : nullptr; float* po = pden ? pden + (size_t)T * S * 32 : nullptr;
+#define DS41_MTP_ATTN_LAUNCH(MT) do { \
+    static size_t set = 0; \
+    if (sm > set) { \
+      if (cudaFuncSetAttribute(sparse_attn_kernel<MT, 0, true, false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) || \
+          cudaFuncSetAttribute(sparse_attn_kernel<MT, 3, true, false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm)) { cudaGetLastError(); return 2; } \
+      set = sm; } \
+    if (S > 1) pdl_launch((sparse_attn_kernel<MT, 3, true, false, false, true>), dim3(S, T), dim3(WARPS * 32), sm, st, Q, pl, D_DEV, sink, O, H, blk, scale, pmx, pden, po, none); \
+    else pdl_launch((sparse_attn_kernel<MT, 0, true, false, false, true>), dim3(T), dim3(WARPS * 32), sm, st, Q, pl, D_DEV, sink, O, H, blk, scale, nullptr, nullptr, nullptr, none); } while (0)
+  if (H <= 16) DS41_MTP_ATTN_LAUNCH(1); else DS41_MTP_ATTN_LAUNCH(2);
+#undef DS41_MTP_ATTN_LAUNCH
+  return (int)cudaGetLastError();
+}
 extern "C" int ds41_h2d(void* dst, const void* src, size_t n, cudaStream_t st) { return (int)cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, st); }
 // staging-buffer fences (DS41_MID_GRAPH): an event recorded after a call's uploads; the host waits on it before
 // rewriting that buffer (the uploads read pinned memory when they run, not when issued)
@@ -925,10 +985,16 @@ static bool tkw_run(const __nv_bfloat16* score, const int64_t* pos, int ratio, i
   const size_t need_cap = (size_t)T * P;
   if (need_cap > g_tkw_cap || !g_tkw_hist) {
     cudaStreamSynchronize(st);
-    cudaFree(g_tkw_hist); cudaFree(g_tkw_st); cudaFree(g_tkw_cnt);
+    cudaFree(g_tkw_hist); g_tkw_hist = nullptr;
+    cudaFree(g_tkw_st); g_tkw_st = nullptr;
+    cudaFree(g_tkw_cnt); g_tkw_cnt = nullptr;
+    g_tkw_cap = 0;
     const size_t cap = need_cap > 16 * 128 ? need_cap : 16 * 128;   // 16 rows of up to 2M keys
     if (cudaMalloc(&g_tkw_hist, 16 * 256 * sizeof(unsigned)) || cudaMalloc(&g_tkw_st, 16 * sizeof(TkwRow)) || cudaMalloc(&g_tkw_cnt, cap * sizeof(int2))) {
-      g_tkw_hist = nullptr; g_tkw_cap = 0; return false;
+      cudaFree(g_tkw_hist); g_tkw_hist = nullptr;
+      cudaFree(g_tkw_st); g_tkw_st = nullptr;
+      cudaFree(g_tkw_cnt); g_tkw_cnt = nullptr;
+      g_tkw_cap = 0; return false;
     }
     cudaMemset(g_tkw_hist, 0, 16 * 256 * sizeof(unsigned));   // the digit kernel leaves it zeroed after each pass
     g_tkw_cap = cap;

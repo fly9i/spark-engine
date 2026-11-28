@@ -168,6 +168,7 @@ pub fn serve(dir: &Path, socket: &Path) {
     let cap = total - 32;   // longest request (prompt + new tokens)
     let t0 = Instant::now();
     let m = Model::load(dir);
+    assert!(m.mtp.is_some(), "qwen-serve requires the MTP head (do not set QWEN_MTP=0)");
     let pool = m.new_kv_pool(total);
     if super::pcache::requested() { super::pcache::init(dir); }
     eprintln!("[qwen-serve] loaded in {:.1}s; KV pool {} tokens ({} stores of {} at start), {} concurrent, drafts {:?}", t0.elapsed().as_secs_f64(),
@@ -261,7 +262,7 @@ pub fn serve(dir: &Path, socket: &Path) {
             }
             let ids: Vec<i64> = v["prompt_ids"].as_array().map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default();
             let max_new = v["max_new"].as_u64().unwrap_or(256) as usize;
-            if ids.is_empty() || range_for(ids.len() + reserve(max_new)) > total {
+            if ids.is_empty() || max_new == 0 || ids.len().checked_add(reserve(max_new)).map_or(true, |tot| range_for(tot) > total) {
                 write_line(&mut conn, &json!({"id": v["id"], "done": true, "error": format!("invalid request: {} prompt tokens + {} new must fit {} tokens", ids.len(), max_new, cap)}));
                 continue;
             }
@@ -318,7 +319,7 @@ pub fn serve(dir: &Path, socket: &Path) {
                     .min_by_key(|&i| (!captured(i), stores[i].used))
             });
             // no in-memory prefix: the longest cached checkpoint on disk that extends into this prompt (QWEN_PCACHE)
-            let disk = (best.is_none() && super::pcache::enabled()).then(|| super::pcache::lookup(&queue[0].1, 0, ckpt_min())).flatten();
+            let disk = (best.is_none() && super::pcache::enabled()).then(|| super::pcache::lookup(&queue[0].1, 0, ckpt_min(), mode, false)).flatten();
             let via = best.map_or(if disk.is_some() { 3 } else { 0 }, |b| b.2);
             let si = match pick {
                 Some(i) => i,
@@ -372,7 +373,7 @@ pub fn serve(dir: &Path, socket: &Path) {
                 // make sure no pending write is still reading this store's old checkpoint before we overwrite its state
                 super::pcache::fence(si as u64);
                 match disk.and_then(|(idx, _)| super::pcache::restore(idx, &prompt, Device::Cuda(0))) {
-                    Some((ids, t)) => {
+                    Some((ids, t, qsa)) if m.pcache_qsa_restore(st.seq_mut(), ids.len() as i64, &qsa) => {
                         let c = Ckpt::from_parts(ids, t);
                         let h = m.ckpt_restore(st.seq_mut(), &c);
                         hit = c.ids.len();
@@ -381,7 +382,7 @@ pub fn serve(dir: &Path, socket: &Path) {
                         st.pend_h = None;
                         st.ckpt = Some(c);
                     }
-                    None => { m.reset(st.seq_mut()); st.history.clear(); st.pend_h = None; st.drop_ckpt(); }
+                    _ => { m.reset(st.seq_mut()); st.history.clear(); st.pend_h = None; st.drop_ckpt(); }
                 }
             } else {
                 m.reset(st.seq_mut());
@@ -495,8 +496,14 @@ fn prefill_step(m: &Model, pol: &Policy, a: &mut Active, st: &mut Store) {
     *last = Some(lg);
     *done = end;
     if at_ckpt {
+        if super::pcache::enabled() { super::pcache::fence(a.store as u64); }
         let mut c = st.ckpt.take(); m.ckpt_save(st.seq(), &mtp_pend.as_ref().unwrap().0, &mut c);
-        if let Some(cp) = &c { if super::pcache::enabled() { super::pcache::save(&cp.ids, cp.tensors(), a.store as u64); } }
+        if let Some(cp) = &c {
+            if super::pcache::enabled() {
+                let qsa = m.pcache_qsa_slices(st.seq(), cp.ids.len() as i64);
+                super::pcache::save(&cp.ids, cp.tensors(), &qsa, super::model::Model::yarn_mode(st.seq()), a.store as u64);
+            }
+        }
         st.ckpt = c;
     }
     if end == a.prompt.len() {
@@ -720,7 +727,7 @@ fn evict_graphs(graphs: &mut HashMap<Vec<usize>, BatchG>, used: &HashMap<Vec<usi
 /// QWEN_SERVE_TIMING=1: synchronized phase times of batched rounds (drafts, verify, commit, catch-up) per batch size,
 /// printed every 100 rounds of a size.
 struct Clock { on: bool, t: Instant }
-thread_local! { static ACC: std::cell::RefCell<[[f64; 5]; 5]> = const { std::cell::RefCell::new([[0.0; 5]; 5]) }; }
+thread_local! { static ACC: std::cell::RefCell<[[f64; 5]; 9]> = const { std::cell::RefCell::new([[0.0; 5]; 9]) }; }
 impl Clock {
     fn new() -> Self {
         let on = std::env::var("QWEN_SERVE_TIMING").is_ok();

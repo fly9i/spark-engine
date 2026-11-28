@@ -191,11 +191,11 @@ impl Writer {
                     match self.write(f) {
                         Ok(())=>{f.state.store(OK,Ordering::Release);wrote=true;
                             if self.log {eprintln!("{tag} wrote {} ({:.1} MiB) in {:.1} ms",f.path.display(),f.size as f64/1048576.,t.elapsed().as_secs_f64()*1e3);}}
-                        Err(e)=>{eprintln!("{tag} write {} failed: {e}",f.path.display());let _=std::fs::remove_file(f.path.with_extension("tmp"));f.state.store(FAILED,Ordering::Release);}
+                        Err(e)=>{let _=unsafe{cudaStreamSynchronize(self.stream as _)};eprintln!("{tag} write {} failed: {e}",f.path.display());let _=std::fs::remove_file(f.path.with_extension("tmp"));f.state.store(FAILED,Ordering::Release);}
                     }
                 }
                 if wrote {if let Ok(d)=std::fs::File::open(&self.dir) {let _=d.sync_all();}}
-                unsafe{cudaEventDestroy(event as _);}
+                unsafe{cudaStreamSynchronize(self.stream as _);cudaEventDestroy(event as _);}
                 done.store(true,Ordering::Release);let _=back.send(keep);
             }
             Job::Delete(p)=>{let _=std::fs::remove_file(&p);let _=std::fs::remove_file(p.with_extension("tmp"));}
@@ -476,16 +476,32 @@ impl Cache {
             "created":format!("{:016x}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())});
         for (k,v) in &snap.meta {fixed[k.as_str()]=v.clone();}
         let (head,size)=layout(&mut regions,&fixed);bytes+=size;
-        if bytes>pc.cap {pc.stats.skipped_budget+=1;return None;}
+        // Replicated budget accounting across ranks (matches `plan()` which uses rank 0's sizes, preventing TP3
+        // uneven-shard eviction/segment-ID divergence while keeping each rank's local FilePlan.size for headroom checks).
+        let (acc_segs,acc_size,acc_bytes):(Vec<u64>,u64,u64)=if crate::tp::is_tp() {
+            let n=files.len()+1;let mut v=vec![0f32;n*2];
+            if pc.rank==0 {
+                for (i,f) in files.iter().enumerate() {v[2*i]=(f.size&0xFFFFF) as f32;v[2*i+1]=(f.size>>20) as f32;}
+                v[2*files.len()]=(size&0xFFFFF) as f32;v[2*files.len()+1]=(size>>20) as f32;
+            }
+            let dev=keep.first().map_or(Device::Cuda(0),|t|t.device());
+            let t=Tensor::from_slice(&v).to_device(dev);crate::tp::allreduce(&t);
+            let h=Vec::<f32>::try_from(t.to_device(Device::Cpu)).unwrap();
+            let dec=|i:usize|((h[2*i].round() as u64)&0xFFFFF)|((h[2*i+1].round() as u64)<<20);
+            let ss:Vec<u64>=(0..files.len()).map(dec).collect();let es=dec(files.len());
+            let tot:u64=ss.iter().copied().sum::<u64>()+es;
+            (ss,es,tot)
+        } else {(files.iter().map(|f|f.size).collect(),size,bytes)};
+        if acc_bytes>pc.cap {pc.stats.skipped_budget+=1;return None;}
         // Reused segments count for this entry before anything is evicted.
         for id in segs.iter() {pc.segs.get_mut(id).unwrap().refs+=1;}
         let id=pc.next_id;pc.next_id+=1;pc.next_seg+=new_segs.len() as u64;
         let path=pc.dir.join(format!("e-{key:032x}-{which}.snap"));
         let entry_file=FilePlan{path:path.clone(),head,size,fixed,regions,srcs,state:Arc::new(AtomicU8::new(PENDING)),cancel:Arc::new(AtomicBool::new(false))};
-        for (f,&sid) in files.iter().zip(&new_segs) {pc.segs.insert(sid,Seg{refs:1,bytes:f.size,path:f.path.clone(),state:f.state.clone(),cancel:f.cancel.clone()});pc.total+=f.size;}
+        for ((f,&sid),ab) in files.iter().zip(&new_segs).zip(acc_segs) {pc.segs.insert(sid,Seg{refs:1,bytes:ab,path:f.path.clone(),state:f.state.clone(),cancel:f.cancel.clone()});pc.total+=ab;}
         let eids=(pc.rank==0).then(||pc.ids_buffer(ids));
         let shared=eids.as_ref().is_some_and(|b|b.len()>plen);
-        pc.entries.push(Entry{id,key,len:plen,which,bytes:size,segs:all_segs.clone(),used:clock,path,state:entry_file.state.clone(),cancel:entry_file.cancel.clone(),ids:eids});pc.total+=size;
+        pc.entries.push(Entry{id,key,len:plen,which,bytes:acc_size,segs:all_segs.clone(),used:clock,path,state:entry_file.state.clone(),cancel:entry_file.cancel.clone(),ids:eids});pc.total+=acc_size;
         if pc.rank==0&&!shared {let i=pc.entries.len()-1;pc.share_ids(i,ids);}
         pc.evict_to(0,Some(id));
         // Eviction may have taken this entry's own segments only if it was itself evicted (protected): not possible.
@@ -587,7 +603,7 @@ impl Cache {
             let by_name:HashMap<&str,&Rows>=rows.iter().map(|r|(r.name.as_str(),r)).collect();
             // Reads: (file, region, sums, destination pointer, host destination). Rows go straight into the store.
             let mut reads:Vec<(PathBuf,Region,Vec<u64>,usize,bool)>=Vec::new();
-            let check=|r:&Region,t:&Tensor|->Result<(),String>{if r.kind!=t.kind()||r.shape!=t.size() {Err(format!("{}: {:?} {:?} vs {:?} {:?}",r.name,r.kind,r.shape,t.kind(),t.size()))} else {Ok(())}};
+            let check=|r:&Region,t:&Tensor|->Result<(),String>{if r.kind!=t.kind()||r.shape!=t.size()||r.bytes!=nbytes(t)||r.off%ALIGN as u64!=0 {Err(format!("{}: {:?} {:?} ({} @ {}) vs {:?} {:?} ({})",r.name,r.kind,r.shape,r.bytes,r.off,t.kind(),t.size(),nbytes(t)))} else {Ok(())}};
             for (k,sid) in e.segs.iter().enumerate() {
                 let sp=pc.segs.get(sid).ok_or("segment gone")?.path.clone();
                 let sh=read_header(&sp).ok_or("unreadable segment header")?;
@@ -610,13 +626,16 @@ impl Cache {
                 if !dst.is_contiguous() {return Err(format!("{}: destination not contiguous",r.name));}
                 reads.push((e.path.clone(),r,sums,dst.data_ptr() as usize,on_host));
             }
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut files:HashMap<PathBuf,std::fs::File>=HashMap::new();
+            for (p,..) in &reads {if !files.contains_key(p) {files.insert(p.clone(),std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(p).map_err(|e|format!("open {}: {e}",p.display()))?);}}
             ld.bytes=reads.iter().map(|r|r.1.bytes).sum();
             let sh=Arc::new(LoadShared{stage:pc.stage.clone(),ready:std::sync::Mutex::new(Default::default()),read_done:AtomicBool::new(false),cancel:AtomicBool::new(false)});
             pc.loads.retain(|w|w.strong_count()>0);pc.loads.push(Arc::downgrade(&sh));
             ld.shared=Some(sh.clone());
             let (threads,delay)=(pc.reader_threads,pc.test_delay_ms);
             ld.job=Some(std::thread::Builder::new().name("pcache-reader".into()).spawn(move||{
-                let r=read_all(&sh,threads,&reads,delay);if r.is_err() {sh.cancel.store(true,Ordering::Release);}
+                let r=read_all(&sh,threads,&reads,&files,delay);if r.is_err() {sh.cancel.store(true,Ordering::Release);}
                 sh.read_done.store(true,Ordering::Release);r
             }).map_err(|e|e.to_string())?);
             Ok(())
@@ -675,7 +694,7 @@ impl Loading {
     }
     /// Every chunk is read (or the load failed): `finish` only copies what is still staged.
     pub(crate) fn ready(&self)->bool {self.err.is_some()||self.shared.as_ref().is_some_and(|s|s.read_done.load(Ordering::Acquire))}
-    fn drain(&mut self,discard:bool)->Result<(),String> {
+    fn drain(&mut self,discard:bool,mut pc:Option<&mut Cache>)->Result<(),String> {
         if let Some(e)=self.err.take() {if let Some(s)=&self.shared {s.cancel.store(true,Ordering::Release);}let _=self.settle();return Err(e);}
         let Some(sh)=self.shared.clone() else {return Err("no load".into())};
         if discard {sh.cancel.store(true,Ordering::Release);}
@@ -683,6 +702,7 @@ impl Loading {
         loop {
             let done=sh.read_done.load(Ordering::Acquire);
             if let Err(e)=sh.pump(discard||res.is_err()) {res=Err(e);sh.cancel.store(true,Ordering::Release);}
+            if let Some(c)=pc.as_deref_mut() {c.pump_all();}
             if done && sh.ready.lock().unwrap().is_empty() {break;}
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
@@ -694,7 +714,7 @@ impl Loading {
     pub(crate) fn finish<T>(mut self,prompt:&[i64],pc:&mut Cache,assemble:impl FnOnce(Loaded)->Result<T,String>)->Option<T> {
         let (id,plen,which)=(self.id,self.plen,self.which);
         let r=(||->Result<T,String>{
-            self.drain(false)?;
+            self.drain(false,Some(pc))?;
             let ids=Vec::<i64>::try_from(self.owned.remove("ids").ok_or("missing ids")?).map_err(|e|e.to_string())?;
             if prompt.len()<plen||prompt[..plen]!=ids[..] {return Err("token ids differ from the prompt".into());}
             assemble(Loaded{which,ids,owned:std::mem::take(&mut self.owned),meta:std::mem::take(&mut self.meta),segs:self.segs.clone()})
@@ -714,16 +734,14 @@ impl Loading {
         }
     }
     /// Abandon (cancelled request): stop the readers, free the staged slots, discard the result.
-    pub(crate) fn abandon(mut self) {let _=self.drain(true);}
+    pub(crate) fn abandon(mut self) {let _=self.drain(true,None);}
 }
-impl Drop for Loading {fn drop(&mut self) {if self.job.is_some() {let _=self.drain(true);}}}
+impl Drop for Loading {fn drop(&mut self) {if self.job.is_some() {let _=self.drain(true,None);}}}
 /// Parallel O_DIRECT reads into free staging slots, checksum per chunk; device-bound pieces are queued for the serve
 /// thread, host-bound ones are copied to their CPU tensor right here. Adjacent regions of a file share one slot-sized
 /// read.
-fn read_all(sh:&LoadShared,threads:usize,reads:&[(PathBuf,Region,Vec<u64>,usize,bool)],delay:Option<u64>)->Result<(),String> {
-    use std::os::unix::fs::{OpenOptionsExt,FileExt};
-    let mut files:HashMap<&PathBuf,std::fs::File>=HashMap::new();
-    for (p,..) in reads {if !files.contains_key(p) {files.insert(p,std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(p).map_err(|e|format!("open {}: {e}",p.display()))?);}}
+fn read_all(sh:&LoadShared,threads:usize,reads:&[(PathBuf,Region,Vec<u64>,usize,bool)],files:&HashMap<PathBuf,std::fs::File>,delay:Option<u64>)->Result<(),String> {
+    use std::os::unix::fs::FileExt;
     for (_,r,sums,..) in reads {if sums.len()!=r.bytes.div_ceil(CHUNK) {return Err(format!("{}: checksum count",r.name));}}
     // Pieces (read, chunk k, bytes) in file order; a read = (file, offset, padded length, pieces with their slot offsets).
     let mut order:Vec<usize>=(0..reads.len()).collect();order.sort_by(|&a,&b|(&reads[a].0,reads[a].1.off).cmp(&(&reads[b].0,reads[b].1.off)));
@@ -736,7 +754,7 @@ fn read_all(sh:&LoadShared,threads:usize,reads:&[(PathBuf,Region,Vec<u64>,usize,
                 _=>plan.push((&r.0,off,pad(n),vec![(0,i,k,n)])),
             }
         }}
-    let next=std::sync::atomic::AtomicUsize::new(0);let files=&files;
+    let next=std::sync::atomic::AtomicUsize::new(0);
     let errs:Vec<String>=std::thread::scope(|sc|{
         let hs:Vec<_>=(0..threads).map(|_|{let next=&next;let plan=&plan;sc.spawn(move||->Result<(),String>{
             loop {
@@ -747,7 +765,7 @@ fn read_all(sh:&LoadShared,threads:usize,reads:&[(PathBuf,Region,Vec<u64>,usize,
                         f=sh.stage.cv.wait_timeout(f,std::time::Duration::from_millis(5)).unwrap().0;}};
                 if let Some(ms)=delay {std::thread::sleep(std::time::Duration::from_millis(ms));}
                 let b=sh.stage.slots[slot].slice(*len);
-                let res=(||{files[p].read_exact_at(b,*off).map_err(|e|format!("read {} @{off}: {e}",p.display()))?;
+                let res=(||{files[*p].read_exact_at(b,*off).map_err(|e|format!("read {} @{off}: {e}",p.display()))?;
                     let mut dev=Vec::new();
                     for &(so,i,k,n) in pieces {let (_,r,sums,dst,host)=&reads[i];
                         if checksum(&b[so..so+pad(n)])!=sums[k] {return Err(format!("checksum mismatch in {} {} chunk {k}",p.display(),r.name));}

@@ -82,7 +82,7 @@ __device__ __forceinline__ long long latent_position(const long long* selected,
         if(slot<slots-3)return slot<full?slot:-1;
         const int tail=slot-(slots-3);
         return tail<len%4?full+tail:-1;
-    } else return selected[query*slots+slot];
+    } else return selected[(long long)query*slots+slot];
 }
 
 // One CTA per (query,head), four independent online-softmax streams. Invalid
@@ -93,7 +93,7 @@ __global__ void sparse_latent(const float* q,R latent,const long long* selected,
     int query=blockIdx.x,head=blockIdx.y,part=blockIdx.z,lane=threadIdx.x&31,warp=threadIdx.x>>5;
     float query_values[16],acc[16];
     #pragma unroll
-    for(int j=0;j<16;++j){query_values[j]=q[head*query_stride+query*512+lane+j*32];acc[j]=0.f;}
+    for(int j=0;j<16;++j){query_values[j]=q[(long long)head*query_stride+(long long)query*512+lane+j*32];acc[j]=0.f;}
     float maximum=-CUDART_INF_F,total=0.f;
     for(int slot=part*4+warp;slot<slots;slot+=4*splits) {
         long long pos=latent_position<Visible>(selected,query,slot,slots);
@@ -132,17 +132,17 @@ __global__ void sparse_latent(const float* q,R latent,const long long* selected,
     for(int j=0;j<4;++j){int dim=threadIdx.x+j*128;float value=0.f;
         #pragma unroll
         for(int w=0;w<4;++w)value+=partial[w*512+dim]*scales[w];
-        if(splits==1)out[(head*queries+query)*512+dim]=value/denom;
-        else out[((part*heads+head)*queries+query)*514+dim]=value;
+        if(splits==1)out[((long long)head*queries+query)*512+dim]=value/denom;
+        else out[(((long long)part*heads+head)*queries+query)*514+dim]=value;
     }
-    if(splits>1 && threadIdx.x==0){int base=((part*heads+head)*queries+query)*514;out[base+512]=global_max;out[base+513]=denom;}
+    if(splits>1 && threadIdx.x==0){long long base=(((long long)part*heads+head)*queries+query)*514;out[base+512]=global_max;out[base+513]=denom;}
 }
 __global__ void merge_latent(const float* partial,float* out,int heads,int queries,int splits){
-    int row=blockIdx.x;float maximum=-CUDART_INF_F;
-    for(int s=0;s<splits;++s)maximum=fmaxf(maximum,partial[(s*heads*queries+row)*514+512]);
+    long long row=blockIdx.x;float maximum=-CUDART_INF_F;
+    for(int s=0;s<splits;++s)maximum=fmaxf(maximum,partial[((long long)s*heads*queries+row)*514+512]);
     float scale[8],denom=0.f;
-    for(int s=0;s<splits;++s){int base=(s*heads*queries+row)*514;scale[s]=partial[base+513]>0.f?expf(partial[base+512]-maximum):0.f;denom+=partial[base+513]*scale[s];}
-    for(int j=0;j<4;++j){int dim=threadIdx.x+j*128;float value=0.f;for(int s=0;s<splits;++s)value+=partial[(s*heads*queries+row)*514+dim]*scale[s];out[row*512+dim]=value/denom;}
+    for(int s=0;s<splits;++s){long long base=((long long)s*heads*queries+row)*514;scale[s]=partial[base+513]>0.f?expf(partial[base+512]-maximum):0.f;denom+=partial[base+513]*scale[s];}
+    for(int j=0;j<4;++j){int dim=threadIdx.x+j*128;float value=0.f;for(int s=0;s<splits;++s)value+=partial[((long long)s*heads*queries+row)*514+dim]*scale[s];out[row*512+dim]=value/denom;}
 }
 // GLM53_MLA_MULTI_LAUNCH (L0): sparse_latent<false,LatentFp8Reader> over the stacked queries of up to 8 sequences, each
 // query reading its own sequence's FP8 latent cache; per-(query, head, part) arithmetic, scratch layout by global query and
@@ -157,7 +157,7 @@ __global__ void sparse_latent_fp8_multi(const float* q,const LatentSeqs L,const 
     const LatentFp8Reader latent{L.latent[sidx]};
     float query_values[16],acc[16];
     #pragma unroll
-    for(int j=0;j<16;++j){query_values[j]=q[head*query_stride+query*512+lane+j*32];acc[j]=0.f;}
+    for(int j=0;j<16;++j){query_values[j]=q[(long long)head*query_stride+(long long)query*512+lane+j*32];acc[j]=0.f;}
     float maximum=-CUDART_INF_F,total=0.f;
     for(int slot=part*4+warp;slot<slots;slot+=4*splits) {
         long long pos=latent_position<false>(selected,query,slot,slots);
@@ -191,10 +191,10 @@ __global__ void sparse_latent_fp8_multi(const float* q,const LatentSeqs L,const 
     for(int j=0;j<4;++j){int dim=threadIdx.x+j*128;float value=0.f;
         #pragma unroll
         for(int w=0;w<4;++w)value+=partial[w*512+dim]*scales[w];
-        if(splits==1)out[(head*queries+query)*512+dim]=value/denom;
-        else out[((part*heads+head)*queries+query)*514+dim]=value;
+        if(splits==1)out[((long long)head*queries+query)*512+dim]=value/denom;
+        else out[(((long long)part*heads+head)*queries+query)*514+dim]=value;
     }
-    if(splits>1 && threadIdx.x==0){int base=((part*heads+head)*queries+query)*514;out[base+512]=global_max;out[base+513]=denom;}
+    if(splits>1 && threadIdx.x==0){long long base=(((long long)part*heads+head)*queries+query)*514;out[base+512]=global_max;out[base+513]=denom;}
 }
 extern "C" int glm53_latent_attention_fp8_multi_cuda(const float* q,const void* table,const long long* selected,
     float* out,float* scratch,int heads,int queries,int slots,int query_stride,int splits,cudaStream_t stream) {
@@ -239,24 +239,24 @@ __global__ void shared_latent(const float* q,const half* latent,const long long*
     __shared__ int full_count;
     if(threadIdx.x==0){
         int lo=0,hi=slots-3;
-        while(lo<hi){int mid=(lo+hi)/2;if(selected[query*slots+mid]>=0)lo=mid+1;else hi=mid;}
+        while(lo<hi){int mid=(lo+hi)/2;if(selected[(long long)query*slots+mid]>=0)lo=mid+1;else hi=mid;}
         full_count=lo;
     }
     float query_values[16],acc[16];
     #pragma unroll
-    for(int j=0;j<16;++j){query_values[j]=head<heads?q[head*query_stride+query*512+lane+j*32]:0.f;acc[j]=0.f;}
+    for(int j=0;j<16;++j){query_values[j]=head<heads?q[(long long)head*query_stride+(long long)query*512+lane+j*32]:0.f;acc[j]=0.f;}
     float maximum=-CUDART_INF_F,total=0.f;
     __syncthreads();
     for(int base=0;base<full_count+3;base+=Tile){
         if(threadIdx.x<Tile){int key=base+threadIdx.x;int slot=key<full_count?key:slots-3+key-full_count;
-            positions[threadIdx.x]=key<full_count+3?selected[query*slots+slot]:-1;}
+            positions[threadIdx.x]=key<full_count+3?selected[(long long)query*slots+slot]:-1;}
         if constexpr(Vectorized){
             // Each loading lane obtains its own small cached index. This
             // removes the barrier waiting for the shared position table and
             // moves eight FP16 elements per memory instruction.
             for(int i=threadIdx.x;i<Tile*64;i+=HeadGroup*32){int key=base+i/64,col=(i%64)*8;
                 int slot=key<full_count?key:slots-3+key-full_count;
-                long long pos=key<full_count+3?selected[query*slots+slot]:-1;
+                long long pos=key<full_count+3?selected[(long long)query*slots+slot]:-1;
                 reinterpret_cast<uint4*>(keys)[i]=pos>=0?*reinterpret_cast<const uint4*>(latent+pos*512+col):make_uint4(0,0,0,0);}
         }else{
             __syncthreads();
@@ -307,7 +307,7 @@ __global__ void shared_latent(const float* q,const half* latent,const long long*
     }
     if(head<heads){
         #pragma unroll
-        for(int j=0;j<16;++j)out[(head*queries+query)*512+lane+j*32]=acc[j]/total;
+        for(int j=0;j<16;++j)out[((long long)head*queries+query)*512+lane+j*32]=acc[j]/total;
     }
 }
 
@@ -835,8 +835,7 @@ extern "C" int glm53_range_cache_copy_cuda(const void* src,void* dst,const long 
 // function of (seed, output position, global vocabulary id): TP shards and replicated heads agree,
 // and the sampled token at an output position does not depend on the speculative structure.
 struct GumbelRows {float temp[64];unsigned long long key[64];};
-__device__ __forceinline__ unsigned long long glm53_mix64(unsigned long long x){
-  x^=x>>30;x*=0xbf58476d1ce4e5b9ULL;x^=x>>27;x*=0x94d049bb133111ebULL;x^=x>>31;return x;}
+#include "gumbel.cuh"
 __global__ void gumbel_noise(float* __restrict__ out,long long stride,int cols,long long col_offset,GumbelRows p){
   int r=blockIdx.y;float t=p.temp[r];unsigned long long key=p.key[r];
   for(int c=blockIdx.x*blockDim.x+threadIdx.x;c<cols;c+=gridDim.x*blockDim.x){
@@ -872,24 +871,6 @@ extern "C" int glm53_gumbel_noise_cuda(float* out,long long stride,int rows,int 
 // whose error is far below eps, then evaluates the exact FP64 noise (same expression as gumbel_noise) only for columns
 // whose estimate is within eps of the block maximum, and keeps ATen's max rule (NaN wins, larger wins, lowest index on
 // ties). Per-row temperature/key live in a small device buffer written by gumbel_params (graph replays read it).
-__device__ __forceinline__ float gumbel_exact(unsigned long long key,long long id,float t){
-  if(!(t>0.f))return 0.f;
-  unsigned long long h=glm53_mix64(key^glm53_mix64((unsigned long long)id+0x9e3779b97f4a7c15ULL));
-  double r=((double)(h>>11)+0.5)*(1.0/9007199254740992.0);double e=-log1p(-r);return (float)(-(double)t*log(e));
-}
-__device__ __forceinline__ float gumbel_estimate(unsigned long long key,long long id,float t){
-  if(!(t>0.f))return 0.f;
-  unsigned long long h=glm53_mix64(key^glm53_mix64((unsigned long long)id+0x9e3779b97f4a7c15ULL));
-  const unsigned long long m=h>>11;float e;
-  if(m<(1ULL<<52)){const float r=((float)m+0.5f)*1.1102230246251565e-16f;e=-log1pf(-r);}
-  else{const float u=((float)((1ULL<<53)-m)-0.5f)*1.1102230246251565e-16f;e=-logf(u);}
-  return -t*logf(e);
-}
-__device__ __forceinline__ bool gumbel_better(float v,int i,float bv,int bi){
-  const bool vn=v!=v,bn=bv!=bv;
-  if(vn||bn)return vn&&(!bn||i<bi);
-  return v>bv||(v==bv&&i<bi);
-}
 __global__ void gumbel_params(float* __restrict__ temps,unsigned long long* __restrict__ keys,int rows,GumbelRows p){
   const int i=threadIdx.x;if(i<64){temps[i]=i<rows?p.temp[i]:0.f;keys[i]=i<rows?p.key[i]:0ULL;}
 }
@@ -1077,11 +1058,11 @@ __global__ void __launch_bounds__(128) latent_tc16_dec(const float* __restrict__
 
 // merge_latent that skips empty splits (total 0: their partial rows were never written)
 __global__ void merge_latent_nz(const float* partial,float* out,int heads,int queries,int splits){
-    int row=blockIdx.x;float maximum=-CUDART_INF_F;
-    for(int s=0;s<splits;++s)maximum=fmaxf(maximum,partial[(s*heads*queries+row)*514+512]);
+    long long row=blockIdx.x;float maximum=-CUDART_INF_F;
+    for(int s=0;s<splits;++s)maximum=fmaxf(maximum,partial[((long long)s*heads*queries+row)*514+512]);
     float scale[8],denom=0.f;
-    for(int s=0;s<splits;++s){int base=(s*heads*queries+row)*514;scale[s]=partial[base+513]>0.f?expf(partial[base+512]-maximum):0.f;denom+=partial[base+513]*scale[s];}
-    for(int j=0;j<4;++j){int dim=threadIdx.x+j*128;float value=0.f;for(int s=0;s<splits;++s)if(scale[s]>0.f)value+=partial[(s*heads*queries+row)*514+dim]*scale[s];out[row*512+dim]=value/denom;}
+    for(int s=0;s<splits;++s){long long base=((long long)s*heads*queries+row)*514;scale[s]=partial[base+513]>0.f?expf(partial[base+512]-maximum):0.f;denom+=partial[base+513]*scale[s];}
+    for(int j=0;j<4;++j){int dim=threadIdx.x+j*128;float value=0.f;for(int s=0;s<splits;++s)if(scale[s]>0.f)value+=partial[((long long)s*heads*queries+row)*514+dim]*scale[s];out[row*512+dim]=value/denom;}
 }
 extern "C" int glm53_latent_attention_fp8_tc_cuda(const float* q,const void* latent,const long long* selected,
     float* out,float* scratch,int heads,int queries,int slots,int query_stride,int splits,cudaStream_t stream) {

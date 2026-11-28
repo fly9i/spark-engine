@@ -106,12 +106,12 @@ pub fn rate_depth_scaled(conf:&[f32],max:usize,scale:f64)->usize {
 #[cfg(test)] mod tests {
     use super::*;
     #[test] fn rate_depth_bounds(){
-        assert_eq!(rate_depth(&[1.;7],7),7);
-        assert_eq!(rate_depth(&[0.;7],7),1);
-        assert_eq!(rate_depth(&[1.;7],3),3);
-        assert_eq!(rate_depth(&[1.;7],1),1);
+        assert_eq!(rate_depth_scaled(&[1.;7],7,1.0),7);
+        assert_eq!(rate_depth_scaled(&[0.;7],7,1.0),1);
+        assert_eq!(rate_depth_scaled(&[1.;7],3,1.0),3);
+        assert_eq!(rate_depth_scaled(&[1.;7],1,1.0),1);
         // a confident first draft followed by an unconfident tail stops early
-        assert!(rate_depth(&[0.99,0.02,0.02,0.02,0.02,0.02,0.02],7)<=2);
+        assert!(rate_depth_scaled(&[0.99,0.02,0.02,0.02,0.02,0.02,0.02],7,1.0)<=2);
     }
     #[test] fn high_acceptance_amortizes_larger_batches(){
         let mut p=Policy::new([120.,150.,180.]);for _ in 0..7{p.observe(7,7);}assert_eq!(p.depth(),7);

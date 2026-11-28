@@ -319,18 +319,24 @@ pub fn allreduce_send(t:&Tensor)->bool {
     match unsafe { rs_allreduce_send(t.data_ptr() as *mut u8, t.numel() as i64) } {0=>true,1=>false,rc=>panic!("send-only allreduce rc={rc}")}
 }
 /// An unsummed partial whose peer half waits in the recv slot, with the rounding its consumer must apply.
-#[derive(Clone,Copy,PartialEq,Debug)]
-pub struct PendingSum {pub ptr:usize,pub numel:i64,pub round_half:bool}
+/// Holds a shallow clone of the partial tensor so its CUDA storage cannot be freed before `materialize`.
+#[derive(Debug)]
+pub struct PendingSum {pub ptr:usize,pub numel:i64,pub round_half:bool,_owner:Tensor}
+impl PendingSum {
+    pub fn new(t:&Tensor,round_half:bool)->Self {
+        Self{ptr:t.data_ptr() as usize,numel:t.numel() as i64,round_half,_owner:t.shallow_clone()}
+    }
+}
 thread_local! {
     static DEFER_SUM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static PENDING_SUM: std::cell::Cell<Option<PendingSum>> = const { std::cell::Cell::new(None) };
+    static PENDING_SUM: std::cell::RefCell<Option<PendingSum>> = const { std::cell::RefCell::new(None) };
 }
 /// Runs `f` (an attention block) letting its row-parallel output projection defer the TP sum; returns the pending
 /// record when the returned tensor is exactly that unsummed partial. Anything else is materialized first.
 pub fn with_deferred_sum(f:impl FnOnce()->Tensor)->(Tensor,Option<PendingSum>) {
     if !ar_fused_enabled() { return (f(),None); }
     DEFER_SUM.with(|d|d.set(true));let r=f();DEFER_SUM.with(|d|d.set(false));
-    let p=PENDING_SUM.with(|c|c.take());
+    let p=PENDING_SUM.with(|c|c.borrow_mut().take());
     match p {
         Some(p) if r.data_ptr() as usize==p.ptr && r.numel() as i64==p.numel && r.is_contiguous() && r.kind()==tch::Kind::Float => (r,Some(p)),
         Some(p) => {materialize(p);(r,None)},
@@ -340,13 +346,13 @@ pub fn with_deferred_sum(f:impl FnOnce()->Tensor)->(Tensor,Option<PendingSum>) {
 /// Inside `with_deferred_sum`: send-only reduce of a row-parallel partial, recorded as pending. false: not deferred.
 pub fn defer_sum(y:&Tensor,round_half:bool)->bool {
     if !DEFER_SUM.with(|d|d.get()) { return false; }
-    if let Some(p)=PENDING_SUM.with(|c|c.take()) { materialize(p); }
+    if let Some(p)=PENDING_SUM.with(|c|c.borrow_mut().take()) { materialize(p); }
     if !allreduce_send(y) { return false; }
-    PENDING_SUM.with(|c|c.set(Some(PendingSum{ptr:y.data_ptr() as usize,numel:y.numel() as i64,round_half})));true
+    PENDING_SUM.with(|c|*c.borrow_mut()=Some(PendingSum{ptr:y.data_ptr() as usize,numel:y.numel() as i64,round_half,_owner:y.shallow_clone()}));true
 }
 /// A pending sum inside a deferral scope must be complete before any later collective reuses the sequence counter.
 fn settle_pending() {
-    if ar_fused_enabled() { if let Some(p)=PENDING_SUM.with(|c|c.take()) { materialize(p); } }
+    if ar_fused_enabled() { if let Some(p)=PENDING_SUM.with(|c|c.borrow_mut().take()) { materialize(p); } }
 }
 pub fn settle_pending_pub(){settle_pending();}
 /// Fallback consumer: writes rank0+rank1 (and the pending rounding) into the partial in place.

@@ -54,20 +54,20 @@ extern "C" int glm53_kda_fork_cuda(const float* source,float* h,const float* q,c
 __global__ void recurrent_sequence(float* h,const float* q,const float* k,const float* v,
                                    const float* beta,const float* decay,float* out,int heads,int steps) {
     int row=blockIdx.x, head=row/128, col=threadIdx.x;
-    float state=h[row*128+col];
+    float state=h[(long long)row*128+col];
     __shared__ float sums[4];
     for(int t=0;t<steps;++t) {
-        int i=(t*heads+head)*128+col;
+        long long i=((long long)t*heads+head)*128+col;
         state=state*decay[i];
         float hk=sum128(state*k[i],sums);
-        float correction=beta[t*heads+head]*(v[t*heads*128+row]-hk);
+        float correction=beta[(long long)t*heads+head]*(v[(long long)t*heads*128+row]-hk);
         state=state+correction*k[i];
         __syncthreads();
         float result=sum128(state*q[i],sums);
-        if(col==0) out[t*heads*128+row]=result;
+        if(col==0) out[(long long)t*heads*128+row]=result;
         __syncthreads();
     }
-    h[row*128+col]=state;
+    h[(long long)row*128+col]=state;
 }
 extern "C" int glm53_kda_sequence_cuda(float* h,const float* q,const float* k,const float* v,
     const float* beta,const float* decay,float* out,int heads,int steps,cudaStream_t stream) {
@@ -82,20 +82,20 @@ __global__ void recurrent_warp_sequence(float* h,const float* q,const float* k,c
     int row=blockIdx.x*4+(threadIdx.x>>5),head=row/128,lane=threadIdx.x&31;
     float state[4];
     #pragma unroll
-    for(int j=0;j<4;++j)state[j]=h[row*128+lane+j*32];
+    for(int j=0;j<4;++j)state[j]=h[(long long)row*128+lane+j*32];
     for(int t=0;t<steps;++t){float key[4],query[4],dot=0.f;
         #pragma unroll
-        for(int j=0;j<4;++j){int i=(t*heads+head)*128+lane+j*32;key[j]=k[i];query[j]=q[i];state[j]*=decay[i];dot+=state[j]*key[j];}
+        for(int j=0;j<4;++j){long long i=((long long)t*heads+head)*128+lane+j*32;key[j]=k[i];query[j]=q[i];state[j]*=decay[i];dot+=state[j]*key[j];}
         for(int s=16;s;s>>=1)dot+=__shfl_down_sync(0xffffffff,dot,s);
-        float correction=beta[t*heads+head]*(v[t*heads*128+row]-__shfl_sync(0xffffffff,dot,0));
+        float correction=beta[(long long)t*heads+head]*(v[(long long)t*heads*128+row]-__shfl_sync(0xffffffff,dot,0));
         dot=0.f;
         #pragma unroll
         for(int j=0;j<4;++j){state[j]+=correction*key[j];dot+=state[j]*query[j];}
         for(int s=16;s;s>>=1)dot+=__shfl_down_sync(0xffffffff,dot,s);
-        if(lane==0)out[t*heads*128+row]=dot;
+        if(lane==0)out[(long long)t*heads*128+row]=dot;
     }
     #pragma unroll
-    for(int j=0;j<4;++j)h[row*128+lane+j*32]=state[j];
+    for(int j=0;j<4;++j)h[(long long)row*128+lane+j*32]=state[j];
 }
 // P3a (GLM53_KDA_SEQUENCE=3): the same per-row arithmetic as recurrent_warp_sequence
 // (bitwise), two rows of one head per warp sharing k/q/decay loads (one wave on GB10),
@@ -105,12 +105,12 @@ __global__ void __launch_bounds__(128) recurrent_warp_sequence2(float* h,const f
     const int pair=blockIdx.x*4+(threadIdx.x>>5),row0=pair*2,head=row0/128,lane=threadIdx.x&31;
     float st0[4],st1[4];
 #pragma unroll
-    for(int j=0;j<4;++j){st0[j]=h[row0*128+lane+j*32];st1[j]=h[(row0+1)*128+lane+j*32];}
+    for(int j=0;j<4;++j){st0[j]=h[(long long)row0*128+lane+j*32];st1[j]=h[(long long)(row0+1)*128+lane+j*32];}
     float nk[4],nq[4],nd[4],nv0=0.f,nv1=0.f,nb=0.f;
     auto load=[&](int t){
 #pragma unroll
-        for(int j=0;j<4;++j){const int i=(t*heads+head)*128+lane+j*32;nk[j]=k[i];nq[j]=q[i];nd[j]=decay[i];}
-        nv0=v[t*heads*128+row0];nv1=v[t*heads*128+row0+1];nb=beta[t*heads+head];};
+        for(int j=0;j<4;++j){const long long i=((long long)t*heads+head)*128+lane+j*32;nk[j]=k[i];nq[j]=q[i];nd[j]=decay[i];}
+        nv0=v[(long long)t*heads*128+row0];nv1=v[(long long)t*heads*128+row0+1];nb=beta[(long long)t*heads+head];};
     if(steps>0)load(0);
     for(int t=0;t<steps;++t){
         float key[4],query[4],dec[4];
@@ -127,10 +127,10 @@ __global__ void __launch_bounds__(128) recurrent_warp_sequence2(float* h,const f
 #pragma unroll
         for(int j=0;j<4;++j){st0[j]+=c0*key[j];d0+=st0[j]*query[j];st1[j]+=c1*key[j];d1+=st1[j]*query[j];}
         for(int s=16;s;s>>=1){d0+=__shfl_down_sync(0xffffffff,d0,s);d1+=__shfl_down_sync(0xffffffff,d1,s);}
-        if(lane==0){out[t*heads*128+row0]=d0;out[t*heads*128+row0+1]=d1;}
+        if(lane==0){out[(long long)t*heads*128+row0]=d0;out[(long long)t*heads*128+row0+1]=d1;}
     }
 #pragma unroll
-    for(int j=0;j<4;++j){h[row0*128+lane+j*32]=st0[j];h[(row0+1)*128+lane+j*32]=st1[j];}
+    for(int j=0;j<4;++j){h[(long long)row0*128+lane+j*32]=st0[j];h[(long long)(row0+1)*128+lane+j*32]=st1[j];}
 }
 
 // P3b (GLM53_KDA_SEQUENCE=4): recurrent_warp_sequence arithmetic per row (bitwise), 16 warps x 2
@@ -951,24 +951,27 @@ extern "C" int glm53_kda_gate_cuda(const float* x,const void* fa,const void* ga,
         return int(cudaGetLastError());}}
     const char* one=std::getenv("GLM53_KDA_GATE_ONE");
     if(one&&one[0]=='1'&&k==4096&&rank_a==128){
-        // Persistent grid = co-resident blocks (capped at the stage-1 warp tasks); each thread holds MaxPass stage-2 slices,
+        // Persistent grid = co-resident blocks (capped per call at the stage-1 warp tasks); each thread holds MaxPass stage-2 slices,
         // so grid*16*MaxPass must cover the 2n stage-2 rows: 4 slices when the grid allows, else 8.
-        static int grid4=0,grid8=0;
-        if(!grid4){int dev=0,sms=0,o4=0,o8=0;cudaGetDevice(&dev);cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,dev);
+        static int max4=-1,max8=-1,coop=0;
+        if(max4<0){int dev=0,sms=0,o4=0,o8=0;cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,dev);
+            cudaDeviceGetAttribute(&coop,cudaDevAttrCooperativeLaunch,dev);
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o4,kda_gate_one<8,4>,256,8*2*128*sizeof(float));
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o8,kda_gate_one<8,8>,256,8*2*128*sizeof(float));
-            const int want=(t1*4+7)/8;grid4=sms*o4<want?sms*o4:want;grid8=sms*o8<want?sms*o8:want;
-            if(std::getenv("GLM53_KDA_GATE_ONE_LOG"))fprintf(stderr,"[kda-gate-one] sms %d occ %d/%d grid %d/%d\n",sms,o4,o8,grid4,grid8);}
+            max4=sms*o4;max8=sms*o8;
+            if(std::getenv("GLM53_KDA_GATE_ONE_LOG"))fprintf(stderr,"[kda-gate-one] sms %d occ %d/%d max %d/%d coop %d\n",sms,o4,o8,max4,max8,coop);}
+        const int want=(t1*4+7)/8;
+        const int grid4=want<max4?want:max4,grid8=want<max8?want:max8;
         const size_t sh=(size_t)rows*2*rank_a*sizeof(float);
-        if(grid4*16*4>=2*n){
-            kda_gate_one<8,4><<<grid4,256,sh,s>>>(x,(const __half*)fa,(const __half*)ga,wb,(const __half*)fb,(const __half*)gb,
-                a_log,dt_bias,part,beta,decay,sg2,rows,k,rank_a,nb,n);
-            return int(cudaGetLastError());
+        const __half *fah=(const __half*)fa,*gah=(const __half*)ga,*fbh=(const __half*)fb,*gbh=(const __half*)gb;
+        void* args[]={(void*)&x,(void*)&fah,(void*)&gah,(void*)&wb,(void*)&fbh,(void*)&gbh,(void*)&a_log,(void*)&dt_bias,
+                      (void*)&part,(void*)&beta,(void*)&decay,(void*)&sg2,(void*)&rows,(void*)&k,(void*)&rank_a,(void*)&nb,(void*)&n};
+        if(coop&&grid4>0&&grid4*16*4>=2*n){
+            return int(cudaLaunchCooperativeKernel((const void*)kda_gate_one<8,4>,dim3(grid4),dim3(256),args,sh,s));
         }
-        if(grid8*16*8>=2*n){
-            kda_gate_one<8,8><<<grid8,256,sh,s>>>(x,(const __half*)fa,(const __half*)ga,wb,(const __half*)fb,(const __half*)gb,
-                a_log,dt_bias,part,beta,decay,sg2,rows,k,rank_a,nb,n);
-            return int(cudaGetLastError());
+        if(coop&&grid8>0&&grid8*16*8>=2*n){
+            return int(cudaLaunchCooperativeKernel((const void*)kda_gate_one<8,8>,dim3(grid8),dim3(256),args,sh,s));
         }
     }
     kda_gate_first<8><<<(t1*4+7)/8,256,0,s>>>(x,(const __half*)fa,(const __half*)ga,wb,part,rows,k,rank_a,nb);

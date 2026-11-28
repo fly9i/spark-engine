@@ -401,7 +401,7 @@ pub fn ar_fused_probe(out:&std::path::Path) {
             let a=if round {a.to_kind(Kind::Half).to_kind(Kind::Float)} else {a};mhc_post(&a,residual,pre)};
         let b=x.copy();assert!(crate::tp::allreduce_send(&b));
         let fused=if packed {mhc_post_packed_pending(&b,residual,pre,round)} else {
-            mhc_post_pending(&b,Some(crate::tp::PendingSum{ptr:b.data_ptr() as usize,numel:b.numel() as i64,round_half:round}),residual,pre)};
+            mhc_post_pending(&b,Some(crate::tp::PendingSum::new(&b,round)),residual,pre)};
         (reference,fused)
     };
     let inputs=|rows:i64,packed:bool,strided:bool,seed:i64|->(Tensor,Tensor,PreOut) {
@@ -420,7 +420,7 @@ pub fn ar_fused_probe(out:&std::path::Path) {
         if lap==2 && rows==3 {   // fallback: send-only, then materialize in place == allreduce (+round)
             let mut a=x.copy();crate::tp::allreduce(&a);if round && !packed {a.copy_(&a.to_kind(Kind::Half).to_kind(Kind::Float));}
             let b=x.copy();assert!(crate::tp::allreduce_send(&b));
-            crate::tp::materialize(crate::tp::PendingSum{ptr:b.data_ptr() as usize,numel:b.numel() as i64,round_half:round&&!packed});
+            crate::tp::materialize(crate::tp::PendingSum::new(&b,round&&!packed));
             tch::Cuda::synchronize(0);assert!(a.equal(&b),"materialize differs");
         }
     }}}}

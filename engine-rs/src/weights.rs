@@ -539,6 +539,7 @@ pub struct MmInject {pub rows:Tensor,pub values:Option<Tensor>}
 thread_local!{static PREFILL_MM:std::cell::RefCell<Option<MmInject>>=const{std::cell::RefCell::new(None)};}
 /// Arm the injection for the next prefill embedding (consumed by `embed_prefill`).
 pub fn set_prefill_mm(x:Option<MmInject>) {PREFILL_MM.with(|p|*p.borrow_mut()=x);}
+pub fn has_prefill_mm()->bool {PREFILL_MM.with(|p|p.borrow().is_some())}
 
 impl ModelWeights {
     /// Prefill embedding: `embed_tokens`, or with an armed multimodal injection, the placeholder rows zeroed

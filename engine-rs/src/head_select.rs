@@ -68,10 +68,11 @@ fn full_from_local(local:&Tensor,start:i64,total:i64)->Tensor {
 }
 
 fn simulate(full:&Tensor,world:usize)->Tensor {
-    let width=full.size()[1]/world as i64;
-    assert_eq!(full.size()[1],width*world as i64);
-    let packets:Vec<_>=(0..world).map(|rank|packet(&full.narrow(1,rank as i64*width,width),
-        rank as i64*width,full.size()[1],rank,world)).collect();
+    let total=full.size()[1];
+    let packets:Vec<_>=(0..world).map(|rank|{
+        let (start,width)=crate::weights::vocab_part(total,rank,world).range(total);
+        packet(&full.narrow(1,start,width),start,total,rank,world)
+    }).collect();
     let mut combined=packets[0].shallow_clone();
     for next in &packets[1..] {combined=&combined+next;}
     choose(&combined)
@@ -234,7 +235,7 @@ mod tests {
         }}}
     }
     #[test] fn pytorch_cpu_matches_packet_rules() {
-        for world in [2usize,3,4] {for width in [7usize,1024] {for rotation in [0,1,width-1,width,width+1] {
+        for world in [2usize,3,4] {for width in [128usize,1024] {for rotation in [0,1,width-1,width,width+1] {
             let rows=fixtures(world,width,rotation);let expected:Vec<i64>=rows.iter().map(|r|scan(r) as i64).collect();
             let full=Tensor::from_slice(&rows.into_iter().flatten().collect::<Vec<_>>()).view([12,(world*width) as i64]);
             let reference=Tensor::from_slice(&expected);
@@ -251,6 +252,6 @@ mod tests {
     }
     #[test] #[should_panic(expected="rank-ordered")]
     fn reject_out_of_order_shards() {
-        check_layout(&Tensor::zeros([1,7],(Kind::Float,tch::Device::Cpu)),0,14,1,2);
+        check_layout(&Tensor::zeros([1,128],(Kind::Float,tch::Device::Cpu)),0,256,1,2);
     }
 }

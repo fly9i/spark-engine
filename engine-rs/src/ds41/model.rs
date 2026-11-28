@@ -257,7 +257,7 @@ fn qakv_split_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::On
 fn mx_gemv_ok(m: i64, k: i64, n: i64) -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let one = *E.get_or_init(|| std::env::var("DS41_GEMV_MX1").map_or(true, |v| v != "0"));
-    moe_mx_on() && m <= super::kern::few_rows() && (m >= 2 || one) && k % 64 == 0 && n % 8 == 0
+    moe_mx_on() && m <= super::kern::wide_rows() && (m >= 2 || one) && k % 64 == 0 && n % 8 == 0
 }
 /// DS41_MOE_MX=0: the BF16-MMA routed-expert kernels (shim/ds41_moe.cu) instead of the block-scaled MMA ones (ds41_mx.cu).
 pub(super) fn moe_mx_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_MOE_MX").map_or(true, |v| v != "0")) }
@@ -1036,9 +1036,12 @@ impl Model {
     /// (rows past the part: zeros), from a BF16 row reduce-scatter of every rank's vocabulary-slice partial instead of
     /// embed's FP32 all-reduce of all rows and their copies (one rank holds each row, so both sums are the row exactly;
     /// the same partials summed in rank order). DS41_SP_EMBED_RS=0: embed of all rows as before.
-    fn sp_embed_parts(&self, ids: &Tensor, parts: &[(i64, i64, i64, i64, i64)]) -> Option<Vec<Tensor>> {
+    fn sp_embed_rs_on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("DS41_SP_EMBED_RS").map_or(true, |v| v != "0")) { return None; }
+        *ON.get_or_init(|| std::env::var("DS41_SP_EMBED_RS").map_or(true, |v| v != "0"))
+    }
+    fn sp_embed_parts(&self, ids: &Tensor, parts: &[(i64, i64, i64, i64, i64)]) -> Option<Vec<Tensor>> {
+        if !Self::sp_embed_rs_on() { return None; }
         let local = ids - self.sp.v0;
         let ok = local.ge(0).logical_and(&local.lt(self.sp.v1 - self.sp.v0));
         let rows = self.embed.index_select(0, &local.clamp(0, self.sp.v1 - self.sp.v0 - 1));
@@ -1079,7 +1082,7 @@ impl Model {
     fn hc_mixes_jobs(&self, h: &Tensor, f: &Tensor, scale: &Tensor, base: &Tensor) -> (Tensor, Tensor, Tensor) {
         static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let on = *E.get_or_init(|| std::env::var("DS41_HC_JOBS").map_or(true, |v| v != "0"));
-        if on && hc_fused() && gemv_on() && moe_mx_on() {
+        if on && hc_fused() && gemv_on() && mx_gemv_ok(h.size()[0], self.c.dim, self.c.dim) {
             if let Some(m) = super::kern::hc_mix_jobs(h, f, scale, base, self.c.norm_eps, self.c.hc_eps, self.c.hc_iters) { return m; }
         }
         self.hc_mixes(h, f, scale, base)
@@ -1137,6 +1140,31 @@ impl Model {
         hashes
     }
 
+    /// Computes engram hash ids for every node of `tree` using each node's exact ancestor token chain
+    /// (without mutating `seq.hist`; `commit_tree` pushes the accepted path later).
+    pub(super) fn hashes_tree(&self, seq: &Seq, tree: &super::tree::VerifyTree) -> Vec<Vec<i64>> {
+        let Some(hs) = &self.hash else { return Vec::new() };
+        let mut hashes = vec![Vec::with_capacity(tree.len() * hs.cols()); hs.layer_ids.len()];
+        let mut ctx = [0i64; 4];
+        for u in 0..tree.len() {
+            let anc = tree.ancestors(u);
+            let take_anc = anc.len().min(4);
+            let need_hist = 4 - take_anc;
+            let h0 = seq.hist.len().saturating_sub(need_hist);
+            let mut len = 0usize;
+            for &h in &seq.hist[h0..] {
+                ctx[len] = h;
+                len += 1;
+            }
+            for &a in &anc[anc.len() - take_anc..] {
+                ctx[len] = hs.compress(tree.ids[a]);
+                len += 1;
+            }
+            hs.at_into(&ctx[..len], &mut hashes);
+        }
+        hashes
+    }
+
     /// Starts loading the engram table rows of `next` (the tokens that will follow `prev`, the raw ids of up to three
     /// tokens before them) into the page cache in the background (prefill: the next chunk while this one runs).
     pub fn engram_prefetch(&self, prev: &[i64], next: &[i64]) {
@@ -1148,11 +1176,44 @@ impl Model {
             let n = hist.len();
             hs.at_into(&hist[n.saturating_sub(4)..], &mut per);
         }
-        let plan = self.sp_plan_pieces(next.len() as i64);
         let enc = self.c.n_layers / 2;
-        let rows: Vec<(usize, Vec<i64>)> = hs.layer_ids.iter().copied().zip(per).filter(|(l, _)| self.layers.iter().any(|x| x.id == *l))
-            .map(|(l, r)| match &plan { Some(p) if l < enc => (l, Self::sp_local_rows(p, &r, hs.cols())), _ => (l, r) }).collect();
-        engram::prefetch(&self.tables, rows, hs.head_dim);
+        let cols = hs.cols();
+        let sub = ced_sub();
+        let has_img = next.iter().any(|&x| crate::mm_canvas::is_salted(x));
+        let pairable = |p: &[i64]| { let t = p.len() as i64; self.sp_eligible(t, enc) && overlap_rows() > 0 && t >= 2 * overlap_rows() && t / 2 > 64 && !p.iter().any(|&x| crate::mm_canvas::is_salted(x)) };
+        let emit = |off: usize, len: usize, plan: Option<Vec<(i64, i64, i64, i64, i64)>>| {
+            let rows: Vec<(usize, Vec<i64>)> = hs.layer_ids.iter().copied().zip(&per)
+                .filter(|(l, _)| self.layers.iter().any(|x| x.id == *l))
+                .map(|(l, r)| {
+                    let sl = &r[off * cols..(off + len) * cols];
+                    match &plan { Some(p) if l < enc => (l, Self::sp_local_rows(p, sl, cols)), _ => (l, sl.to_vec()) }
+                }).collect();
+            engram::prefetch(&self.tables, rows, hs.head_dim);
+        };
+        if sub == 0 || next.len() <= sub {
+            emit(0, next.len(), self.sp_plan(next.len() as i64));
+            return;
+        }
+        let pieces: Vec<&[i64]> = next.chunks(sub).collect();
+        let (mut i, mut off) = (0usize, 0usize);
+        while i < pieces.len() {
+            let a = pieces[i];
+            if !has_img && pair_on() && i + 1 < pieces.len() && pairable(a) && pairable(pieces[i + 1]) {
+                let b = pieces[i + 1];
+                let mut plan = self.sp_plan(a.len() as i64).unwrap_or_default();
+                if let Some(pb) = self.sp_plan(b.len() as i64) {
+                    let al = a.len() as i64;
+                    plan.extend(pb.into_iter().map(|(x, n, l, lo, nr)| (al + x, n, l, lo, nr)));
+                }
+                emit(off, a.len() + b.len(), (!plan.is_empty()).then_some(plan));
+                off += a.len() + b.len();
+                i += 2;
+                continue;
+            }
+            emit(off, a.len(), self.sp_plan(a.len() as i64));
+            off += a.len();
+            i += 1;
+        }
     }
 
     /// Logits [1, vocab] FP32 of the last of `ids` appended to `seq`: one token through the decode graphs, otherwise
@@ -1197,6 +1258,92 @@ impl Model {
             if let Some(h) = self.last_hidden.borrow_mut().take() { hid.push(h); }
         }
         (Tensor::cat(&lg, 0), (!hid.is_empty()).then(|| Tensor::cat(&hid, 0)))
+    }
+
+    /// Tree-aware verification forward (DS41_SPEC_TREE): delegates to `forward_rows_local` with zero overhead when every
+    /// sequence is a linear chain; otherwise evaluates every tree node along its exact ancestor path (Engram, RoPE, window
+    /// attention, ratio-1/ratio-2 compression & indexing) reusing the captured `DecodeGraph` for `total` rows.
+    /// Returns `(local_logits [R, v1 - v0], target_hidden, per_seq_tree_state)` (None for chain sequences).
+    pub fn forward_trees_local(
+        &self,
+        seqs: &mut [&mut Seq],
+        trees: &[super::tree::VerifyTree],
+    ) -> (Tensor, Option<Tensor>, Vec<Option<TreeState>>) {
+        assert_eq!(seqs.len(), trees.len());
+        if trees.iter().all(|t| t.is_chain()) {
+            let ids: Vec<Vec<i64>> = trees.iter().map(|t| t.ids.clone()).collect();
+            let (lg, hid) = self.forward_rows_local(seqs, &ids);
+            return (lg, hid, (0..seqs.len()).map(|_| None).collect());
+        }
+        self.rows_graph_trees(seqs, trees)
+    }
+
+    /// Commit an accepted tree path `path` (`path[0] == 0`, length `k + 1`) produced by `forward_trees_local`.
+    pub fn commit_tree(&self, seq: &mut Seq, rb: super::spec::Rollback, ts: TreeState, path: &[usize]) {
+        let _g = tch::no_grad_guard();
+        let start = ts.start;
+        let k_keep = path.len() as i64;
+        let new_pos = start + k_keep;
+        let is_main_prefix = path.iter().enumerate().all(|(j, &u)| u == j);
+        let path_i64: Vec<i64> = path.iter().map(|&u| u as i64).collect();
+        let path_t = super::kern::upload_i64(&path_i64, self.dev);
+        // 1. Window rings: if main prefix won, rings already hold [0..k_keep) with zero races; just restore rejected tail.
+        //    If an alternate branch won, restore all checkpointed slots and commit the accepted path's keys cleanly.
+        if is_main_prefix {
+            self.restore_ring(seq, &rb, k_keep);
+        } else {
+            self.restore_ring(seq, &rb, 0);
+            let ppos = Tensor::arange_start(start, new_pos, (Kind::Int64, self.dev));
+            let graphs = self.graph.borrow();
+            let g_mid = ts.graph_loc.as_ref().and_then(|(gk, _, _)| graphs.get(gk)).map(|g| &g.mid);
+            for l in 0..self.layers.len() {
+                let acc_kv = if !ts.win_kv.is_empty() {
+                    ts.win_kv[l].index_select(0, &path_t)
+                } else {
+                    let (_, off, len) = ts.graph_loc.as_ref().expect("tree win_kv or graph_loc");
+                    g_mid.expect("tree graph_loc present")[l][3].narrow(0, *off, *len).index_select(0, &path_t)
+                };
+                if ops_fused() && seq.win[l].is_contiguous() {
+                    super::kern::win_commit(&seq.win[l], &acc_kv, &ppos);
+                } else {
+                    let _ = seq.win[l].index_copy_(0, &ppos.remainder(self.c.window), &acc_kv);
+                }
+            }
+        }
+        // 2. Ratio-1 KV sources (e.g. layer 20): copy accepted nodes into [start .. new_pos).
+        for (l, (k_nodes, lat_nodes)) in &ts.kv1 {
+            let _ = seq.ikv.get_mut(l).unwrap().narrow(0, start, k_keep).copy_(&k_nodes.index_select(0, &path_t));
+            let _ = seq.ckv.get_mut(l).unwrap().narrow(0, start, k_keep).copy_(&lat_nodes.index_select(0, &path_t));
+        }
+        // 3. Ratio-2 KV sources (e.g. layers 2, 8, 14): copy accepted odd-position groups and update open cstate.
+        for (l, (kv_p, sc_p, odd_nodes, k_groups, lat_groups, _old_cs)) in &ts.kv2 {
+            let base = start / 2;
+            let acc_slots: Vec<i64> = path.iter()
+                .filter(|&&u| (start + ts.tree.depths[u] as i64) % 2 == 1)
+                .map(|&u| odd_nodes.iter().position(|&x| x == u).expect("odd tree node") as i64)
+                .collect();
+            if !acc_slots.is_empty() {
+                let ng = acc_slots.len() as i64;
+                let st = super::kern::upload_i64(&acc_slots, self.dev);
+                let _ = seq.ikv.get_mut(l).unwrap().narrow(0, base, ng).copy_(&k_groups.index_select(0, &st));
+                let _ = seq.ckv.get_mut(l).unwrap().narrow(0, base, ng).copy_(&lat_groups.index_select(0, &st));
+            }
+            if new_pos % 2 == 1 {
+                let last_u = *path.last().unwrap() as i64;
+                let (ks, ss) = seq.cstate.get_mut(l).unwrap();
+                let _ = ks.narrow(0, 0, 1).copy_(&kv_p.narrow(0, last_u, 1));
+                let _ = ss.narrow(0, 0, 1).copy_(&sc_p.narrow(0, last_u, 1));
+            }
+        }
+        // 4. Engram history + positions.
+        if let Some(hs) = &self.hash {
+            for &u in path {
+                seq.hist.push(hs.compress(ts.tree.ids[u]));
+            }
+        }
+        seq.pos = new_pos;
+        seq.dec_pos = new_pos;
+        seq.hw = seq.hw.max(new_pos);
     }
 
     fn rows_graph(&self, seqs: &mut [&mut Seq], ids: &[Vec<i64>]) -> (Tensor, Option<Tensor>) {
@@ -1572,6 +1719,500 @@ impl Model {
         }
     }
 
+    /// Tree-aware verification forward (DS41_SPEC_TREE). Reuses already-captured `DecodeGraph` (including `MidGraph`
+    /// with per-row ancestor tables and null ring pointers for branch rows) when available, falling back to an exact
+    /// eager layer loop otherwise.
+    fn rows_graph_trees(
+        &self,
+        seqs: &mut [&mut Seq],
+        trees: &[super::tree::VerifyTree],
+    ) -> (Tensor, Option<Tensor>, Vec<Option<TreeState>>) {
+        let _g = tch::no_grad_guard();
+        let _wide = super::kern::WideScope::new();
+        let c = &self.c;
+        let dev = self.dev;
+        let key: Vec<usize> = trees.iter().map(|t| t.len()).collect();
+        let offs: Vec<i64> = key.iter().scan(0i64, |a, &n| { let o = *a; *a += n as i64; Some(o) }).collect();
+        let total: i64 = key.iter().sum::<usize>() as i64;
+        let starts: Vec<i64> = seqs.iter().zip(trees).map(|(s, t)| {
+            let need = if t.is_chain() { t.len() as i64 } else { (t.len() as i64) * 2 };
+            assert!(s.pos + need <= s.cap, "sequence capacity {} exceeded", s.cap);
+            s.pos
+        }).collect();
+        let hashes: Vec<Vec<Vec<i64>>> = seqs.iter_mut().zip(trees).map(|(s, t)| {
+            if t.is_chain() { self.push_hashes(s, &t.ids) } else { self.hashes_tree(s, t) }
+        }).collect();
+        let flat: Vec<i64> = trees.iter().flat_map(|t| t.ids.iter().copied()).collect();
+        let e = self.embed(&super::kern::upload_i64(&flat, dev));
+        let engram_layers: Vec<usize> = self.hash.as_ref().map_or(vec![], |h| h.layer_ids.iter().copied().filter(|l| self.layers.iter().any(|x| x.id == *l)).collect());
+        let rows_now = |li: usize, l: usize| -> Tensor {
+            let all: Vec<i64> = hashes.iter().flat_map(|h| h[li].iter().copied()).collect();
+            self.engram_rows(l, &all, total)
+        };
+        let posv: Vec<i64> = starts.iter().zip(trees).flat_map(|(&st, t)| t.depths.iter().map(move |&d| st + d as i64)).collect();
+        let pos_now = super::kern::upload_i64(&posv, dev);
+        let want_hid = self.mtp.is_some();
+        let anc_tabs: Vec<Vec<[u8; 16]>> = trees.iter().map(|t| t.anc_table()).collect();
+        let anc_tensors: Vec<Option<Tensor>> = trees.iter().zip(&anc_tabs).map(|(t, tab)| {
+            if t.is_chain() { return None; }
+            let flat_anc: Vec<i64> = tab.iter().flat_map(|r| r.iter().map(|&x| x as i64)).collect();
+            Some(super::kern::upload_i64(&flat_anc, dev).view([t.len() as i64, 16]))
+        }).collect();
+        let main_masks: Vec<Vec<bool>> = trees.iter().map(|t| t.main_chain_mask()).collect();
+        let mut tstates: Vec<Option<TreeState>> = trees.iter().zip(&starts).map(|(t, &st)| {
+            (!t.is_chain()).then(|| TreeState {
+                tree: t.clone(),
+                start: st,
+                win_kv: Vec::new(),
+                graph_loc: None,
+                kv1: HashMap::new(),
+                kv2: HashMap::new(),
+                tail_map: HashMap::new(),
+                tail_cnt: HashMap::new(),
+                idx_maps: HashMap::new(),
+            })
+        }).collect();
+        let mut sh: Vec<Shared> = (0..seqs.len()).map(|_| Shared::default()).collect();
+
+        let run_mid_tree = |layer: &Layer, mid: &[Tensor; 4], pos: &Tensor, obuf: Option<&Tensor>,
+                            sh: &mut Vec<Shared>, seqs: &mut [&mut Seq], tstates: &mut [Option<TreeState>]| -> Option<Tensor> {
+            let [x, qr, q, kv] = mid;
+            let mut outs = Vec::new();
+            for (b, seq) in seqs.iter_mut().enumerate() {
+                let n = key[b] as i64;
+                let r = |t: &Tensor| t.narrow(0, offs[b], n);
+                let into = obuf.map(|ob| ob.narrow(0, offs[b], n));
+                let o = if let Some(ts) = tstates[b].as_mut() {
+                    self.attn_mid_tree(layer, &r(x), &r(qr), &r(q), &r(kv), seq, &r(pos), starts[b],
+                                       &anc_tabs[b], anc_tensors[b].as_ref().unwrap(), &mut sh[b], ts, into.as_ref())
+                } else {
+                    self.attn_mid(layer, &r(x), &r(qr), &r(q), &r(kv), seq, &r(pos), starts[b], &mut sh[b], into.as_ref())
+                };
+                if obuf.is_none() { outs.push(o); }
+            }
+            obuf.is_none().then(|| Tensor::cat(&outs, 0))
+        };
+
+        let gkey: Vec<usize> = vec![total as usize];
+        self.graph_clock.set(self.graph_clock.get() + 1);
+        let mut graphs = self.graph.borrow_mut();
+        if graph_on() && !parity() && dump_layers().is_empty() {
+            if let Some(g) = graphs.get_mut(&gkey) {
+                g.used = self.graph_clock.get();
+                let _ = g.pos.copy_(&pos_now);
+                let _ = g.h0.copy_(&e.unsqueeze(1).expand([total, c.hc, c.dim], false));
+                let jit = engram_jit_on();
+                let upload = |l: usize, rows: &mut HashMap<usize, Tensor>| {
+                    if let Some(li) = engram_layers.iter().position(|x| *x == l) {
+                        if let Some(r) = rows.get_mut(&l) { let _ = r.copy_(&prof("engram", || rows_now(li, l))); }
+                    }
+                };
+                if !jit { for &l in &engram_layers { upload(l, &mut g.rows); } }
+                if g.mg.is_some() {
+                    let DecodeGraph { mg, rows, mid, pos, obuf, .. } = &mut *g;
+                    let mg = mg.as_ref().unwrap();
+                    let cur = mg.calls.get() % 2;
+                    mg.fence[cur].sync();
+                    for k in 0..mg.segs.len() {
+                        if jit { for &l in &mg.seg_eng[k] { upload(l, rows); } }
+                        if let (Some(&f), Some(&last)) = (mg.seg_layers[k].first(), mg.seg_layers[k].last()) {
+                            let buf = pinned_bytes(&mg.host[cur]);
+                            for &i in &mg.seg_layers[k] {
+                                assert!(self.mid_fill_trees(&self.layers[i], &mid[i][3], pos, seqs, trees, &anc_tabs, &main_masks,
+                                                            &tstates, &offs, &key, &starts, &mut sh, mg.rings_at, &mut buf[i * mg.slot..(i + 1) * mg.slot]),
+                                        "captured attention middle no longer applicable (tree)");
+                            }
+                            super::kern::h2d(unsafe { (mg.desc.data_ptr() as *mut u8).add(f * mg.slot) }.cast(), &buf[f * mg.slot..(last + 1) * mg.slot]);
+                        }
+                        prof("graph.seg", || mg.segs[k].replay());
+                        if let Some(&Some(i)) = mg.eager.get(k) {
+                            let _ = run_mid_tree(&self.layers[i], &mid[i], pos, Some(&obuf[i]), &mut sh, seqs, &mut tstates);
+                        }
+                    }
+                    mg.fence[cur].record();
+                    mg.calls.set(mg.calls.get() + 1);
+                    prof("graph.fin", || g.fin.replay());
+                } else {
+                    for (i, layer) in self.layers.iter().enumerate() {
+                        if jit { upload(layer.id, &mut g.rows); }
+                        prof("graph.s1", || g.s1[i].replay());
+                        let _ = run_mid_tree(layer, &g.mid[i], &g.pos, Some(&g.obuf[i]), &mut sh, seqs, &mut tstates);
+                        prof("graph.s3", || g.s3[i].replay());
+                    }
+                    prof("graph.fin", || g.fin.replay());
+                }
+                for b in 0..seqs.len() {
+                    if let Some(ts) = tstates[b].as_mut() {
+                        ts.graph_loc = Some((gkey.clone(), offs[b], key[b] as i64));
+                    } else {
+                        seqs[b].advance(key[b] as i64);
+                    }
+                }
+                return (g.logits.copy(), g.hid.as_ref().map(|h| h.copy()), tstates);
+            }
+        }
+        drop(graphs);
+        // Eager tree fallback (used when graph for `total` is not yet captured or DS41_GRAPH=0 / kernel tests).
+        let mut h = e.unsqueeze(1).repeat([1, c.hc, 1]).contiguous();
+        let mut pre_mix = Tensor::zeros([total, c.hc], (Kind::Float, dev));
+        let _ = pre_mix.narrow(1, 0, 1).fill_(1.0);
+        let mut hid_parts = Vec::new();
+        for layer in &self.layers {
+            let l = layer.id;
+            let hh = match (&layer.engram, engram_layers.iter().position(|&x| x == l)) {
+                (Some(en), Some(li)) => self.engram(en, &h, &rows_now(li, l)),
+                _ => h.shallow_clone(),
+            };
+            if want_hid && c.dspark_targets.contains(&l) { hid_parts.push(hh.mean_dim([1].as_slice(), false, Kind::BFloat16)); }
+            let (a_pre, a_post, a_comb) = self.hc_mixes(&hh, &layer.hc.attn_fn, &layer.hc.attn_scale, &layer.hc.attn_base);
+            let x = site_z(&layer.attn_norm, &Self::hc_pre(&hh, &pre_mix), c.norm_eps);
+            let (qr, q, kv) = self.attn_in(layer, &x, &pos_now);
+            for b in 0..seqs.len() {
+                if let Some(ts) = tstates[b].as_mut() { ts.win_kv.push(kv.narrow(0, offs[b], key[b] as i64).copy()); }
+            }
+            let m4 = [x, qr, q, kv];
+            let o = run_mid_tree(layer, &m4, &pos_now, None, &mut sh, seqs, &mut tstates).unwrap();
+            let y = self.attn_out(layer, &o, &pos_now);
+            let h2 = Self::hc_post(&y, &hh, &a_post, &a_comb);
+            let (f_pre, f_post, f_comb) = self.hc_mixes(&h2, &layer.hc.ffn_fn, &layer.hc.ffn_scale, &layer.hc.ffn_base);
+            let x2 = site_z(&layer.ffn_norm, &Self::hc_pre(&h2, &a_pre), c.norm_eps);
+            let m = self.moe(&layer.moe, &x2);
+            h = Self::hc_post(&m, &h2, &f_post, &f_comb);
+            pre_mix = f_pre;
+        }
+        let xf = crate::ablate::clamp_final(rmsn(&Self::hc_pre(&h, &pre_mix), &self.norm, c.norm_eps));
+        let logits = self.logits_local(&xf);
+        let hid = (!hid_parts.is_empty()).then(|| Tensor::cat(&hid_parts, 1));
+        for b in 0..seqs.len() {
+            if tstates[b].is_none() { seqs[b].advance(key[b] as i64); }
+        }
+        (logits, hid, tstates)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mid_fill_trees(
+        &self, layer: &Layer, kv: &Tensor, pos: &Tensor, seqs: &mut [&mut Seq],
+        trees: &[super::tree::VerifyTree], anc_tabs: &[Vec<[u8; 16]>], main_masks: &[Vec<bool>],
+        tstates: &[Option<TreeState>], offs: &[i64], key: &[usize], starts: &[i64], sh: &mut [Shared],
+        rings_at: usize, buf: &mut [u8],
+    ) -> bool {
+        let c = &self.c;
+        let l = layer.id;
+        let ratio = c.compress[l];
+        let v: Vec<(Tensor, Tensor, Option<Tensor>, Tensor, i64, i64)> = seqs.iter_mut().enumerate().map(|(b, seq)| {
+            let n = key[b] as i64;
+            let kb = kv.narrow(0, offs[b], n);
+            let ring = seq.win[l].shallow_clone();
+            let (ckv, ci) = if ratio > 0 {
+                let src = c.kv_source_of(l).expect("compressed layer without KV source");
+                let clen = match &tstates[b] {
+                    Some(ts) => starts[b] / ratio + ts.tail_cnt[&src],
+                    None => (starts[b] + n) / ratio,
+                };
+                (Some(seq.ckv[&src].narrow(0, 0, clen.max(1))), sh[b].topk.as_ref().expect("no index source before reuse layer").shallow_clone())
+            } else {
+                (None, Tensor::empty([n, 0], (Kind::Int64, self.dev)))
+            };
+            (ring, kb, ckv, ci, starts[b], sh[b].win_lo)
+        }).collect();
+        if v.iter().any(|s| !s.0.is_contiguous() || s.0.kind() != Kind::BFloat16) { return false; }
+        let refs: Vec<_> = v.iter().enumerate().map(|(b, (a, kb, cc, ix, st, lo))| {
+            let anc = (!trees[b].is_chain()).then_some(anc_tabs[b].as_slice());
+            (a, kb, cc.as_ref(), ix, *st, *lo, anc)
+        }).collect();
+        if super::kern::attn_multi_build_tree(&refs, c.window, pos, self.sp.local_heads(c), &mut buf[..rings_at]) != Some(true) {
+            return false;
+        }
+        let mut row = 0usize;
+        for (b, s) in v.iter().enumerate() {
+            let ptr = s.0.data_ptr() as u64;
+            for u in 0..key[b] {
+                let wptr = if trees[b].is_chain() || main_masks[b][u] { ptr } else { 0u64 };
+                buf[rings_at + 8 * row..rings_at + 8 * row + 8].copy_from_slice(&wptr.to_le_bytes());
+                row += 1;
+            }
+        }
+        true
+    }
+
+    /// Exact tree middle for one sequence: tree compression, true-position tree indexing, ancestor-masked window attention,
+    /// and main-chain-only window ring commit (branch nodes committed later only if accepted).
+    #[allow(clippy::too_many_arguments)]
+    fn attn_mid_tree(
+        &self, layer: &Layer, x: &Tensor, qr: &Tensor, q: &Tensor, kv: &Tensor, seq: &mut Seq,
+        pos: &Tensor, start: i64, anc_tab: &[[u8; 16]], anc_t: &Tensor, sh: &mut Shared, ts: &mut TreeState, into: Option<&Tensor>,
+    ) -> Tensor {
+        let c = &self.c;
+        let l = layer.id;
+        let n = x.size()[0];
+        let w = c.window;
+        let ring = seq.win[l].shallow_clone();
+        let mut ckv = None;
+        let mut ci = Tensor::empty([n, 0], (Kind::Int64, self.dev));
+        let ratio = c.compress[l];
+        if ratio > 0 {
+            let src = c.kv_source_of(l).expect("compressed layer without KV source");
+            if c.is_kv_source(l) && !sh.skip_compress {
+                prof("attn.compress", || self.compress_tree(layer, x, seq, pos, start, ts));
+            }
+            let clen_tmp = start / ratio + ts.tail_cnt[&src];
+            if c.is_index_source(l) {
+                sh.topk = Some(prof("attn.indexer", || self.indexer_tree(layer, x, qr, seq, pos, start, src, ratio, w + n, sh, ts)));
+            }
+            ci = sh.topk.as_ref().expect("no index source before reuse layer").shallow_clone();
+            ckv = Some(seq.ckv[&src].narrow(0, 0, clen_tmp.max(1)));
+        }
+        let scale = (c.head_dim as f64).powf(-0.5);
+        // Fast single-launch path (no arange/kpos/gather/where/cat): sparse_attn_multi_tree reads anc_tab directly.
+        let o = if attn_fused() && n <= 16 {
+            let ob = match into {
+                Some(b) if b.is_contiguous() && b.kind() == Kind::BFloat16 && b.size() == q.size() => b.shallow_clone(),
+                _ => Tensor::empty_like(q),
+            };
+            let ok = prof("attn.sparse", || super::kern::sparse_attn_multi_tree(q, &[(&ring, kv, ckv.as_ref(), &ci, start, sh.win_lo, Some(anc_tab))], w, pos, &layer.attn.sink, scale, &ob));
+            if ok {
+                match into {
+                    Some(b) if !b.is_set_to(&ob) => { let mut b = b.shallow_clone(); let _ = b.copy_(&ob); b }
+                    _ => ob,
+                }
+            } else {
+                let off = Tensor::arange(w, (Kind::Int64, self.dev));
+                let kpos = pos.unsqueeze(-1) - (w - 1) + off.unsqueeze(0);
+                let d = (&kpos - start).clamp(0, 15);
+                let anc_slot = anc_t.gather(1, &d, false) + w;
+                let widx = anc_slot.where_self(&kpos.ge(start), &kpos.remainder(w)).masked_fill(&kpos.lt(sh.win_lo.max(0)), -1);
+                let full_idx = Tensor::cat(&[widx, ci], 1);
+                let o2 = prof("attn.sparse", || {
+                    super::kern::sparse_attn_into(q, [Some(&ring), Some(kv), ckv.as_ref()], None, sh.win_lo, &full_idx, &layer.attn.sink, scale, into)
+                        .unwrap_or_else(|| {
+                            let mut full = vec![ring.shallow_clone(), kv.shallow_clone()];
+                            if let Some(k) = &ckv { full.push(k.shallow_clone()); }
+                            ops::sparse_attn(q, &Tensor::cat(&full, 0), &full_idx, &layer.attn.sink, scale, 256)
+                        })
+                });
+                match into {
+                    Some(b) if !b.is_set_to(&o2) => { let mut b = b.shallow_clone(); let _ = b.copy_(&o2); b }
+                    _ => o2,
+                }
+            }
+        } else {
+            let off = Tensor::arange(w, (Kind::Int64, self.dev));
+            let kpos = pos.unsqueeze(-1) - (w - 1) + off.unsqueeze(0);
+            let d = (&kpos - start).clamp(0, 15);
+            let anc_slot = anc_t.gather(1, &d, false) + w;
+            let widx = anc_slot.where_self(&kpos.ge(start), &kpos.remainder(w)).masked_fill(&kpos.lt(sh.win_lo.max(0)), -1);
+            let full_idx = Tensor::cat(&[widx, ci], 1);
+            let o2 = prof("attn.sparse", || {
+                attn_fused().then(|| super::kern::sparse_attn_into(q, [Some(&ring), Some(kv), ckv.as_ref()], None, sh.win_lo, &full_idx, &layer.attn.sink, scale, into)).flatten()
+                    .unwrap_or_else(|| {
+                        let mut full = vec![ring.shallow_clone(), kv.shallow_clone()];
+                        if let Some(k) = &ckv { full.push(k.shallow_clone()); }
+                        ops::sparse_attn(q, &Tensor::cat(&full, 0), &full_idx, &layer.attn.sink, scale, 256)
+                    })
+            });
+            match into {
+                Some(b) if !b.is_set_to(&o2) => { let mut b = b.shallow_clone(); let _ = b.copy_(&o2); b }
+                _ => o2,
+            }
+        };
+        // Commit only the main chain rows into seq.win[l] (unique positions, zero sibling race).
+        let main_len = ts.tree.main_chain_len() as i64;
+        self.attn_commit(layer, seq, &kv.narrow(0, 0, main_len), &pos.narrow(0, 0, main_len), start);
+        o
+    }
+
+    fn compress_tree(&self, layer: &Layer, x: &Tensor, seq: &mut Seq, pos: &Tensor, start: i64, ts: &mut TreeState) {
+        let c = &self.c;
+        let l = layer.id;
+        let a = &layer.attn;
+        let cm = a.comp.as_ref().unwrap();
+        let ratio = c.compress[l];
+        let n = ts.tree.len();
+        let proj = self.comp_proj(layer, x);
+        if ratio == 1 {
+            let latent = rmsn(&proj, &cm.norm, c.norm_eps);
+            let k_nodes = if let Some(ix) = &a.idx {
+                if let (Some(wk), Some(kn)) = (&ix.wk, &ix.k_norm) {
+                    let k = rmsn(&latent.matmul(&wk.tr()), kn, c.norm_eps);
+                    Some(fp4q(&rot_mut(k, &a.rope, pos, c.rope_dim, false), 32, false))
+                } else { None }
+            } else { None };
+            let lat_nodes = fp4q(&rot_mut(latent, &a.rope, pos, c.rope_dim, false), 16, true);
+            if let Some(kn) = &k_nodes {
+                let _ = seq.ikv.get_mut(&l).unwrap().narrow(0, start, n as i64).copy_(kn);
+            }
+            let _ = seq.ckv.get_mut(&l).unwrap().narrow(0, start, n as i64).copy_(&lat_nodes);
+            let tmap: Vec<Vec<usize>> = (0..n).map(|u| ts.tree.ancestors(u)).collect();
+            ts.tail_map.insert(l, tmap);
+            ts.tail_cnt.insert(l, n as i64);
+            if let Some(kn) = k_nodes {
+                ts.kv1.insert(l, (kn, lat_nodes));
+            }
+            return;
+        }
+        assert_eq!(ratio, 2, "compress_tree: expected ratio 1 or 2, got {ratio}");
+        let hd = c.head_dim;
+        let (kv_p, sc_p) = (proj.narrow(1, 0, hd), proj.narrow(1, hd, hd));
+        let old_cs = {
+            let (ks, ss) = seq.cstate.get(&l).unwrap();
+            (ks.copy(), ss.copy())
+        };
+        let base = start / 2;
+        let odd_nodes: Vec<usize> = (0..n).filter(|&u| (start + ts.tree.depths[u] as i64) % 2 == 1).collect();
+        let m = odd_nodes.len();
+        let (k_groups, lat_groups) = if m > 0 {
+            let mut kpairs = Vec::with_capacity(m);
+            let mut spairs = Vec::with_capacity(m);
+            let mut gpos_v = Vec::with_capacity(m);
+            for &u in &odd_nodes {
+                let (pkv, psc) = if u == 0 {
+                    (old_cs.0.narrow(0, 0, 1), old_cs.1.narrow(0, 0, 1))
+                } else {
+                    let p = ts.tree.parents[u] as i64;
+                    (kv_p.narrow(0, p, 1), sc_p.narrow(0, p, 1))
+                };
+                kpairs.push(Tensor::cat(&[pkv, kv_p.narrow(0, u as i64, 1)], 0));
+                spairs.push(Tensor::cat(&[psc, sc_p.narrow(0, u as i64, 1)], 0));
+                gpos_v.push(((start + ts.tree.depths[u] as i64) / 2) * 2);
+            }
+            let kvg = Tensor::stack(&kpairs, 0);
+            let scg = Tensor::stack(&spairs, 0).softmax(1, Kind::Float);
+            let lat = (kvg * scg).sum_dim_intlist([1].as_slice(), false, Kind::Float);
+            let latent = rmsn(&bf16(lat), &cm.norm, c.norm_eps);
+            let gpos = super::kern::upload_i64(&gpos_v, self.dev);
+            let kg = if let Some(ix) = &a.idx {
+                if let (Some(wk), Some(kn)) = (&ix.wk, &ix.k_norm) {
+                    let k = rmsn(&latent.matmul(&wk.tr()), kn, c.norm_eps);
+                    let k = fp4q(&rot_mut(k, &a.rope, &gpos, c.rope_dim, false), 32, false);
+                    let _ = seq.ikv.get_mut(&l).unwrap().narrow(0, base, m as i64).copy_(&k);
+                    k
+                } else { Tensor::empty([0, c.index_dim], (Kind::BFloat16, self.dev)) }
+            } else { Tensor::empty([0, c.index_dim], (Kind::BFloat16, self.dev)) };
+            let lg = fp4q(&rot_mut(latent, &a.rope, &gpos, c.rope_dim, false), 16, true);
+            let _ = seq.ckv.get_mut(&l).unwrap().narrow(0, base, m as i64).copy_(&lg);
+            (kg, lg)
+        } else {
+            (Tensor::empty([0, c.index_dim], (Kind::BFloat16, self.dev)), Tensor::empty([0, hd], (Kind::BFloat16, self.dev)))
+        };
+        let tmap: Vec<Vec<usize>> = (0..n).map(|u| {
+            ts.tree.ancestors(u).into_iter()
+                .filter(|&a| (start + ts.tree.depths[a] as i64) % 2 == 1)
+                .map(|a| odd_nodes.iter().position(|&x| x == a).unwrap())
+                .collect()
+        }).collect();
+        ts.tail_map.insert(l, tmap);
+        ts.tail_cnt.insert(l, m as i64);
+        ts.kv2.insert(l, (kv_p, sc_p, odd_nodes, k_groups, lat_groups, old_cs));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn indexer_tree(
+        &self, layer: &Layer, x: &Tensor, qr: &Tensor, seq: &Seq, pos: &Tensor, start: i64,
+        src: usize, ratio: i64, offset: i64, sh: &mut Shared, ts: &mut TreeState,
+    ) -> Tensor {
+        let c = &self.c;
+        let l = layer.id as i64;
+        let n = ts.tree.len() as i64;
+        let base = start / ratio;
+        let m = ts.tail_cnt[&src];
+        let clen_tmp = base + m;
+        let max_clen = (start + ts.tree.max_depth() as i64 + 1) / ratio;
+        let k_top = c.index_topk.min(max_clen);
+        let is_cand = l == c.candidate_source;
+        let use_cand = !is_cand && c.candidate_source >= 0 && c.candidate_source < l;
+        if k_top == 0 {
+            if is_cand { sh.candidates = None; }
+            return Tensor::full([n, 0], -1, (Kind::Int64, self.dev));
+        }
+        let (q, wts) = self.index_q(layer, x, qr, pos);
+        let k_pool = seq.ikv[&src].narrow(0, 0, clen_tmp.max(1));
+        let t_true = max_clen - base;
+        if m > 0 && t_true > 0 && !ts.idx_maps.contains_key(&src) {
+            let tmap = &ts.tail_map[&src];
+            let mut gi = Vec::with_capacity((n * t_true) as usize);
+            let mut si = Vec::with_capacity((n * t_true) as usize);
+            let mut vt = Vec::with_capacity((n * t_true) as usize);
+            for u in 0..n as usize {
+                for g_off in 0..t_true as usize {
+                    if g_off < tmap[u].len() {
+                        let s = tmap[u][g_off] as i64;
+                        gi.push(s); si.push(s); vt.push(1i64);
+                    } else {
+                        gi.push(0); si.push(m); vt.push(0i64);
+                    }
+                }
+            }
+            // Async pinned staged_upload (never pageable to_device, which drains the CUDA stream!).
+            let g_t = super::kern::upload_i64(&gi, self.dev).view([n, t_true]);
+            let s_t = super::kern::upload_i64(&si, self.dev).view([n, t_true]);
+            let v_t = super::kern::upload_i64(&vt, self.dev).view([n, t_true]).ne(0);
+            ts.idx_maps.insert(src, (g_t, s_t, v_t));
+        }
+        let (gather_idx, scatter_idx, valid_true) = match ts.idx_maps.get(&src) {
+            Some((g, s, v)) => (Some(g.shallow_clone()), Some(s.shallow_clone()), Some(v.shallow_clone())),
+            None => (None, None, None),
+        };
+        let cand_tmp = if use_cand {
+            let cand_true = sh.candidates.as_ref().expect("candidate source not run");
+            if let (Some(si), Some(vt)) = (&scatter_idx, &valid_true) {
+                let c_tail = Tensor::zeros([n, m + 1], (Kind::Bool, self.dev))
+                    .scatter(1, si, &cand_true.narrow(1, base, t_true).logical_and(vt))
+                    .narrow(1, 0, m);
+                Some(if base > 0 { Tensor::cat(&[cand_true.narrow(1, 0, base), c_tail], 1) } else { c_tail })
+            } else {
+                Some(cand_true.narrow(1, 0, clen_tmp))
+            }
+        } else {
+            None
+        };
+        let pos_all = Tensor::full([n], clen_tmp * ratio - 1, (Kind::Int64, self.dev));
+        let (nh, id) = (c.index_heads, c.index_dim);
+        let fused = attn_fused() && nh == 32 && id == 128;
+        static CAND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let cand_k = *CAND.get_or_init(|| std::env::var("DS41_INDEX_CAND").map_or(true, |v| v != "0"));
+        let pre = match (&cand_tmp, fused && cand_k && !is_cand) {
+            (Some(cd), true) => prof("idx.score_cand", || super::kern::index_score_cand(&q, &k_pool, &wts, &pos_all, ratio, cd)),
+            _ => None,
+        };
+        let masked = pre.is_some();
+        let mut score_tmp = if let Some(s) = pre { s } else if fused {
+            prof("idx.score", || super::kern::index_score(&q, &k_pool, &wts, &pos_all, ratio))
+        } else {
+            let s = q.matmul(&k_pool.tr().unsqueeze(0)).relu();
+            (s * wts.unsqueeze(-1)).sum_dim_intlist([1].as_slice(), false, Kind::BFloat16)
+        };
+        if let (Some(cd), false) = (&cand_tmp, masked) {
+            score_tmp = score_tmp.masked_fill(&cd.logical_not(), f64::NEG_INFINITY);
+        }
+        // Remap temporary tail slots into each node's exact true compressed positions [0 .. max_clen).
+        let score_true = if let (Some(gi), Some(vt)) = (&gather_idx, &valid_true) {
+            let s_tail = score_tmp.narrow(1, base, m).gather(1, gi, false).masked_fill(&vt.logical_not(), f64::NEG_INFINITY);
+            if base > 0 { Tensor::cat(&[score_tmp.narrow(1, 0, base), s_tail], 1) } else { s_tail }
+        } else {
+            score_tmp.narrow(1, 0, max_clen)
+        };
+        let lens = (pos + 1).floor_divide_scalar(ratio);
+        if is_cand {
+            sh.candidates = Some(prof("idx.cand_sel", || select_candidate_blocks(&score_true, &lens, c.candidate_topk_blocks, c.candidate_block)));
+        }
+        let ids_true = if ops_fused() && topk_fused() {
+            prof("idx.topk", || super::kern::topk_idx(&score_true, pos, ratio, k_top, 0))
+        } else {
+            let (_, ids) = score_true.topk(k_top, -1, true, false);
+            let (ids, _) = ids.sort(-1, false);
+            ids.masked_fill(&ids.ge_tensor(&lens.unsqueeze(-1)), -1)
+        };
+        if let Some(gi) = &gather_idx {
+            let is_tail = ids_true.ge(base);
+            let rel = (ids_true.clamp_min(base) - base).clamp_max(t_true - 1);
+            let mapped = gi.gather(1, &rel, false) + base;
+            let ids_local = mapped.where_self(&is_tail, &ids_true);
+            (&ids_local + offset).masked_fill(&ids_true.lt(0), -1)
+        } else {
+            (&ids_true + offset).masked_fill(&ids_true.lt(0), -1)
+        }
+    }
+
     /// One chunk: tokens `ids` at positions [seq.pos, seq.pos + T). Returns the final hidden states [T, dim] BF16 of the
     /// rows in `keep` (all rows when None), and commits the chunk to `seq`.
     pub fn forward(&self, seq: &mut Seq, ids: &[i64], keep: Option<&[i64]>) -> Tensor {
@@ -1629,7 +2270,7 @@ impl Model {
         let has_img = ids.iter().any(|&x| crate::mm_canvas::is_salted(x));
         let pieces: Vec<&[i64]> = ids.chunks(sub).collect();
         let enc = self.c.n_layers / 2;
-        let pairable = |p: &[i64]| { let t = p.len() as i64; self.sp_eligible(t, enc) && overlap_rows() > 0 && t >= 2 * overlap_rows() && !p.iter().any(|&x| crate::mm_canvas::is_salted(x)) };
+        let pairable = |p: &[i64]| { let t = p.len() as i64; self.sp_eligible(t, enc) && overlap_rows() > 0 && t >= 2 * overlap_rows() && t / 2 > 64 && !p.iter().any(|&x| crate::mm_canvas::is_salted(x)) };
         let (mut out, mut i, mut off) = (None, 0, 0i64);
         while i < pieces.len() {
             let a = pieces[i];
@@ -1684,12 +2325,12 @@ impl Model {
             }
         }
         let ids_t = Tensor::from_slice(ids).to_device(dev);
-        let two = overlap_rows() > 0 && t >= 2 * overlap_rows();
+        let two = overlap_rows() > 0 && t >= 2 * overlap_rows() && t / 2 > 64;
         // the two-micro-batch sequence-parallel encoder without image rows embeds this rank's rows only (sp_embed_parts);
         // with image rows every rank takes embed_vis's all-reduce (rank 0 adds the rows). Decided from the salted
         // placeholders, not seq.vis (rank 0 only): the ranks must issue the same collectives
         let has_img = ids.iter().any(|&x| crate::mm_canvas::is_salted(x));
-        let sp_ids = (self.sp_eligible(t, enc) && two && !has_img).then_some(&ids_t);
+        let sp_ids = (self.sp_eligible(t, enc) && two && !has_img && Self::sp_embed_rs_on()).then_some(&ids_t);
         let mut h = if sp_ids.is_some() { Tensor::new() } else { self.embed_vis(&ids_t, seq.vis.take()).unsqueeze(1).repeat([1, c.hc, 1]) };
         let vl = vl_set(self.image_rows(seq, start, start + t));
         let mut pre_mix = Tensor::zeros([t, c.hc], (Kind::Float, dev));
@@ -1961,8 +2602,12 @@ impl Model {
     /// the fused row kernels, no capture / dump hook and no unfused clamp (they see whole chunks; the fused clamp's count
     /// gate takes each rank's global row base, sp_z) and no DSpark target among the encoder layers (their hidden rows are
     /// taken per layer).
+    fn rdma_arn_on() -> bool {
+        extern "C" { fn rs_rdma_arn_on() -> i32; }
+        unsafe { rs_rdma_arn_on() != 0 }
+    }
     fn sp_eligible(&self, t: i64, enc: usize) -> bool {
-        self.sp.world > 1 && sp_on() && t >= sp_rows() && hc_fused() && ops_fused() && gemv_on() && !crate::tp::graph::capturing()
+        self.sp.world > 1 && Self::rdma_arn_on() && sp_on() && t >= sp_rows() && hc_fused() && ops_fused() && gemv_on() && !crate::tp::graph::capturing()
             && !crate::ablate::unfused_active() && !crate::ablate::capturing() && dump_layers().is_empty()
             && !(self.mtp.is_some() && self.c.dspark_targets.iter().any(|&l| l < enc))
     }
@@ -2016,7 +2661,7 @@ impl Model {
         let enc = self.c.n_layers / 2;
         if !self.sp_eligible(t, enc) { return None; }
         let w = self.sp.world as i64;
-        let two = overlap_rows() > 0 && t >= 2 * overlap_rows();
+        let two = overlap_rows() > 0 && t >= 2 * overlap_rows() && t / 2 > 64;
         let rows = if two { vec![(0, t / 2), (t / 2, t - t / 2)] } else { vec![(0, t)] };
         Some(rows.into_iter().map(|(a, n)| { let l = (n + w - 1) / w; let lo = self.sp.rank as i64 * l; (a, n, l, lo, (n - lo).clamp(0, l)) }).collect())
     }
@@ -2215,7 +2860,7 @@ impl Model {
                 fronts.push((SpPending::ag(x, n), residual, a_pre, a_post, a_comb));
             }
             // every part's FFN input, then one MoE call (the routed experts' weights read once per pass)
-            let fp8 = self.ffn_ag_fp8_ok(&layer.moe, groups, t);
+            let fp8 = self.ffn_ag_fp8_ok(&layer.moe, parts, groups, t);
             let mut x2s = Vec::new();
             let x2buf = Tensor::empty([if fp8 { 0 } else { x2rows }, c.dim], (Kind::BFloat16, self.dev));
             let mut ctx = Vec::new();
@@ -2340,10 +2985,11 @@ impl Model {
     /// input into exactly these operands, so the result is the same bits. Needs the fused block-scaled paths, every MoE
     /// group > 64 rows (the shared expert over all rows on the FP8 GEMM, the router's FP32 matmul) and no image rows
     /// (their VL routing bias).
-    fn ffn_ag_fp8_ok(&self, m: &Moe, groups: &[(i64, i64)], t: i64) -> bool {
+    fn ffn_ag_fp8_ok(&self, m: &Moe, parts: &[(i64, i64, i64, i64, i64)], groups: &[(i64, i64)], t: i64) -> bool {
         static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *E.get_or_init(|| std::env::var("DS41_FFN_AG_FP8").map_or(true, |v| v != "0"))
-            && ops_fused() && gemv_on() && moe_mx_on() && !parity() && m.experts.packed.is_some() && groups.iter().all(|g| g.1 > 64)
+            && ops_fused() && gemv_on() && moe_mx_on() && !parity() && m.experts.packed.is_some()
+            && parts.iter().all(|p| p.1 > 64) && groups.iter().all(|g| g.1 > 64)
             && vl_rows(0, t, true).is_none() && self.c.dim % 64 == 0
     }
 
@@ -2436,7 +3082,7 @@ impl Model {
         // this rank's output rows, zero-padded and summed over the ranks (exact), then rounded like the full Linear
         // decode / verify rows: the BF16-wire sum of the BF16-rounded parts (ar_b16_wire: one nonzero part per element,
         // summed in rank order like the FP32 path -- the same bits, half the bytes)
-        let wire = (self.sp.world > 1 && t <= 64).then(|| {
+        let wire = (self.sp.world > 1 && t <= 64 && t * (c.hc + 1) * c.dim * 2 <= (1 << 20)).then(|| {
             let fb = Tensor::zeros([t, (c.hc + 1) * c.dim], (Kind::BFloat16, self.dev));
             let _ = fb.narrow(1, e.row0, part.size()[1]).copy_(&part);
             ar_b16_wire(&fb)
@@ -2488,7 +3134,7 @@ impl Model {
         let a = &layer.attn;
         let t = x.size()[0];
         let k = *x.size().last().unwrap();
-        let Some(mine) = a.qakv_mine.as_ref().filter(|m| gemv_on() && !parity() && mx_gemv_ok(t, k, m.n())) else { return a.qakv.mm(x); };
+        let Some(mine) = a.qakv_mine.as_ref().filter(|m| Self::rdma_arn_on() && gemv_on() && !parity() && mx_gemv_ok(t, k, m.n())) else { return a.qakv.mm(x); };
         let blk = mine.n();
         let world = self.sp.world as i64;
         let y = mine.mm(x).contiguous();                                                // [T, blk] BF16
@@ -2616,8 +3262,8 @@ impl Model {
             let gm = super::kern::grouped_max_rows();
             let oa = if gemv_on() && t <= gm {
                 bf16(super::kern::fp8_gemv_grouped(&o3.reshape([t, -1]), &a.wo_a.w, &a.wo_a.s, c.o_lora))
-            } else if gemv_on() && t <= 32 && super::kern::inv_woa_on() && super::kern::wide() {
-                // DS41_INV_WOA (batch invariance): grouped-GEMV chunks of grouped_max_rows() rows
+            } else if gemv_on() && t <= super::kern::inv_rows() && super::kern::inv_woa_on() && super::kern::wide() {
+                // DS41_INV_WOA (batch invariance): grouped-GEMV chunks of grouped_max_rows() rows (up to kern::inv_rows())
                 let o2 = o3.reshape([t, -1]);
                 let parts: Vec<Tensor> = (0..t).step_by(gm as usize).map(|r| bf16(super::kern::fp8_gemv_grouped(&o2.narrow(0, r, gm.min(t - r)), &a.wo_a.w, &a.wo_a.s, c.o_lora))).collect();
                 Tensor::cat(&parts, 0)
@@ -2788,9 +3434,8 @@ impl Model {
         // of the full-scoring layers instead (index_key_split); the later candidate layers stay replicated
         static KSPLIT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
         let key_split = *KSPLIT.get_or_init(|| std::env::var("DS41_INDEX_KEY_SPLIT").ok().and_then(|v| v.parse().ok()).unwrap_or(65536));
-        if world > 1 && key_split > 0 && clen >= key_split.max(world * 4 * k_top) && t <= 16 && !use_cand && k_top > 0
+        if world > 1 && Self::rdma_arn_on() && key_split > 0 && clen >= key_split.max(world * 4 * k_top) && t <= 16 && !use_cand && k_top > 0
             && !crate::tp::graph::capturing() && attn_fused() && c.index_heads == 32 && c.index_dim == 128 && ops_fused() && topk_fused() {
-            let (q, wts) = match sh.index_q.take() { Some(v) => v, None => self.index_q(layer, x, qr, pos) };
             let (ids, cand_out) = prof("idx.key_split", || self.index_key_split(&q, &wts, &k, pos, ratio, clen, k_top, offset, is_cand));
             // DS41_INDEX_KEY_SPLIT_CHECK=1: also the replicated selection, asserted equal (indices and candidate blocks)
             static KCHK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2994,7 +3639,7 @@ impl Model {
         let sm = &m.shared;
         let shared_fused = || { let gu = sm.w13.mm_f32(x); sm.w2.mm_f32(&super::kern::swiglu_quant(&gu, lim)) };
         // decode / verify: the shared expert on a parallel stream beside the router and routed experts
-        if let (true, false, Some(p)) = (t <= super::kern::few_rows() && ops_fused() && moe_mx_on() && shared_par(), parity(), ex.packed.as_ref()) {
+        if let (true, false, Some(p)) = (t <= super::kern::wide_rows() && ops_fused() && moe_mx_on() && shared_par(), parity(), ex.packed.as_ref()) {
             let w = [&p[0], &p[1], &p[2], &p[3], &p[4], &p[5]];
             let y = prof("moe.experts", || super::kern::moe_mx_par(x, route, w, shared_fused));
             return ar_bf16(y);
@@ -3102,6 +3747,20 @@ pub struct Shared {
     pub(super) index_q: Option<(Tensor, Tensor)>,
     /// likewise the compressor's projection (comp_proj)
     pub(super) comp_in: Option<Tensor>,
+}
+
+/// Per-sequence temporary state held between `Model::forward_trees_local` and `Model::commit_tree`.
+pub struct TreeState {
+    pub tree: super::tree::VerifyTree,
+    pub start: i64,
+    pub win_kv: Vec<Tensor>,
+    pub graph_loc: Option<(Vec<usize>, i64, i64)>,
+    pub kv1: HashMap<usize, (Tensor, Tensor)>,
+    #[allow(clippy::type_complexity)]
+    pub kv2: HashMap<usize, (Tensor, Tensor, Vec<usize>, Tensor, Tensor, (Tensor, Tensor))>,
+    pub tail_map: HashMap<usize, Vec<Vec<usize>>>,
+    pub tail_cnt: HashMap<usize, i64>,
+    pub idx_maps: HashMap<usize, (Tensor, Tensor, Tensor)>,
 }
 
 /// Level one of the hierarchical indexer (model.py select_candidate_blocks): keep the `topk_blocks` best blocks of

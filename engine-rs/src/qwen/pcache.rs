@@ -14,7 +14,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use tch::{Device, Kind, Tensor};
 
-const FORMAT: u64 = 1;
+const FORMAT: u64 = 2;
 const ALIGN: usize = 4096;
 const CHUNK: usize = 16 << 20;
 #[cfg(target_arch = "aarch64")] const O_DIRECT: i32 = 0o200000;
@@ -122,9 +122,9 @@ impl Writer {
                 else { let t = Instant::now(); match self.write(&f) {
                     Ok(()) => { f.state.store(OK, Ordering::Release); if let Ok(d) = std::fs::File::open(&self.dir) { let _ = d.sync_all(); }
                         if log() { eprintln!("[qpcache] wrote {} ({:.1} MiB) in {:.1} ms", f.path.display(), f.size as f64 / 1048576., t.elapsed().as_secs_f64() * 1e3); } }
-                    Err(e) => { eprintln!("[qpcache] write {} failed: {e}", f.path.display()); let _ = std::fs::remove_file(f.path.with_extension("tmp")); f.state.store(FAILED, Ordering::Release); }
+                    Err(e) => { let _ = unsafe { cudaStreamSynchronize(self.stream as _) }; eprintln!("[qpcache] write {} failed: {e}", f.path.display()); let _ = std::fs::remove_file(f.path.with_extension("tmp")); f.state.store(FAILED, Ordering::Release); }
                 } }
-                unsafe { cudaEventDestroy(event as _); }
+                unsafe { cudaStreamSynchronize(self.stream as _); cudaEventDestroy(event as _); }
                 done.store(true, Ordering::Release); let _ = back.send(keep);
             }
             Job::Delete(p) => { let _ = std::fs::remove_file(&p); let _ = std::fs::remove_file(p.with_extension("tmp")); }
@@ -162,11 +162,11 @@ impl Writer {
 }
 
 // ---- index ----
-struct Entry { key: u128, len: usize, bytes: u64, used: u64, path: PathBuf, state: Arc<AtomicU8>, cancel: Arc<AtomicBool> }
+struct Entry { key: u128, len: usize, yarn: i32, bytes: u64, used: u64, path: PathBuf, state: Arc<AtomicU8>, cancel: Arc<AtomicBool> }
 struct Pending { tag: u64, done: Arc<AtomicBool> }
 #[derive(Default)] struct Stats { saves: u64, skipped_dup: u64, skipped_budget: u64, evicted: u64, restores: u64, restore_fail: u64, written_bytes: u64 }
 struct Pc {
-    dir: PathBuf, identity: String, cap: u64, min: usize, margin: u64,
+    dir: PathBuf, identity: String, cap: u64, min: usize,
     entries: Vec<Entry>, clock: u64, total: u64,
     read: [Pinned; 2], rstream: usize, revents: [usize; 2],
     tx: mpsc::Sender<Job>, back: mpsc::Receiver<Vec<Tensor>>, pending: Vec<Pending>, stats: Stats,
@@ -176,9 +176,19 @@ thread_local! { static PC: RefCell<Option<Pc>> = const { RefCell::new(None) }; }
 fn identity(binary: &str, model: &Path) -> String {
     let skip = ["QWEN_SERVE_", "QWEN_PCACHE", "QWEN_KV_TOKENS", "QWEN_MEMGUARD", "QWEN_ASSETS", "QWEN_REQLOG", "QWEN_TIMING",
                 "QWEN_KEEP_SHARD_CACHE", "QWEN_NGRAM_CACHE_MB", "QWEN_NGRAM_HOT", "QWEN_PLE_SERIAL", "QWEN_BATCH", "QWEN_TAIL", "QWEN_STATE_DUMP", "QWEN_DUMP"];
-    let mut env: Vec<(String, String)> = std::env::vars().filter(|(k, _)| k.starts_with("QWEN_") && !skip.iter().any(|s| k.starts_with(s))).collect(); env.sort();
+    let mut env: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| (k.starts_with("QWEN_") && !skip.iter().any(|s| k.starts_with(s))) || k.starts_with("SPARK_ABLATE"))
+        .collect();
+    env.sort();
+    let ablate_files: Vec<String> = env.iter()
+        .filter(|(k, v)| k.starts_with("SPARK_ABLATE") && !v.is_empty() && Path::new(v).is_file())
+        .filter_map(|(k, v)| std::fs::read(v).ok().map(|b| {
+            use sha2::Digest;
+            let h: String = sha2::Sha256::digest(&b)[..8].iter().map(|x| format!("{x:02x}")).collect();
+            format!("{k}={h}")
+        })).collect();
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).display().to_string();
-    format!("format={FORMAT};binary={binary};model={};env={env:?}", canon(model))
+    format!("format={FORMAT};binary={binary};model={};env={env:?};ablate={ablate_files:?}", canon(model))
 }
 fn short(s: &str) -> String { use sha2::Digest; sha2::Sha256::digest(s.as_bytes())[..8].iter().map(|b| format!("{b:02x}")).collect() }
 fn mtime(p: &Path) -> u64 { std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64) }
@@ -192,28 +202,29 @@ pub(crate) fn init(model: &Path) {
     let identity = identity(&binary, model); let dir = root.join(short(&identity));
     std::fs::create_dir_all(&dir).expect("prefix cache directory");
     let _ = std::fs::write(dir.join("identity.txt"), &identity);
-    let mut found: Vec<(u128, usize, u64, PathBuf, u64)> = Vec::new();   // key, len, bytes, path, mtime
+    let mut found: Vec<(u128, usize, i32, u64, PathBuf, u64)> = Vec::new();   // key, len, yarn, bytes, path, mtime
     for e in std::fs::read_dir(&dir).unwrap().flatten() {
         let p = e.path(); let name = p.file_name().unwrap().to_string_lossy().to_string();
         if name.ends_with(".tmp") { let _ = std::fs::remove_file(&p); continue; }
         if !name.ends_with(".snap") { continue; }
         match read_header(&p).filter(|h| h["identity"].as_str() == Some(identity.as_str()) && h["format"].as_u64() == Some(FORMAT)) {
             Some(h) => found.push((u128::from_str_radix(h["key"].as_str().unwrap_or("0"), 16).unwrap_or(0), h["len"].as_u64().unwrap_or(0) as usize,
+                                   h["yarn"].as_i64().unwrap_or(0) as i32,
                                    e.metadata().map(|m| m.len()).unwrap_or(0), p.clone(), mtime(&p))),
             None => { let _ = std::fs::remove_file(&p); }
         }
     }
-    found.sort_by_key(|x| x.4);
+    found.sort_by_key(|x| x.5);
     let (tx, rx) = mpsc::channel(); let (btx, brx) = mpsc::channel();
     let margin = env_u64("QWEN_PCACHE_FREE_GIB", 20) << 30;
     let ev = || { let mut e = std::ptr::null_mut(); assert_eq!(unsafe { cudaEventCreateWithFlags(&mut e, 2) }, 0); e as usize };
     let writer = Writer { stream: stream(), bufs: [Pinned::new(CHUNK), Pinned::new(CHUNK)], dir: dir.clone(), margin, events: [ev(), ev()] };
     std::thread::Builder::new().name("qpcache-writer".into()).spawn(move || writer.run(rx, btx)).unwrap();
-    let mut pc = Pc { dir: dir.clone(), identity, cap, min, margin, entries: Vec::new(), clock: 0, total: 0,
+    let mut pc = Pc { dir: dir.clone(), identity, cap, min, entries: Vec::new(), clock: 0, total: 0,
         read: [Pinned::new(CHUNK), Pinned::new(CHUNK)], rstream: stream(), revents: [ev(), ev()],
         tx, back: brx, pending: Vec::new(), stats: Stats::default() };
-    for (key, len, bytes, path, _) in found { pc.clock += 1; pc.total += bytes;
-        pc.entries.push(Entry { key, len, bytes, used: pc.clock, path, state: Arc::new(AtomicU8::new(OK)), cancel: Arc::new(AtomicBool::new(false)) }); }
+    for (key, len, yarn, bytes, path, _) in found { pc.clock += 1; pc.total += bytes;
+        pc.entries.push(Entry { key, len, yarn, bytes, used: pc.clock, path, state: Arc::new(AtomicU8::new(OK)), cancel: Arc::new(AtomicBool::new(false)) }); }
     let before = pc.entries.len(); pc.evict_to(0);
     eprintln!("[qpcache] {} entries ({} evicted to fit), {:.2} GiB of {:.1} GiB at {} ({:.2}s)", pc.entries.len(), before - pc.entries.len(),
         pc.total as f64 / (1u64 << 30) as f64, pc.cap as f64 / (1u64 << 30) as f64, dir.display(), t0.elapsed().as_secs_f64());
@@ -228,7 +239,18 @@ impl Pc {
             let _ = self.tx.send(Job::Delete(e.path)); self.stats.evicted += 1;
         }
     }
-    fn reap(&mut self) { while self.back.try_recv().is_ok() {} self.pending.retain(|p| !p.done.load(Ordering::Acquire)); }
+    fn reap(&mut self) {
+        while self.back.try_recv().is_ok() {}
+        self.pending.retain(|p| !p.done.load(Ordering::Acquire));
+        let mut i = 0;
+        while i < self.entries.len() {
+            let st = self.entries[i].state.load(Ordering::Acquire);
+            if st == FAILED || st == CANCELLED {
+                let e = self.entries.remove(i);
+                self.total = self.total.saturating_sub(e.bytes);
+            } else { i += 1; }
+        }
+    }
 }
 
 pub(crate) fn poll() { PC.with(|p| if let Some(pc) = p.borrow_mut().as_mut() { pc.reap(); }); }
@@ -255,12 +277,16 @@ pub(crate) fn stats() -> Value {
         "restores": s.restores, "restore_failures": s.restore_fail, "written_bytes": s.written_bytes}) }))
 }
 
-/// Save checkpoint of prefix `ids` with its state `tensors` (right after ckpt_save). `tag`: the store (see fence).
-pub(crate) fn save(ids: &[i64], tensors: &[Tensor], tag: u64) {
+/// Save checkpoint of prefix `ids` with its non-positional state `tensors` AND positional QSA KV slices `qsa`
+/// (right after ckpt_save). `yarn`: RoPE mode (0 native, 1 YaRN). `tag`: the store (see fence).
+pub(crate) fn save(ids: &[i64], tensors: &[Tensor], qsa: &[Tensor], yarn: i32, tag: u64) {
     PC.with(|p| { let mut b = p.borrow_mut(); let Some(pc) = b.as_mut() else { return }; pc.reap();
         if ids.len() < pc.min { return; }
         let key = hash_ids(ids); pc.clock += 1; let clock = pc.clock;
-        if let Some(e) = pc.entries.iter_mut().find(|e| e.key == key && e.len == ids.len()) { e.used = clock; pc.stats.skipped_dup += 1; let _ = pc.tx.send(Job::Touch(e.path.clone())); return; }
+        if let Some(e) = pc.entries.iter_mut().find(|e| e.key == key && e.len == ids.len() && e.yarn == yarn
+            && matches!(e.state.load(Ordering::Acquire), PENDING | OK)) {
+            e.used = clock; pc.stats.skipped_dup += 1; let _ = pc.tx.send(Job::Touch(e.path.clone())); return;
+        }
         let mut regions = Vec::new(); let mut srcs = Vec::new(); let mut keep = Vec::new();
         let idb: Vec<u8> = ids.iter().flat_map(|t| t.to_le_bytes()).collect();
         // ids first (Host bytes staged through a kept tensor so every region is a device source)
@@ -270,13 +296,17 @@ pub(crate) fn save(ids: &[i64], tensors: &[Tensor], tag: u64) {
             let t = if t.is_contiguous() { t.shallow_clone() } else { t.contiguous() };
             regions.push(Region { name: format!("t{i}"), kind: t.kind(), shape: t.size(), off: 0, bytes: nbytes(&t) }); srcs.push(t.data_ptr() as usize); keep.push(t);
         }
-        let fixed = json!({"format": FORMAT, "identity": pc.identity, "key": format!("{key:032x}"), "len": ids.len()});
+        for (i, t) in qsa.iter().enumerate() {
+            let t = if t.is_contiguous() { t.shallow_clone() } else { t.contiguous() };
+            regions.push(Region { name: format!("q{i}"), kind: t.kind(), shape: t.size(), off: 0, bytes: nbytes(&t) }); srcs.push(t.data_ptr() as usize); keep.push(t);
+        }
+        let fixed = json!({"format": FORMAT, "identity": pc.identity, "key": format!("{key:032x}"), "len": ids.len(), "yarn": yarn, "n_ckpt": tensors.len()});
         let (head, size) = layout(&mut regions, &fixed); let _ = head;
         if size > pc.cap { pc.stats.skipped_budget += 1; return; }
         pc.clock += 1; let used = pc.clock;
-        let path = pc.dir.join(format!("e-{key:032x}.snap"));
+        let path = pc.dir.join(format!("e-{key:032x}-y{yarn}.snap"));
         let state = Arc::new(AtomicU8::new(PENDING)); let cancel = Arc::new(AtomicBool::new(false));
-        pc.entries.push(Entry { key, len: ids.len(), bytes: size, used, path: path.clone(), state: state.clone(), cancel: cancel.clone() });
+        pc.entries.push(Entry { key, len: ids.len(), yarn, bytes: size, used, path: path.clone(), state: state.clone(), cancel: cancel.clone() });
         pc.total += size; pc.evict_to(0);
         let (head, _) = layout(&mut regions, &fixed);
         let f = FilePlan { path, head, size, fixed, regions, srcs, state, cancel };
@@ -285,13 +315,15 @@ pub(crate) fn save(ids: &[i64], tensors: &[Tensor], tag: u64) {
         let done = Arc::new(AtomicBool::new(false)); pc.pending.push(Pending { tag, done: done.clone() });
         pc.stats.saves += 1; pc.stats.written_bytes += size;
         let _ = pc.tx.send(Job::Write { event: event as usize, f, done, keep });
-        if log() { eprintln!("[qpcache] save {} tokens: {:.1} MiB, total {:.2} GiB, {} entries", ids.len(), size as f64 / 1048576., pc.total as f64 / (1u64 << 30) as f64, pc.entries.len()); }
+        if log() { eprintln!("[qpcache] save {} tokens (yarn {yarn}): {:.1} MiB, total {:.2} GiB, {} entries", ids.len(), size as f64 / 1048576., pc.total as f64 / (1u64 << 30) as f64, pc.entries.len()); }
     });
 }
-/// The longest finished entry that is a (<=) prefix of `q`, at least `min_len`, longer than `longer_than`. (id index, len).
-pub(crate) fn lookup(q: &[i64], longer_than: usize, min_len: usize) -> Option<(usize, usize)> {
+/// The longest finished entry that is a prefix of `q` (strict unless `exact_ok`), at least `min_len`, longer than
+/// `longer_than`, with matching RoPE `yarn` mode. Returns (entry index, len).
+pub(crate) fn lookup(q: &[i64], longer_than: usize, min_len: usize, yarn: i32, exact_ok: bool) -> Option<(usize, usize)> {
     PC.with(|p| { let b = p.borrow(); let pc = b.as_ref()?;
-        let mut cand: Vec<(usize, &Entry)> = pc.entries.iter().enumerate().filter(|(_, e)| e.len <= q.len() && e.len > longer_than && e.len >= min_len && e.state.load(Ordering::Acquire) == OK).collect();
+        let mut cand: Vec<(usize, &Entry)> = pc.entries.iter().enumerate()
+            .filter(|(_, e)| e.yarn == yarn && e.len <= q.len() && (exact_ok || e.len < q.len()) && e.len > longer_than && e.len >= min_len && e.state.load(Ordering::Acquire) == OK).collect();
         if cand.is_empty() { return None; }
         cand.sort_by_key(|(_, e)| e.len);
         let mut h = PrefixHash::new(); let mut at = 0usize; let mut best: Option<(usize, usize)> = None;
@@ -299,22 +331,28 @@ pub(crate) fn lookup(q: &[i64], longer_than: usize, min_len: usize) -> Option<(u
         best
     })
 }
-/// Read entry `idx` from disk into fresh device tensors: (ids, state tensors in save order). Verifies every chunk's
-/// checksum and the token ids against `prompt`'s prefix; returns None (and drops the entry) on any mismatch.
-pub(crate) fn restore(idx: usize, prompt: &[i64], dev: Device) -> Option<(Vec<i64>, Vec<Tensor>)> {
+/// Read entry `idx` from disk into fresh device tensors: (ids, ckpt state tensors, QSA KV tensors). Verifies every
+/// chunk's checksum and the token ids against `prompt`'s prefix; returns None (and drops the entry) on any mismatch.
+pub(crate) fn restore(idx: usize, prompt: &[i64], dev: Device) -> Option<(Vec<i64>, Vec<Tensor>, Vec<Tensor>)> {
     PC.with(|p| {
         let t0 = Instant::now();
         let (path, key, len, state) = { let b = p.borrow(); let pc = b.as_ref()?; let e = pc.entries.get(idx)?; (e.path.clone(), e.key, e.len, e.state.clone()) };
         if state.load(Ordering::Acquire) != OK { return None; }
-        let fail = |p: &RefCell<Option<Pc>>| { if let Some(pc) = p.borrow_mut().as_mut() { pc.stats.restore_fail += 1; if let Some(i) = pc.entries.iter().position(|e| e.path == path) { let e = pc.entries.remove(i); pc.total -= e.bytes; let _ = pc.tx.send(Job::Delete(e.path)); } } None::<(Vec<i64>, Vec<Tensor>)> };
+        let fail = |p: &RefCell<Option<Pc>>| { if let Some(pc) = p.borrow_mut().as_mut() { pc.stats.restore_fail += 1; if let Some(i) = pc.entries.iter().position(|e| e.path == path) { let e = pc.entries.remove(i); pc.total = pc.total.saturating_sub(e.bytes); let _ = pc.tx.send(Job::Delete(e.path)); } } None::<(Vec<i64>, Vec<Tensor>, Vec<Tensor>)> };
         let h = match read_header(&path) { Some(h) => h, None => return fail(p) };
+        let n_ckpt = match h["n_ckpt"].as_u64() { Some(n) => n as usize, None => return fail(p) };
         let regions = match regions_of(&h) { Some(r) => r, None => return fail(p) };
         use std::os::unix::fs::{FileExt, OpenOptionsExt};
         let file = match std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(&path) { Ok(f) => f, Err(_) => return fail(p) };
         let mut ids: Vec<i64> = Vec::new(); let mut out: Vec<Tensor> = Vec::new();
         let b = p.borrow(); let pc = b.as_ref().unwrap(); let (rs, rev) = (pc.rstream, pc.revents);
         for (r, sums) in &regions {
-            let dst = if r.name == "ids" { None } else { Some(Tensor::empty(&r.shape, (r.kind, dev))) };
+            if r.off % ALIGN as u64 != 0 || sums.len() != r.bytes.div_ceil(CHUNK) { drop(b); return fail(p); }
+            let dst = if r.name == "ids" { None } else {
+                let t = Tensor::empty(&r.shape, (r.kind, dev));
+                if r.bytes != nbytes(&t) { drop(b); return fail(p); }
+                Some(t)
+            };
             let dptr = dst.as_ref().map(|t| t.data_ptr() as usize);
             let mut idbytes: Vec<u8> = Vec::new();
             let nch = r.bytes.div_ceil(CHUNK);
@@ -329,10 +367,11 @@ pub(crate) fn restore(idx: usize, prompt: &[i64], dev: Device) -> Option<(Vec<i6
             match dst { Some(t) => out.push(t), None => ids = idbytes.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect() }
         }
         drop(b);
-        if ids.len() != len || hash_ids(&ids) != key || prompt.len() < len || prompt[..len] != ids[..] { return fail(p); }
+        if ids.len() != len || hash_ids(&ids) != key || prompt.len() < len || prompt[..len] != ids[..] || out.len() < n_ckpt { return fail(p); }
+        let qsa = out.split_off(n_ckpt);
         unsafe { cudaStreamSynchronize(rs as _); }
         PC.with(|p| if let Some(pc) = p.borrow_mut().as_mut() { pc.stats.restores += 1; pc.clock += 1; if let Some(e) = pc.entries.get_mut(idx) { e.used = pc.clock; } });
         if log() { eprintln!("[qpcache] restore {len} tokens in {:.1} ms", t0.elapsed().as_secs_f64() * 1e3); }
-        Some((ids, out))
+        Some((ids, out, qsa))
     })
 }

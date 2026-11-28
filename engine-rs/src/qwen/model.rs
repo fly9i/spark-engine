@@ -1323,6 +1323,43 @@ impl Model {
         }
     }
 
+    /// RoPE mode of `seq` (0 = native, 1 = YaRN), from its QSA layers.
+    pub fn yarn_mode(seq: &Seq) -> i32 {
+        seq.layers.iter().find_map(|st| match st { LayerState::Qsa { yarn, .. } => Some(*yarn), _ => None }).unwrap_or(0)
+    }
+
+    /// Positional QSA KV slices [0..len) (and pooled [0..len/4]) of every QSA layer (main + MTP) for persistent prefix cache.
+    pub fn pcache_qsa_slices(&self, seq: &Seq, len: i64) -> Vec<Tensor> {
+        let mut out = Vec::new();
+        for st in seq.layers.iter().chain(seq.mtp.iter()) {
+            if let LayerState::Qsa { kc, ks, vc, vs, pooled, .. } = st {
+                out.push(kc.narrow(0, 0, len));
+                out.push(ks.narrow(0, 0, len));
+                out.push(vc.narrow(0, 0, len));
+                out.push(vs.narrow(0, 0, len));
+                out.push(pooled.narrow(0, 0, len / 4));
+            }
+        }
+        out
+    }
+
+    /// Restore positional QSA KV slices [0..len) (and pooled [0..len/4]) from a persistent prefix cache entry.
+    pub fn pcache_qsa_restore(&self, seq: &mut Seq, len: i64, qsa: &[Tensor]) -> bool {
+        let mut it = qsa.iter();
+        for st in seq.layers.iter_mut().chain(seq.mtp.iter_mut()) {
+            if let LayerState::Qsa { kc, ks, vc, vs, pooled, .. } = st {
+                let (Some(k), Some(s), Some(v), Some(w), Some(p)) = (it.next(), it.next(), it.next(), it.next(), it.next()) else { return false };
+                if k.size()[0] != len || s.size()[0] != len || v.size()[0] != len || w.size()[0] != len || p.size()[0] != len / 4 { return false; }
+                let _ = kc.narrow(0, 0, len).copy_(k);
+                let _ = ks.narrow(0, 0, len).copy_(s);
+                let _ = vc.narrow(0, 0, len).copy_(v);
+                let _ = vs.narrow(0, 0, len).copy_(w);
+                let _ = pooled.narrow(0, 0, len / 4).copy_(p);
+            }
+        }
+        it.next().is_none()
+    }
+
     /// Return `seq` to the checkpoint (position ckpt.ids.len()); returns the MTP head's pending row there.
     pub fn ckpt_restore(&self, seq: &mut Seq, c: &Ckpt) -> Tensor {
         Self::gdn_discard(seq);

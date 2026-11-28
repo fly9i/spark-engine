@@ -68,7 +68,10 @@ class QwenApp(o.App):
         if "thinking" in kwargs and "enable_thinking" not in kwargs:
             kwargs["enable_thinking"] = kwargs.pop("thinking")
         # thinking level: reasoning_effort (OpenAI), reasoning.effort (Responses / OpenRouter), thinking.type (Anthropic style)
-        effort = kwargs.pop("reasoning_effort", None) or body.get("reasoning_effort") or (body.get("reasoning") or {}).get("effort")
+        reasoning_obj = body.get("reasoning")
+        if reasoning_obj is not None and not isinstance(reasoning_obj, dict):
+            raise o.ApiError(400, "reasoning must be an object", param="reasoning")
+        effort = kwargs.pop("reasoning_effort", None) or body.get("reasoning_effort") or (reasoning_obj or {}).get("effort")
         th = body.get("thinking")
         if isinstance(th, dict) and th.get("type") == "disabled":
             kwargs.setdefault("enable_thinking", False)
@@ -101,12 +104,14 @@ class QwenApp(o.App):
 
 _REQLOG = __import__("os").environ.get("QWEN_REQLOG", "/tmp/qwen38-requests.jsonl")   # "" = off
 _tl = __import__("threading").local()
+_REQLOG_MAX_SEEN_TOKENS = 16384
 
 
 class LoggedApp(QwenApp):
     """Appends one JSON line per request to QWEN_REQLOG: sizes, prefix hit, queue / prefill / TTFT, and where the prompt
     first differs from the closest earlier sequence (its prompt + output), with the text on both sides of that point."""
     seen = __import__("collections").deque(maxlen=64)
+    _log_lock = __import__("threading").Lock()
 
     def chat_prompt(self, body):
         r = super().chat_prompt(body)
@@ -120,6 +125,8 @@ class LoggedApp(QwenApp):
         return r
 
     def run(self, ids, max_new, stop_ids, stream_text, on_text=None, alive=None, mm=None):
+        info = getattr(_tl, "info", None) or {}
+        _tl.info = {}
         t0 = time.time()
         first = {}
         def wrap(r, c):
@@ -129,26 +136,30 @@ class LoggedApp(QwenApp):
         out, finish, usage, timing = super().run(ids, max_new, stop_ids, stream_text, wrap, alive, mm)
         if _REQLOG:
             try:
-                best, bi = 0, None
-                for k, prev in enumerate(self.seen):
+                best, best_prev = 0, None
+                with self._log_lock:
+                    snapshot = list(self.seen)
+                for prev in snapshot:
                     n = 0
                     lim = min(len(prev), len(ids))
                     while n < lim and prev[n] == ids[n]:
                         n += 1
                     if n > best:
-                        best, bi = n, k
-                rec = {"t": time.strftime("%H:%M:%S"), **getattr(_tl, "info", {}), "prompt": len(ids), "max_new": max_new, "out": len(out),
+                        best, best_prev = n, prev
+                rec = {"t": time.strftime("%H:%M:%S"), **info, "prompt": len(ids), "max_new": max_new, "out": len(out),
                        "finish": finish, "hit": timing.get("prefix_hit_tokens"), "queue_ms": round(timing.get("queue_ms") or 0),
                        "prefill_ms": round(timing.get("prefill_ms") or 0), "ttft_ms": round(((first.get("t") or time.time()) - t0) * 1000),
                        "lcp": best}
-                if bi is not None and best < len(ids):
-                    prev = self.seen[bi]
-                    rec["lcp_prev_len"] = len(prev)
-                    rec["diverge_prev"] = self.tok.decode(prev[max(0, best - 30):best + 50], skip_special_tokens=False)
+                if best_prev is not None and best < len(ids):
+                    rec["lcp_prev_len"] = len(best_prev)
+                    rec["diverge_prev"] = self.tok.decode(best_prev[max(0, best - 30):best + 50], skip_special_tokens=False)
                     rec["diverge_now"] = self.tok.decode(ids[max(0, best - 30):best + 50], skip_special_tokens=False)
-                self.seen.append(list(ids) + list(out))
-                with open(_REQLOG, "a") as f:
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                seq = (list(ids) + list(out))[:_REQLOG_MAX_SEEN_TOKENS]
+                line = json.dumps(rec, ensure_ascii=False) + "\n"
+                with self._log_lock:
+                    self.seen.append(seq)
+                    with open(_REQLOG, "a") as f:
+                        f.write(line)
             except Exception as e:      # logging must never fail a request
                 print("[reqlog]", e, flush=True)
         return out, finish, usage, timing

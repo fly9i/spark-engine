@@ -167,13 +167,13 @@ __global__ __launch_bounds__(KS > 4 ? 32 * KS : 128) void up_mx(const uint8_t* _
     if (!PF && s > 0)
       for (int t = 0; t < 8; ++t) { bw[t] = __ldg(reinterpret_cast<const uint4*>(wr[t] + s * 512)); bs[t] = s_word(sr[t], s); }
     uint32_t sfa4[MT];
-    for (int m = 0; m < MT; ++m) sfa4[m] = __ldg(reinterpret_cast<const uint32_t*>(xsa[m] + s * 4));
+    for (int m = 0; m < MT; ++m) sfa4[m] = *reinterpret_cast<const uint32_t*>(xsa[m] + s * 4);
 #pragma unroll
     for (int b = 0; b < 4; ++b) {
       uint32_t a[MT][4];
       for (int m = 0; m < MT; ++m) {
-        const uint2 r0 = __ldg(reinterpret_cast<const uint2*>(xa[m][0] + s * 128 + b * 32));
-        const uint2 r1 = __ldg(reinterpret_cast<const uint2*>(xa[m][1] + s * 128 + b * 32));
+        const uint2 r0 = *reinterpret_cast<const uint2*>(xa[m][0] + s * 128 + b * 32);
+        const uint2 r1 = *reinterpret_cast<const uint2*>(xa[m][1] + s * 128 + b * 32);
         a_split(r0, a[m][0], a[m][2]);
         a_split(r1, a[m][1], a[m][3]);
       }
@@ -1129,8 +1129,8 @@ __global__ __launch_bounds__(256) void bf16_gemv_mx(const __nv_bfloat16* __restr
       const int sp = s0 + u;
       if (sp < spans) {
         wv[u] = __ldg(reinterpret_cast<const uint4*>(wr + sp * 32));
-        a[u] = z0 ? make_uint4(0, 0, 0, 0) : __ldg(reinterpret_cast<const uint4*>(x0p + sp * 32));
-        b[u] = z1 ? make_uint4(0, 0, 0, 0) : __ldg(reinterpret_cast<const uint4*>(x1p + sp * 32));
+        a[u] = z0 ? make_uint4(0, 0, 0, 0) : *reinterpret_cast<const uint4*>(x0p + sp * 32);
+        b[u] = z1 ? make_uint4(0, 0, 0, 0) : *reinterpret_cast<const uint4*>(x1p + sp * 32);
       }
     }
 #pragma unroll
@@ -1155,7 +1155,7 @@ __global__ __launch_bounds__(256) void bf16_gemv_mx(const __nv_bfloat16* __restr
 // and feeds four MMAs (K 16q + 4j .. +3 as the logical 2q, 2q+1, 2q+8, 2q+9, A and B alike). S warps split K as in
 // fp8_gemv_mx (summed in slice order; S depends on the shape only, so a row's result does not depend on m). Before,
 // a CUDA-core GEMV whose cost grew with m (decode B = 4: 62 -> 140 us per layer).
-template <int S>
+template <int S, int T = 1>
 __global__ __launch_bounds__(256) void fp8_gemv_bx(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws,
                                                   float* __restrict__ y, int m, int n, int k, int xs, int rpg) {
   pdl_trigger();
@@ -1174,60 +1174,116 @@ __global__ __launch_bounds__(256) void fp8_gemv_bx(const __nv_bfloat16* __restri
   uint4 wv[U]; uint32_t sb[U];
   if (n0 < n) ldw(wv, sb, s_lo);
   pdl_wait();
-  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  float acc[T][4];
+#pragma unroll
+  for (int tt = 0; tt < T; ++tt) { acc[tt][0] = 0.f; acc[tt][1] = 0.f; acc[tt][2] = 0.f; acc[tt][3] = 0.f; }
   if (n0 < n) {
-    const int r0 = g, r1 = g + 8;
-    const bool z0 = r0 >= m, z1 = r1 >= m;
     const long long xo = (rpg ? (long long)(n0 / rpg) * k : 0) + 16 * q;
-    const __nv_bfloat16* x0p = x + (long long)(z0 ? 0 : r0) * xs + xo;
-    const __nv_bfloat16* x1p = x + (long long)(z1 ? 0 : r1) * xs + xo;
-    for (int sp0 = s_lo; sp0 < s_hi; sp0 += U) {
-      uint4 a[U][2], b[U][2];
+    if constexpr (T == 1) {
+      const int r0 = g, r1 = g + 8;
+      const bool z0 = r0 >= m, z1 = r1 >= m;
+      const __nv_bfloat16* x0p = x + (long long)(z0 ? 0 : r0) * xs + xo;
+      const __nv_bfloat16* x1p = x + (long long)(z1 ? 0 : r1) * xs + xo;
+      for (int sp0 = s_lo; sp0 < s_hi; sp0 += U) {
+        uint4 a[U][2], b[U][2];
 #pragma unroll
-      for (int u = 0; u < U; ++u)
-        if (sp0 + u < s_hi)
-          for (int h = 0; h < 2; ++h) {
-            a[u][h] = z0 ? make_uint4(0, 0, 0, 0) : __ldg(reinterpret_cast<const uint4*>(x0p + (sp0 + u) * 64 + 8 * h));
-            b[u][h] = z1 ? make_uint4(0, 0, 0, 0) : __ldg(reinterpret_cast<const uint4*>(x1p + (sp0 + u) * 64 + 8 * h));
+        for (int u = 0; u < U; ++u)
+          if (sp0 + u < s_hi)
+            for (int h = 0; h < 2; ++h) {
+              a[u][h] = z0 ? make_uint4(0, 0, 0, 0) : *reinterpret_cast<const uint4*>(x0p + (sp0 + u) * 64 + 8 * h);
+              b[u][h] = z1 ? make_uint4(0, 0, 0, 0) : *reinterpret_cast<const uint4*>(x1p + (sp0 + u) * 64 + 8 * h);
+            }
+        uint4 nw[U]; uint32_t nsb[U];
+        if (sp0 + U < s_hi) ldw(nw, nsb, sp0 + U);
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          if (sp0 + u >= s_hi) break;
+          const float sc = __uint_as_float(sb[u] << 23);
+          const uint32_t ww[4] = {wv[u].x, wv[u].y, wv[u].z, wv[u].w};
+          uint32_t wb[8];
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(ww[j >> 1] >> (16 * (j & 1))), __NV_E4M3);
+            const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+            const __nv_bfloat162 v = __floats2bfloat162_rn(f.x * sc, f.y * sc);
+            wb[j] = *reinterpret_cast<const uint32_t*>(&v);
           }
-      uint4 nw[U]; uint32_t nsb[U];
-      if (sp0 + U < s_hi) ldw(nw, nsb, sp0 + U);
+          const uint32_t aw[8] = {a[u][0].x, a[u][0].y, a[u][0].z, a[u][0].w, a[u][1].x, a[u][1].y, a[u][1].z, a[u][1].w};
+          const uint32_t bw[8] = {b[u][0].x, b[u][0].y, b[u][0].z, b[u][0].w, b[u][1].x, b[u][1].y, b[u][1].z, b[u][1].w};
 #pragma unroll
-      for (int u = 0; u < U; ++u) {
-        if (sp0 + u >= s_hi) break;
-        const float sc = __uint_as_float(sb[u] << 23);
-        const uint32_t ww[4] = {wv[u].x, wv[u].y, wv[u].z, wv[u].w};
-        uint32_t wb[8];
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(ww[j >> 1] >> (16 * (j & 1))), __NV_E4M3);
-          const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
-          const __nv_bfloat162 v = __floats2bfloat162_rn(f.x * sc, f.y * sc);
-          wb[j] = *reinterpret_cast<const uint32_t*>(&v);
+          for (int j = 0; j < 4; ++j) mma_bf16(acc[0], aw[2 * j], bw[2 * j], aw[2 * j + 1], bw[2 * j + 1], wb[2 * j], wb[2 * j + 1]);
         }
-        const uint32_t aw[8] = {a[u][0].x, a[u][0].y, a[u][0].z, a[u][0].w, a[u][1].x, a[u][1].y, a[u][1].z, a[u][1].w};
-        const uint32_t bw[8] = {b[u][0].x, b[u][0].y, b[u][0].z, b[u][0].w, b[u][1].x, b[u][1].y, b[u][1].z, b[u][1].w};
 #pragma unroll
-        for (int j = 0; j < 4; ++j) mma_bf16(acc, aw[2 * j], bw[2 * j], aw[2 * j + 1], bw[2 * j + 1], wb[2 * j], wb[2 * j + 1]);
+        for (int u = 0; u < U; ++u) { wv[u] = nw[u]; sb[u] = nsb[u]; }
       }
+    } else {
+      const __nv_bfloat16* x0p[T];
+      const __nv_bfloat16* x1p[T];
+      bool z0[T], z1[T];
 #pragma unroll
-      for (int u = 0; u < U; ++u) { wv[u] = nw[u]; sb[u] = nsb[u]; }
+      for (int tt = 0; tt < T; ++tt) {
+        const int r0 = tt * 16 + g, r1 = r0 + 8;
+        z0[tt] = r0 >= m; z1[tt] = r1 >= m;
+        x0p[tt] = x + (long long)(z0[tt] ? 0 : r0) * xs + xo;
+        x1p[tt] = x + (long long)(z1[tt] ? 0 : r1) * xs + xo;
+      }
+      for (int sp0 = s_lo; sp0 < s_hi; sp0 += U) {
+        uint4 nw[U]; uint32_t nsb[U];
+        if (sp0 + U < s_hi) ldw(nw, nsb, sp0 + U);
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          if (sp0 + u >= s_hi) break;
+          const float sc = __uint_as_float(sb[u] << 23);
+          const uint32_t ww[4] = {wv[u].x, wv[u].y, wv[u].z, wv[u].w};
+          uint32_t wb[8];
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(ww[j >> 1] >> (16 * (j & 1))), __NV_E4M3);
+            const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+            const __nv_bfloat162 v = __floats2bfloat162_rn(f.x * sc, f.y * sc);
+            wb[j] = *reinterpret_cast<const uint32_t*>(&v);
+          }
+#pragma unroll
+          for (int tt = 0; tt < T; ++tt) {
+            const uint4 a0 = z0[tt] ? make_uint4(0, 0, 0, 0) : *reinterpret_cast<const uint4*>(x0p[tt] + (sp0 + u) * 64);
+            const uint4 a1 = z0[tt] ? make_uint4(0, 0, 0, 0) : *reinterpret_cast<const uint4*>(x0p[tt] + (sp0 + u) * 64 + 8);
+            const uint4 b0 = z1[tt] ? make_uint4(0, 0, 0, 0) : *reinterpret_cast<const uint4*>(x1p[tt] + (sp0 + u) * 64);
+            const uint4 b1 = z1[tt] ? make_uint4(0, 0, 0, 0) : *reinterpret_cast<const uint4*>(x1p[tt] + (sp0 + u) * 64 + 8);
+            const uint32_t aw[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const uint32_t bw[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) mma_bf16(acc[tt], aw[2 * j], bw[2 * j], aw[2 * j + 1], bw[2 * j + 1], wb[2 * j], wb[2 * j + 1]);
+          }
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) { wv[u] = nw[u]; sb[u] = nsb[u]; }
+      }
     }
   }
   if (S > 1) {
     __shared__ float4 red[8][32];
-    red[wid][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
-    __syncthreads();
-    if (slice) return;
-    for (int j = 1; j < S; ++j) {
-      const float4 o = red[wid + j][lane];
-      acc[0] += o.x; acc[1] += o.y; acc[2] += o.z; acc[3] += o.w;
+#pragma unroll
+    for (int tt = 0; tt < T; ++tt) {
+      red[wid][lane] = make_float4(acc[tt][0], acc[tt][1], acc[tt][2], acc[tt][3]);
+      __syncthreads();
+      if (!slice) {
+        for (int j = 1; j < S; ++j) {
+          const float4 o = red[wid + j][lane];
+          acc[tt][0] += o.x; acc[tt][1] += o.y; acc[tt][2] += o.z; acc[tt][3] += o.w;
+        }
+      }
+      if (tt + 1 < T) __syncthreads();
     }
+    if (slice) return;
   }
   if (n0 >= n) return;
-  const int r0 = g, r1 = g + 8, c = n0 + 2 * q;
-  if (r0 < m) *reinterpret_cast<float2*>(y + (long long)r0 * n + c) = make_float2(acc[0], acc[1]);
-  if (r1 < m) *reinterpret_cast<float2*>(y + (long long)r1 * n + c) = make_float2(acc[2], acc[3]);
+  const int c = n0 + 2 * q;
+#pragma unroll
+  for (int tt = 0; tt < T; ++tt) {
+    const int r0 = tt * 16 + g, r1 = r0 + 8;
+    if (r0 < m) *reinterpret_cast<float2*>(y + (long long)r0 * n + c) = make_float2(acc[tt][0], acc[tt][1]);
+    if (r1 < m) *reinterpret_cast<float2*>(y + (long long)r1 * n + c) = make_float2(acc[tt][2], acc[tt][3]);
+  }
 }
 
 // prefill (R > 64): 64-row items for the grouped GEMM (up_gemm; DS41_MOE_GEMM=0 the earlier 32-row up_mx items)
@@ -1381,13 +1437,14 @@ int ds41_fp8_gemv_mx_job(const void* x, const void* aq, const void* as_, const v
 // largest m k quantized in shared memory (else the caller quantizes first and passes aq / as_)
 size_t ds41_fp8_gemv_mx_smem_max() { return 92 * 1024; }
 // y [m, n] FP32 = x . W^T, FP8 W [n, k] with BF16 x (row stride xs elements; rpg > 0: block-diagonal groups of rpg
-// weight rows, group g reading input elements [g k, +k)); m <= 16, k % 64 == 0, n % 8 == 0
+// weight rows, group g reading input elements [g k, +k)); m <= 32, k % 64 == 0, n % 8 == 0
 int ds41_fp8_gemv_bx(const void* x, const void* w, const void* ws, float* y, int m, int n, int k, int xs, int rpg, cudaStream_t st) {
-  if (m < 1 || m > 16 || k % 64 || n % 8 || (rpg && rpg % 8)) return 1;
+  if (m < 1 || m > 32 || k % 64 || n % 8 || (rpg && rpg % 8)) return 1;
   int S = 8;
   while (S > 1 && k / 64 / S < 2) S /= 2;
-#define GEMV_BX(SS) pdl_launch((fp8_gemv_bx<SS>), dim3((n / 8 + 8 / SS - 1) / (8 / SS)), dim3(256), 0, st, (const __nv_bfloat16*)x, (const uint8_t*)w, (const uint8_t*)ws, y, m, n, k, xs, rpg)
-  switch (S) { case 1: GEMV_BX(1); break; case 2: GEMV_BX(2); break; case 4: GEMV_BX(4); break; default: GEMV_BX(8); }
+#define GEMV_BX(SS, TT) pdl_launch((fp8_gemv_bx<SS, TT>), dim3((n / 8 + 8 / SS - 1) / (8 / SS)), dim3(256), 0, st, (const __nv_bfloat16*)x, (const uint8_t*)w, (const uint8_t*)ws, y, m, n, k, xs, rpg)
+  if (m <= 16) { switch (S) { case 1: GEMV_BX(1, 1); break; case 2: GEMV_BX(2, 1); break; case 4: GEMV_BX(4, 1); break; default: GEMV_BX(8, 1); } }
+  else { switch (S) { case 1: GEMV_BX(1, 2); break; case 2: GEMV_BX(2, 2); break; case 4: GEMV_BX(4, 2); break; default: GEMV_BX(8, 2); } }
 #undef GEMV_BX
   return (int)cudaGetLastError();
 }

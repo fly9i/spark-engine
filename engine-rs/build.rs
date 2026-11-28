@@ -12,12 +12,13 @@ fn cache_dir() -> String {
     std::fs::create_dir_all(&d).unwrap();
     d
 }
-fn headers_hash() -> u64 {
+fn headers_hash(extra: &str) -> u64 {
     let mut names: Vec<_> = std::fs::read_dir("shim").unwrap().flatten().map(|e| e.path())
         .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("cuh") | Some("h") | Some("hpp"))).collect();
     names.sort();
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    for n in names { std::fs::read(&n).unwrap().hash(&mut h); }
+    for n in &names { std::fs::read(n).unwrap().hash(&mut h); }
+    extra.hash(&mut h);
     h.finish()
 }
 fn cached_object(source: &str, flags: &[String], hh: u64) -> String {
@@ -35,7 +36,7 @@ fn compile_all(jobs: &[(String, Vec<String>, String, String)]) {
     let todo: Vec<_> = jobs.iter().filter(|j| !Path::new(&j.3).exists()).collect();
     for batch in todo.chunks(par) {
         let children: Vec<_> = batch.iter().map(|(prog, flags, src, obj)| {
-            let tmp = format!("{obj}.tmp");
+            let tmp = format!("{obj}.{}.tmp", std::process::id());
             let child = Command::new(prog).args(flags).args(["-c", src.as_str(), "-o", tmp.as_str()]).spawn().expect("compiler");
             (child, tmp, obj.clone(), src.clone())
         }).collect();
@@ -71,8 +72,8 @@ fn main() {
         .replace("${nccl:Major}", "2").replace("${nccl:Minor}", "29")
         .replace("${nccl:Patch}", "7").replace("${nccl:Suffix}", "")
         .replace("${nccl:Version}", "22907");
-    std::fs::write(format!("{out}/nccl.h"), header).expect("generate NCCL header");
-    let hh = headers_hash();
+    std::fs::write(format!("{out}/nccl.h"), &header).expect("generate NCCL header");
+    let hh = headers_hash(&header);
     let cxx: Vec<String> = ["-O2", "-std=c++17", "-fPIC", "-DUSE_C10D_NCCL"].iter().map(|s| s.to_string())
         .chain([format!("-I{out}"), format!("-I{libtorch}/include"), format!("-I{libtorch}/include/torch/csrc/api/include"),
                 format!("-I{pyinc}"), format!("-I{cuda}/include")]).collect();

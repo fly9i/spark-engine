@@ -13,6 +13,7 @@ fi
 export QWEN_ASSETS=${QWEN_ASSETS:-$SPARK_HOME/assets/qwen38}
 vision=$([[ $QWEN_VISION == 1 ]] && echo on || echo off)
 bash "$here/stop-qwen.sh" > /dev/null 2>&1 || true
+rm -f /tmp/spark-qwen-engine.log
 (
   export SPARK_PYTHON=$py; source "$SPARK_HOME/scripts/env.sh"
   exec "$SPARK_BIN" qwen-serve "$QWEN_MODEL" "$socket"
@@ -22,16 +23,22 @@ echo $! > /tmp/spark-qwen-engine.pid
   limit=${QWEN_MEMGUARD_GIB:-8}; pid=$(cat /tmp/spark-qwen-engine.pid)
   while kill -0 "$pid" 2> /dev/null; do
     a=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
-    if [[ -z $a ]] || (( a < limit )); then echo "$(date '+%F %T') MemAvailable ${a} GiB < ${limit}: stopping $pid" >> /tmp/spark-qwen-memguard.log; kill -9 "$pid"; break; fi
+    if [[ -z $a ]] || (( a < limit )); then
+      kill -9 "$pid" 2> /dev/null || true
+      echo "$(date '+%F %T') MemAvailable ${a} GiB < ${limit}: stopping $pid" >> /tmp/spark-qwen-memguard.log 2> /dev/null || true
+      break
+    fi
     sleep 0.5
   done
 ) > /dev/null 2>&1 &
 echo $! > /tmp/spark-qwen-guard.pid
+ready=0
 for _ in $(seq 300); do
-  grep -q "ready on" /tmp/spark-qwen-engine.log 2> /dev/null && break
-  kill -0 "$(cat /tmp/spark-qwen-engine.pid)" 2> /dev/null || { echo "engine exited:"; tail -5 /tmp/spark-qwen-engine.log; exit 1; }
+  grep -q "ready on" /tmp/spark-qwen-engine.log 2> /dev/null && { ready=1; break; }
+  kill -0 "$(cat /tmp/spark-qwen-engine.pid)" 2> /dev/null || { echo "engine exited:"; tail -5 /tmp/spark-qwen-engine.log; bash "$here/stop-qwen.sh" > /dev/null 2>&1 || true; exit 1; }
   sleep 1
 done
+[[ $ready == 1 ]] || { echo "engine startup timed out"; tail -5 /tmp/spark-qwen-engine.log; bash "$here/stop-qwen.sh" > /dev/null 2>&1 || true; exit 1; }
 nohup "$py" "$here/qwen_server.py" --socket "$socket" --model-dir "$QWEN_MODEL" --port "$SPARK_PORT" --vision "$vision" \
   > /tmp/spark-qwen-front.log 2>&1 &
 echo $! > /tmp/spark-qwen-front.pid
@@ -39,4 +46,4 @@ for _ in $(seq 30); do
   curl -sf "http://127.0.0.1:$SPARK_PORT/health" > /dev/null 2>&1 && { echo "Qwen3.8-Flash-Next ready: http://$(hostname -I | awk '{print $1}'):$SPARK_PORT/v1"; exit 0; }
   sleep 1
 done
-echo "front end did not come up"; tail -5 /tmp/spark-qwen-front.log; exit 1
+echo "front end did not come up"; tail -5 /tmp/spark-qwen-front.log; bash "$here/stop-qwen.sh" > /dev/null 2>&1 || true; exit 1

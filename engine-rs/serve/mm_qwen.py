@@ -35,6 +35,8 @@ mm.Item.grid_tokens = property(lambda self: (self.canvas.shape[1] // FACTOR) * (
 
 def smart_resize(height, width, min_pixels, max_pixels, frames=1):
     """HF Qwen2VL smart_resize (frames = 1) / Qwen3VL video smart_resize (pixels counted over frames rounded to even)."""
+    if height <= 0 or width <= 0:
+        raise mm.MediaError(415, f"invalid media dimensions: {width}x{height}")
     if height < FACTOR or width < FACTOR:
         s = max(FACTOR / height, FACTOR / width)
         height, width = int(height * s), int(width * s)
@@ -131,7 +133,10 @@ def video_item_from_bytes(b, fps, max_frames, max_tokens, min_tokens=16):
                     raise mm.MediaError(415, "video decoding produced no frames")
                 for k in range(got, len(want_idx)):
                     put(k, prev)
-        return _clip(frames_of, idx, vs.codec_context.height, vs.codec_context.width, vfps, max_tokens)
+        w0, h0 = int(vs.codec_context.width or 0), int(vs.codec_context.height or 0)
+        if w0 <= 0 or h0 <= 0:
+            raise mm.MediaError(415, f"video has invalid dimensions: {w0}x{h0}")
+        return _clip(frames_of, idx, h0, w0, vfps, max_tokens)
     finally:
         c.close()
 

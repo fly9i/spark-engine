@@ -42,6 +42,8 @@ class MediaError(Exception):
 # ----------------------------------------------------------------------------- processor geometry
 def smart_resize(num_frames, height, width, temporal_factor=2, factor=28, min_tokens=16, max_tokens=8000):
     """HF Glm5Next smart_resize: an aligned canvas within the spatio-temporal token budget."""
+    if height <= 0 or width <= 0 or num_frames <= 0:
+        raise MediaError(415, f"invalid media dimensions: {num_frames}x{width}x{height}")
     ppt = temporal_factor * factor ** 2
     min_pixels, max_pixels = min_tokens * ppt, max_tokens * ppt
 
@@ -186,10 +188,15 @@ def fetch(src, pol, max_bytes):
         real, root = os.path.realpath(path), os.path.realpath(pol.local_root)
         if os.path.commonpath([real, root]) != root:
             raise MediaError(403, f"media path {path!r} is outside --allowed-local-media-path")
-        if os.path.getsize(real) > max_bytes:
-            raise MediaError(413, f"media larger than {max_bytes} bytes")
-        with open(real, "rb") as f:
-            return f.read()
+        if not os.path.isfile(real):
+            raise MediaError(400, f"media path {path!r} is not a regular file")
+        try:
+            if os.path.getsize(real) > max_bytes:
+                raise MediaError(413, f"media larger than {max_bytes} bytes")
+            with open(real, "rb") as f:
+                return f.read()
+        except OSError as e:
+            raise MediaError(400, f"cannot read media path {path!r}: {e}")
     if u.scheme and len(u.scheme) > 1:
         raise MediaError(400, f"unsupported media URL scheme {u.scheme!r}")
     try:                                              # bare base64
@@ -335,7 +342,9 @@ def video_item_from_bytes(b, fps, max_frames, max_tokens, min_tokens=16):
         if total <= 0:
             raise MediaError(415, "video has no frames")
         idx = sample_indices(total, vfps, fps, max_frames, total / vfps if vfps else None)
-        width, height = vs.codec_context.width, vs.codec_context.height
+        width, height = int(vs.codec_context.width or 0), int(vs.codec_context.height or 0)
+        if width <= 0 or height <= 0:
+            raise MediaError(415, f"video has invalid dimensions: {width}x{height}")
         th, tw, ch, cw = _video_canvas(len(idx), height, width, max_tokens, min_tokens)
         want = {}
         for k, i in enumerate(idx):
@@ -434,55 +443,84 @@ class CanvasStore:
                 return self.items[hx]
         path = os.path.join(self.dir, hx + ".u8")
         tmp = path + f".{threading.get_ident()}.tmp"
-        with open(tmp, "wb") as f:
-            f.write(item.canvas.tobytes())
-        os.replace(tmp, path)
+        try:
+            with open(tmp, "wb") as f:
+                f.write(item.canvas.tobytes())
+            os.replace(tmp, path)
+        except OSError as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise MediaError(503, f"cannot store media canvas: {e}")
         with self.lock:
             if hx not in self.files:
-                self.files[hx] = [path, item.canvas.nbytes, 0, time.time()]
+                self.files[hx] = [path, item.canvas.nbytes, 0, time.time(), False]
                 self.items[hx] = item
             self.by_key[key] = hx
             self._evict()
             return self.items[hx]
 
     def path(self, item):
-        return self.files[item.digest.hex()][0]
+        with self.lock:
+            f = self.files.get(item.digest.hex())
+            if f is None:
+                raise MediaError(503, "media canvas is no longer cached; please retry")
+            return f[0]
 
     def acquire(self, items):
         with self.lock:
-            for it in items:
-                self.files[it.digest.hex()][2] += 1
+            hxs = [it.digest.hex() for it in items]
+            for hx in hxs:
+                if hx not in self.files:
+                    raise MediaError(503, "media canvas evicted before execution; please retry")
+            for hx in hxs:
+                self.files[hx][2] += 1
 
     def release(self, items):
         with self.lock:
             for it in items:
                 f = self.files.get(it.digest.hex())
                 if f:
-                    f[2] -= 1
+                    f[2] = max(0, f[2] - 1)
                     f[3] = time.time()
+                    f[4] = True
             self._evict()
 
-    GRACE_S = 300    # a file prepared for a request stays until that request acquires it (prompt build -> run)
+    GRACE_S = 300    # an unreleased file stays until its request acquires it (prompt build -> run)
 
     def _evict(self):
         total = sum(f[1] for f in self.files.values())
         if total <= self.cap:
             return
         now = time.time()
-        for hx, f in sorted(self.files.items(), key=lambda kv: kv[1][3]):
-            if total <= self.cap:
-                break
-            if f[2] > 0 or now - f[3] < self.GRACE_S:
-                continue
+        hard_cap = max(self.cap * 2, self.cap + (64 << 20))
+        def drop(hx, f):
+            nonlocal total
             try:
                 os.unlink(f[0])
             except OSError:
                 pass
             total -= f[1]
             del self.files[hx]
-            del self.items[hx]
+            self.items.pop(hx, None)
             for k in [k for k, v in self.by_key.items() if v == hx]:
                 del self.by_key[k]
+        # Pass 1: evict unpinned items that were already released or past GRACE_S.
+        for hx, f in sorted(list(self.files.items()), key=lambda kv: kv[1][3]):
+            if total <= self.cap:
+                return
+            if f[2] > 0 or (not f[4] and now - f[3] < self.GRACE_S):
+                continue
+            drop(hx, f)
+        # Pass 2: if still above hard cap, evict oldest unpinned items to protect /dev/shm.
+        if total > hard_cap:
+            for hx, f in sorted(list(self.files.items()), key=lambda kv: kv[1][3]):
+                if total <= hard_cap:
+                    break
+                if f[2] > 0:
+                    continue
+                drop(hx, f)
 
 
 # ----------------------------------------------------------------------------- request parts
@@ -535,10 +573,17 @@ class Opts:
 
 
 def _tok_opt(d, name, pixels_name, default):
-    if d.get(name) is not None:
-        return int(d[name])
-    if d.get(pixels_name) is not None:
-        return max(1, int(d[pixels_name]) // (28 * 28))
+    try:
+        if d.get(name) is not None:
+            if isinstance(d[name], bool):
+                raise ValueError("bool")
+            return int(d[name])
+        if d.get(pixels_name) is not None:
+            if isinstance(d[pixels_name], bool):
+                raise ValueError("bool")
+            return max(1, int(d[pixels_name]) // (28 * 28))
+    except (TypeError, ValueError):
+        raise MediaError(400, f"invalid numeric media option for {name}/{pixels_name}")
     return default
 
 
@@ -570,10 +615,24 @@ class Media:
                 it = self.store.put(key, it)
             return it
         if kind == "video":
-            fps = float(kw.get("fps") or o.video_fps)
-            mf = int(kw.get("max_frames") or o.video_max_frames)
-            mx = max(64, min(int(kw.get("max_video_tokens") or o.max_video_tokens), o.video_token_cap))
+            try:
+                fps_raw = kw.get("fps")
+                fps = o.video_fps if fps_raw is None else float(fps_raw)
+                mf_raw = kw.get("max_frames")
+                mf = o.video_max_frames if mf_raw is None else int(mf_raw)
+                mx_raw = kw.get("max_video_tokens")
+                mx_val = o.max_video_tokens if mx_raw is None else int(mx_raw)
+            except (TypeError, ValueError):
+                raise MediaError(400, "invalid numeric video option (fps / max_frames / max_video_tokens)")
+            if not math.isfinite(fps) or fps <= 0 or fps > 120:
+                raise MediaError(400, f"video fps must be a finite number in (0, 120], got {fps}")
+            if mf < 1:
+                raise MediaError(400, f"max_frames must be at least 1, got {mf}")
+            mf = min(mf, o.video_max_frames)
+            mx = max(64, min(mx_val, o.video_token_cap))
             if isinstance(src, list):          # pre-sampled frames
+                if len(src) > mf:
+                    raise MediaError(400, f"video frame list has {len(src)} frames, exceeding max_frames={mf}")
                 raws = [fetch(s, self.pol, self.pol.image_max_bytes) for s in src]
                 key = hashlib.sha256(b"".join(hashlib.sha256(r).digest() for r in raws)).hexdigest() + f":f:{fps}:{mx}"
                 it = self.store.lookup(key)
@@ -591,13 +650,13 @@ class Media:
                 except MediaError:
                     if sniff(raw) != "image":
                         raise
-                    it = self._animated(raw, fps, mx)   # animations PyAV cannot open: frames via PIL
+                    it = self._animated(raw, fps, mf, mx)   # animations PyAV cannot open: frames via PIL
                 it.digest = digest(it)
                 it = self.store.put(key, it)
             return it
         raise MediaError(400, "this model has no audio encoder; audio input is not supported")
 
-    def _animated(self, raw, fps, mx):
+    def _animated(self, raw, fps, mf, mx):
         try:
             im = Image.open(io.BytesIO(raw))
         except Exception as e:
@@ -610,12 +669,14 @@ class Media:
                 durs.append(im.info.get("duration", 100) or 100)
         except EOFError:
             pass
-        # Uniform resampling at `fps` over the animation's time line.
+        if not frames:
+            raise MediaError(415, "animation has no frames")
+        # Uniform resampling at `fps` over the animation's time line, capped by max_frames.
         t, acc = [], 0.0
         for d in durs:
             t.append(acc)
-            acc += d / 1000.0
-        n = max(2, int(acc * fps))
+            acc += max(1.0, float(d)) / 1000.0
+        n = min(max(2, int(acc * fps)), mf)
         picks = [min(range(len(t)), key=lambda k: abs(t[k] - j / fps)) for j in range(n)]
         return video_item_from_frames([frames[k] for k in picks], fps, mx)
 

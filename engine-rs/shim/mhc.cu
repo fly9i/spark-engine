@@ -376,8 +376,15 @@ extern "C" int glm53_mhc_pre_fused_cuda(const float* residual,const void* fn,int
     const int slices=k/MHC_PRE_SLICE;
     if(fn_bf16)mhc_pre_partial_launch(residual,(const __nv_bfloat16*)fn,partial,rows,k,slices,stream);
     else mhc_pre_partial_launch(residual,(const float*)fn,partial,rows,k,slices,stream);
-    if(cl)mhc_pre_finish<true><<<mhc_finish_ctas(rows),1024,(slices*25+cl->k*33)*sizeof(float),stream>>>(partial,slices,residual,scale,base,ln,z,post,comb,rows,h,mhc_finish_reg(h),nullptr,0,nullptr,*cl);
-    else mhc_pre_finish<false><<<mhc_finish_ctas(rows),1024,(slices*25+(zr?h:0))*sizeof(float),stream>>>(partial,slices,residual,scale,base,ln,z,post,comb,rows,h,mhc_finish_reg(h),rsign,rbk,zr);
+    const size_t smem=(size_t)(cl?(slices*25+cl->k*33):(slices*25+(zr?h:0)))*sizeof(float);
+    if(smem>48*1024){
+      const cudaError_t err=cl
+        ?cudaFuncSetAttribute(mhc_pre_finish<true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)smem)
+        :cudaFuncSetAttribute(mhc_pre_finish<false>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)smem);
+      if(err!=cudaSuccess)return int(err);
+    }
+    if(cl)mhc_pre_finish<true><<<mhc_finish_ctas(rows),1024,smem,stream>>>(partial,slices,residual,scale,base,ln,z,post,comb,rows,h,mhc_finish_reg(h),nullptr,0,nullptr,*cl);
+    else mhc_pre_finish<false><<<mhc_finish_ctas(rows),1024,smem,stream>>>(partial,slices,residual,scale,base,ln,z,post,comb,rows,h,mhc_finish_reg(h),rsign,rbk,zr);
     return int(cudaGetLastError());
 }
 
@@ -480,14 +487,19 @@ __global__ void mhc_post_pre_partial(const float* __restrict__ x,const float* __
   for(int i=threadIdx.x;i<nt*25;i+=blockDim.x){const int tok=i/25,o=i%25;
     partial[((long long)slice*rows+row0+tok)*25+o]=(red[0][tok][o]+red[1][tok][o])+(red[2][tok][o]+red[3][tok][o]);}
 }
-static int glm53_mhc_post_pre_fused_cuda_rows(const float*,const float*,const float*,const float*,float*,const void*,int,const float*,const float*,const float*,float*,float*,float*,float*,int,int,const int8_t*,int,__half*,const SparkClamp*,cudaStream_t);
+static int glm53_mhc_post_pre_fused_cuda_rows(const float*,const float*,const float*,const float*,float*,const void*,int,const float*,const float*,const float*,float*,float*,float*,float*,int,int,const int8_t*,int,__half*,const SparkClamp*,bool,cudaStream_t);
 extern "C" int glm53_mhc_post_pre_fused_cuda(const float* x,const float* residual,const float* comb,const float* post,float* out,
     const void* fn,int fn_bf16,const float* scale,const float* base,const float* ln,float* partial,float* z,float* post_next,float* comb_next,int rows,int h,
     const int8_t* rsign,int rbk,__half* zr,const SparkClamp* cl,cudaStream_t stream){
   const int k=4*h;
   if(cl&&cl->k<1)cl=nullptr;
   if(rows<1||h%128||k%MHC_PRE_SLICE||(zr&&(!rsign||!mhc_rot_ok(h,rbk)))||(cl&&(zr||cl->k>SPARK_CLAMP_MAX_K)))return int(cudaErrorInvalidValue);
-  const int slices=k/MHC_PRE_SLICE;
+  // Compute plain once on original rows (matching mhc_pre_partial_launch) so GLM53_MHC_GROUP_ROWS tail chunks
+  // never switch precision mid-batch, and GLM53_VERIFY_INVARIANT=1 extends plain-TF32 up to 32 rows.
+  const char* tc=std::getenv("GLM53_MHC_PRE_TC");
+  const char* inv=std::getenv("GLM53_VERIFY_INVARIANT");
+  const int tc_rows=(inv&&inv[0]=='1')?32:8;
+  const bool plain=rows<=tc_rows&&tc&&tc[0]=='1';
   // GLM53_MHC_GROUP_ROWS=G (multiple of 8): prefill rows in groups of G, partial then finish per group, so the finish
   // re-reads the new residual from L2 instead of DRAM. Every row's arithmetic (its 8-row MMA tile, slice partials,
   // finish) is unchanged: L0.
@@ -496,24 +508,28 @@ extern "C" int glm53_mhc_post_pre_fused_cuda(const float* x,const float* residua
     for(int r0=0;r0<rows;r0+=grp){const int n=rows-r0<grp?rows-r0:grp;
       SparkClamp g;if(cl){g=*cl;if(g.count)g.count+=r0;}   // the count gate is per row too
       const int rc=glm53_mhc_post_pre_fused_cuda_rows(x+(long long)r0*h,residual+(long long)r0*k,comb+(long long)r0*16,post+(long long)r0*4,out+(long long)r0*k,
-        fn,fn_bf16,scale,base,ln,partial,z+(long long)r0*h,post_next+(long long)r0*4,comb_next+(long long)r0*16,n,h,rsign,rbk,zr?zr+(long long)r0*h:nullptr,cl?&g:nullptr,stream);
+        fn,fn_bf16,scale,base,ln,partial,z+(long long)r0*h,post_next+(long long)r0*4,comb_next+(long long)r0*16,n,h,rsign,rbk,zr?zr+(long long)r0*h:nullptr,cl?&g:nullptr,plain,stream);
       if(rc)return rc;}
     return 0;
   }
-  return glm53_mhc_post_pre_fused_cuda_rows(x,residual,comb,post,out,fn,fn_bf16,scale,base,ln,partial,z,post_next,comb_next,rows,h,rsign,rbk,zr,cl,stream);
+  return glm53_mhc_post_pre_fused_cuda_rows(x,residual,comb,post,out,fn,fn_bf16,scale,base,ln,partial,z,post_next,comb_next,rows,h,rsign,rbk,zr,cl,plain,stream);
 }
 static int glm53_mhc_post_pre_fused_cuda_rows(const float* x,const float* residual,const float* comb,const float* post,float* out,
     const void* fn,int fn_bf16,const float* scale,const float* base,const float* ln,float* partial,float* z,float* post_next,float* comb_next,int rows,int h,
-    const int8_t* rsign,int rbk,__half* zr,const SparkClamp* cl,cudaStream_t stream){
+    const int8_t* rsign,int rbk,__half* zr,const SparkClamp* cl,bool plain,cudaStream_t stream){
   const int k=4*h,slices=k/MHC_PRE_SLICE;
-  // Decode rows <= 8 with GLM53_MHC_PRE_TC=1 use the plain-TF32 MMA of mhc_pre_partial_tc<false> (what the
-  // separate decode pre uses); prefill keeps split-TF32. Either way bitwise the separate post + pre partial.
-  const char* tc=std::getenv("GLM53_MHC_PRE_TC");const bool plain=rows<=8&&tc&&tc[0]=='1';
   if(fn_bf16){if(plain)mhc_post_pre_partial<__nv_bfloat16,false><<<dim3(slices,(rows+7)/8),128,0,stream>>>(x,residual,comb,post,out,(const __nv_bfloat16*)fn,partial,rows,h);
               else mhc_post_pre_partial<__nv_bfloat16,true><<<dim3(slices,(rows+7)/8),128,0,stream>>>(x,residual,comb,post,out,(const __nv_bfloat16*)fn,partial,rows,h);}
   else{if(plain)mhc_post_pre_partial<float,false><<<dim3(slices,(rows+7)/8),128,0,stream>>>(x,residual,comb,post,out,(const float*)fn,partial,rows,h);
        else mhc_post_pre_partial<float,true><<<dim3(slices,(rows+7)/8),128,0,stream>>>(x,residual,comb,post,out,(const float*)fn,partial,rows,h);}
-  if(cl)mhc_pre_finish<true><<<mhc_finish_ctas(rows),1024,(slices*25+cl->k*33)*sizeof(float),stream>>>(partial,slices,out,scale,base,ln,z,post_next,comb_next,rows,h,mhc_finish_reg(h),nullptr,0,nullptr,*cl);
-  else mhc_pre_finish<false><<<mhc_finish_ctas(rows),1024,(slices*25+(zr?h:0))*sizeof(float),stream>>>(partial,slices,out,scale,base,ln,z,post_next,comb_next,rows,h,mhc_finish_reg(h),rsign,rbk,zr);
+  const size_t smem=(size_t)(cl?(slices*25+cl->k*33):(slices*25+(zr?h:0)))*sizeof(float);
+  if(smem>48*1024){
+    const cudaError_t err=cl
+      ?cudaFuncSetAttribute(mhc_pre_finish<true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)smem)
+      :cudaFuncSetAttribute(mhc_pre_finish<false>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)smem);
+    if(err!=cudaSuccess)return int(err);
+  }
+  if(cl)mhc_pre_finish<true><<<mhc_finish_ctas(rows),1024,smem,stream>>>(partial,slices,out,scale,base,ln,z,post_next,comb_next,rows,h,mhc_finish_reg(h),nullptr,0,nullptr,*cl);
+  else mhc_pre_finish<false><<<mhc_finish_ctas(rows),1024,smem,stream>>>(partial,slices,out,scale,base,ln,z,post_next,comb_next,rows,h,mhc_finish_reg(h),rsign,rbk,zr);
   return int(cudaGetLastError());
 }

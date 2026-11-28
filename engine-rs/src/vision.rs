@@ -179,7 +179,9 @@ pub fn parse_items(v:&serde_json::Value)->Result<Vec<MmItem>,String> {
         let (frames,height,width)=(get("frames")?,get("height")?,get("width")?);
         if frames<1||height<28||width<28||height%28!=0||width%28!=0 {return Err(format!("mm item has a bad canvas {frames}x{height}x{width}"));}
         let meta=std::fs::metadata(&path).map_err(|e|format!("mm canvas {}: {e}",path.display()))?;
-        if meta.len() as i64!=frames*height*width*3 {return Err(format!("mm canvas {} has {} bytes, expected {}",path.display(),meta.len(),frames*height*width*3));}
+        let want=frames.checked_mul(height).and_then(|v|v.checked_mul(width)).and_then(|v|v.checked_mul(3))
+            .ok_or_else(||format!("mm canvas {frames}x{height}x{width} overflows byte size"))?;
+        if meta.len()!=want as u64 {return Err(format!("mm canvas {} has {} bytes, expected {want}",path.display(),meta.len()));}
         let tokens_per=(height/28)*(width/28);
         let mut segments=Vec::new();
         for s in it["segments"].as_array().ok_or("mm item without segments")? {
@@ -226,7 +228,7 @@ impl MmState {
             let need:Vec<usize>=(0..it.segments.len()).filter(|&si|{let (p,l,_)=it.segments[si];p<end&&p+l>begin&&!self.done.contains_key(&(ii,si))}).collect();
             if !need.is_empty() {
                 // Video groups share one grid: batch up to ~16K patches per forward (bounded activations).
-                let per=(it.height/14)*(it.width/14);let batch=((16384/per).max(1)) as usize;
+                let per=(it.height/14)*(it.width/14);let batch=if it.frames>1 {((16384/per).max(1)) as usize} else {1};
                 for group in need.chunks(batch) {
                     let canvas=read_frames(it,group.iter().map(|&si|it.segments[si].2).collect::<Vec<_>>().as_slice(),vision.dev);
                     let (px,g,gh,gw)=vision.pixels(&canvas);

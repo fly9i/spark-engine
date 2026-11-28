@@ -157,10 +157,99 @@ pub fn c12_register(w: &Tensor) -> i64 {
     bytes
 }
 
+/// DS41_MARKOV_FUSED (default on; 0 off): fuse Markov head C12 GEMV (K = 256) + head logits addition + Gumbel top-1
+/// argmax into one kernel pass (bitwise identical to bf16_gemv + logits + rs_gumbel_argmax_packet).
+pub fn markov_fused_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_MARKOV_FUSED").map_or(true, |v| v != "0")) }
+#[allow(clippy::too_many_arguments)]
+pub fn c12_markov_argmax(
+    emb: &Tensor, w: &Tensor, logits: &Tensor, blk: i64, step_j: i64, start: i64,
+    temps: &Tensor, keys: &Tensor, packet: &Tensor, world: i64, rank: i64,
+) -> bool {
+    if !markov_fused_on() { return false; }
+    let Some(c) = c12_lookup(w) else { return false; };
+    let (m, k) = (emb.size()[0], emb.size()[1]);
+    let n = w.size()[0];
+    if !(1..=8).contains(&m) || k != 256 || n % 16 != 0 { return false; }
+    if logits.kind() != Kind::Float || !logits.is_contiguous() || logits.size() != [m * blk, n] { return false; }
+    let x = emb.to_kind(Kind::BFloat16).contiguous();
+    const NB: i64 = 192;
+    let part_v = Tensor::empty([m * NB], (Kind::Float, x.device()));
+    let part_i = Tensor::empty([m * NB], (Kind::Int, x.device()));
+    extern "C" {
+        fn glm53_c12_markov_argmax_cuda(
+            x: *const std::ffi::c_void, m8: *const std::ffi::c_void, e4: *const std::ffi::c_void, eb: *const std::ffi::c_void,
+            ptr: *const i32, col: *const i32, val: *const std::ffi::c_void, logits: *const f32, blk: i32, step_j: i32,
+            m: i32, n: i32, k: i32, start: i64, temps: *const f32, keys: *const u64,
+            part_v: *mut f32, part_i: *mut i32, packet: *mut f32, world: i32, rank: i32, nb: i32, pdl: i32,
+            st: *mut std::ffi::c_void,
+        ) -> i32;
+        fn ds41_pdl_enabled() -> i32;
+    }
+    assert_eq!(unsafe { glm53_c12_markov_argmax_cuda(
+        x.data_ptr(), c[0].data_ptr(), c[1].data_ptr(), c[2].data_ptr(), c[3].data_ptr().cast(), c[4].data_ptr().cast(), c[5].data_ptr(),
+        logits.data_ptr() as *const f32, blk as i32, step_j as i32, m as i32, n as i32, k as i32, start,
+        temps.data_ptr().cast(), keys.data_ptr().cast(), part_v.data_ptr().cast(), part_i.data_ptr().cast(), packet.data_ptr().cast(),
+        world as i32, rank as i32, NB as i32, ds41_pdl_enabled(), rs_current_stream()) }, 0, "c12_markov_argmax");
+    true
+}
+
+/// Fused Markov head C12 GEMV (K = 256) + logits add + Gumbel top-2 argmax (DS41_SPEC_TREE).
+/// `b_mod <= m` allows packing primary chain (`0..b_mod`) and alt0 branch (`b_mod..2*b_mod`) in one weight pass.
+#[allow(clippy::too_many_arguments)]
+pub fn c12_markov_top2(
+    emb: &Tensor, w: &Tensor, logits: &Tensor, blk: i64, step_j: i64, b_mod: i64, start: i64,
+    temps: &Tensor, keys: &Tensor, packet2: &Tensor, world: i64, rank: i64,
+) -> bool {
+    if !markov_fused_on() { return false; }
+    let Some(c) = c12_lookup(w) else { return false; };
+    let (m, k) = (emb.size()[0], emb.size()[1]);
+    let n = w.size()[0];
+    if !(1..=8).contains(&m) || b_mod < 1 || b_mod > m || k != 256 || n % 16 != 0 { return false; }
+    if logits.kind() != Kind::Float || !logits.is_contiguous() || logits.size() != [b_mod * blk, n] { return false; }
+    let x = emb.to_kind(Kind::BFloat16).contiguous();
+    const NB: i64 = 192;
+    let pv1 = Tensor::empty([m * NB], (Kind::Float, x.device()));
+    let pi1 = Tensor::empty([m * NB], (Kind::Int, x.device()));
+    let pv2 = Tensor::empty([m * NB], (Kind::Float, x.device()));
+    let pi2 = Tensor::empty([m * NB], (Kind::Int, x.device()));
+    extern "C" {
+        fn glm53_c12_markov_top2_cuda(
+            x: *const std::ffi::c_void, m8: *const std::ffi::c_void, e4: *const std::ffi::c_void, eb: *const std::ffi::c_void,
+            ptr: *const i32, col: *const i32, val: *const std::ffi::c_void, logits: *const f32, blk: i32, step_j: i32, b_mod: i32,
+            m: i32, n: i32, k: i32, start: i64, temps: *const f32, keys: *const u64,
+            pv1: *mut f32, pi1: *mut i32, pv2: *mut f32, pi2: *mut i32, packet2: *mut f32,
+            world: i32, rank: i32, nb: i32, pdl: i32, st: *mut std::ffi::c_void,
+        ) -> i32;
+        fn ds41_pdl_enabled() -> i32;
+    }
+    assert_eq!(unsafe { glm53_c12_markov_top2_cuda(
+        x.data_ptr(), c[0].data_ptr(), c[1].data_ptr(), c[2].data_ptr(), c[3].data_ptr().cast(), c[4].data_ptr().cast(), c[5].data_ptr(),
+        logits.data_ptr() as *const f32, blk as i32, step_j as i32, b_mod as i32, m as i32, n as i32, k as i32, start,
+        temps.data_ptr().cast(), keys.data_ptr().cast(), pv1.data_ptr().cast(), pi1.data_ptr().cast(), pv2.data_ptr().cast(), pi2.data_ptr().cast(),
+        packet2.data_ptr().cast(), world as i32, rank as i32, NB as i32, ds41_pdl_enabled(), rs_current_stream()) }, 0, "c12_markov_top2");
+    true
+}
+
+/// Cross-rank top-2 selection on device from allreduced `packet2 [world, m, 4]` -> `(tok1 [m] Int64, tok2 [m] Int64, margin [m] Float)`.
+pub fn choose_top2(packet2: &Tensor) -> (Tensor, Tensor, Tensor) {
+    let (world, rows) = (packet2.size()[0], packet2.size()[1]);
+    let dev = packet2.device();
+    let tok1 = Tensor::empty([rows], (Kind::Int64, dev));
+    let tok2 = Tensor::empty([rows], (Kind::Int64, dev));
+    let margin = Tensor::empty([rows], (Kind::Float, dev));
+    extern "C" {
+        fn glm53_choose_top2_cuda(packet2: *const f32, world: i32, rows: i32, tok1: *mut i64, tok2: *mut i64, margin: *mut f32, st: *mut std::ffi::c_void) -> i32;
+    }
+    assert_eq!(unsafe { glm53_choose_top2_cuda(packet2.data_ptr().cast(), world as i32, rows as i32, tok1.data_ptr().cast(), tok2.data_ptr().cast(), margin.data_ptr().cast(), rs_current_stream()) }, 0, "choose_top2");
+    (tok1, tok2, margin)
+}
+
 /// DS41_GEMV_BX=0: wo_a on the CUDA-core FP8 GEMV (cost linear in the rows) instead of the BF16-MMA one.
 pub fn gemv_bx_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_GEMV_BX").map_or(true, |v| v != "0")) }
+/// DS41_WOA_BX32=0: cap wo_a's grouped FP8 GEMV at 16 rows instead of 32 (two m16 tiles, one weight read; bitwise L0).
+pub fn woa_bx32_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_WOA_BX32").map_or(true, |v| v != "0")) }
 /// Largest row count of fp8_gemv_grouped.
-pub fn grouped_max_rows() -> i64 { if gemv_bx_on() { 16 } else { 8 } }
+pub fn grouped_max_rows() -> i64 { if gemv_bx_on() { if woa_bx32_on() { 32 } else { 16 } } else { 8 } }
 
 /// Grouped (block-diagonal) FP8 GEMV: W [G * rpg, k] whose row group g reads the input's g-th k elements; x [m, G * k]
 /// (m <= grouped_max_rows()) -> FP32 [m, G * rpg] (wo_a's groups in one launch).
@@ -379,7 +468,7 @@ pub fn sparse_attn_into(q: &Tensor, pools: [Option<&Tensor>; 3], window: Option<
 
 /// One sequence of sparse_attn_multi (shim Ds41AttnSeq).
 #[repr(C)]
-pub struct AttnSeq { a: *const std::ffi::c_void, b: *const std::ffi::c_void, c: *const std::ffi::c_void, idx: *const i64, start: i64, lo: i64, na: i32, n: i32, k: i32, pad: i32 }
+pub struct AttnSeq { a: *const std::ffi::c_void, b: *const std::ffi::c_void, c: *const std::ffi::c_void, idx: *const i64, start: i64, lo: i64, na: i32, n: i32, k: i32, pad: i32, anc: *const u8 }
 
 /// The sparse attention of several sequences' rows in one launch (decode / verify batches; same bits as one call per
 /// sequence): q [T, H, 512] and out [T, H, 512] BF16 of all rows, pos [T]; per sequence, in row order, (ring, chunk keys
@@ -406,13 +495,45 @@ pub fn sparse_attn_multi(q: &Tensor, seqs: &[(&Tensor, &Tensor, Option<&Tensor>,
 fn attn_descs(seqs: &[(&Tensor, &Tensor, Option<&Tensor>, &Tensor, i64, i64)], w: i64) -> Vec<AttnSeq> {
     seqs.iter().map(|(a, b, c, i, start, lo)| AttnSeq {
         a: a.data_ptr(), b: b.data_ptr(), c: c.map_or(std::ptr::null(), |c| c.data_ptr() as *const std::ffi::c_void), idx: i.data_ptr() as *const i64,
-        start: *start, lo: *lo, na: a.size()[0] as i32, n: b.size()[0] as i32, k: (w + i.size()[1]) as i32, pad: 0 }).collect()
+        start: *start, lo: *lo, na: a.size()[0] as i32, n: b.size()[0] as i32, k: (w + i.size()[1]) as i32, pad: 0, anc: std::ptr::null() }).collect()
+}
+/// Tree-aware `sparse_attn_multi`: single-launch window+compressed sparse attention for 1..=16 rows using per-row
+/// ancestor tables `[n][16]` (no host widx/arange/cat/where).
+#[allow(clippy::type_complexity)]
+pub fn sparse_attn_multi_tree(q: &Tensor, seqs: &[(&Tensor, &Tensor, Option<&Tensor>, &Tensor, i64, i64, Option<&[[u8; 16]]>)], w: i64, pos: &Tensor, sink: &Tensor, scale: f64, out: &Tensor) -> bool {
+    let (t, h, d) = (q.size()[0], q.size()[1], q.size()[2]);
+    let bf = |x: &Tensor| x.kind() == Kind::BFloat16 && x.is_contiguous();
+    if d != 512 || h > 32 || t > 16 || !bf(q) || !bf(out) || out.size() != q.size() || pos.kind() != Kind::Int64 || !pos.is_contiguous() { return false; }
+    if seqs.iter().any(|(a, b, c, i, _, _, _)| !bf(a) || !bf(b) || c.is_some_and(|c| !bf(c)) || i.kind() != Kind::Int64 || !i.is_contiguous()) { return false; }
+    if seqs.iter().map(|s| s.1.size()[0]).sum::<i64>() != t { return false; }
+    let desc = attn_descs_tree(seqs, w);
+    let sink = sink.to_kind(Kind::Float).contiguous();
+    let wsb = unsafe { ds41_sparse_attn_ws_bytes(t as i32, h as i32) } as i64;
+    let ws = Tensor::empty([wsb], (Kind::Uint8, q.device()));
+    let rc = unsafe { ds41_sparse_attn_multi(q.data_ptr(), desc.as_ptr(), desc.len() as i32, w as i32, pos.data_ptr() as *const i64, sink.data_ptr() as *const f32,
+        out.data_ptr(), h as i32, scale as f32, ws.data_ptr(), rs_current_stream()) };
+    if rc == 2 { return false; }
+    assert_eq!(rc, 0, "ds41_sparse_attn_multi (tree)");
+    true
+}
+
+#[allow(clippy::type_complexity)]
+fn attn_descs_tree(seqs: &[(&Tensor, &Tensor, Option<&Tensor>, &Tensor, i64, i64, Option<&[[u8; 16]]>)], w: i64) -> Vec<AttnSeq> {
+    seqs.iter().map(|(a, b, c, i, start, lo, anc)| AttnSeq {
+        a: a.data_ptr(), b: b.data_ptr(), c: c.map_or(std::ptr::null(), |c| c.data_ptr() as *const std::ffi::c_void), idx: i.data_ptr() as *const i64,
+        start: *start, lo: *lo, na: a.size()[0] as i32, n: b.size()[0] as i32, k: (w + i.size()[1]) as i32, pad: 0,
+        anc: anc.map_or(std::ptr::null(), |t| t.as_ptr().cast()) }).collect()
 }
 extern "C" {
     fn ds41_sparse_attn_multi_dev(q: *const std::ffi::c_void, seqs: *const AttnSeq, nseq: i32, w: i32, pos: *const i64, sink: *const f32, out: *mut std::ffi::c_void,
                                   h: i32, scale: f32, ws: *mut std::ffi::c_void, md: *const std::ffi::c_void, fused: *mut i32, st: *mut std::ffi::c_void) -> i32;
     fn ds41_attn_multi_build(seqs: *const AttnSeq, nseq: i32, w: i32, pos: *const i64, h: i32, out: *mut std::ffi::c_void) -> i32;
     fn ds41_attn_multi_bytes() -> usize;
+    fn ds41_mtp_mid_desc_bytes() -> usize;
+    fn ds41_mtp_mid_desc_fill(wins: *const *const std::ffi::c_void, nwins: *const i32, bsz: i32, host_out: *mut std::ffi::c_void) -> i32;
+    fn ds41_mtp_window_attn_ws_bytes(bsz: i32, blk: i32, h: i32, w: i32) -> usize;
+    fn ds41_mtp_window_attn(q: *const std::ffi::c_void, kv: *const std::ffi::c_void, desc_dev: *const std::ffi::c_void, sink: *const f32,
+                            out: *mut std::ffi::c_void, bsz: i32, blk: i32, h: i32, w: i32, scale: f32, ws: *mut std::ffi::c_void, st: *mut std::ffi::c_void) -> i32;
     fn ds41_h2d(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, n: usize, st: *mut std::ffi::c_void) -> i32;
     fn ds41_event_new() -> *mut std::ffi::c_void;
     fn ds41_event_record(e: *mut std::ffi::c_void, st: *mut std::ffi::c_void) -> i32;
@@ -424,12 +545,50 @@ extern "C" {
 }
 /// DS41_MID_GRAPH: bytes of the device descriptor (shim Multi) of one captured sparse_attn_multi_dev launch.
 pub fn attn_multi_bytes() -> usize { unsafe { ds41_attn_multi_bytes() } }
+/// DS41_MTP_SINGLE_GRAPH: bytes of one MTP layer's device descriptor (MtpMidDesc).
+pub fn mtp_mid_desc_bytes() -> usize { unsafe { ds41_mtp_mid_desc_bytes() } }
+/// Fill one MTP layer's host descriptor bytes for `wins` (each sequence's mtp_win[i]) and `nwins` (min(pos, W)).
+pub fn mtp_mid_desc_fill(wins: &[&Tensor], nwins: &[i32], out: &mut [u8]) {
+    assert_eq!(wins.len(), nwins.len());
+    assert!(out.len() >= mtp_mid_desc_bytes());
+    let ptrs: Vec<*const std::ffi::c_void> = wins.iter().map(|t| { assert!(t.is_contiguous() && t.kind() == Kind::BFloat16); t.data_ptr() as *const std::ffi::c_void }).collect();
+    assert_eq!(unsafe { ds41_mtp_mid_desc_fill(ptrs.as_ptr(), nwins.as_ptr(), ptrs.len() as i32, out.as_mut_ptr().cast()) }, 0, "ds41_mtp_mid_desc_fill");
+}
+/// Workspace bytes for `mtp_window_attn_dev` (MODE 3 split-K when resident on SMs).
+pub fn mtp_window_attn_ws_bytes(bsz: i64, blk: i64, h: i64, w: i64) -> i64 {
+    unsafe { ds41_mtp_window_attn_ws_bytes(bsz as i32, blk as i32, h as i32, w as i32) as i64 }
+}
+/// Single-launch MTP window attention reading per-sequence (win_ptr, nwin) from device descriptor `desc_dev`.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_window_attn_dev(q: &Tensor, kv: &Tensor, desc_dev: *const std::ffi::c_void, sink: &Tensor, out: &Tensor, bsz: i64, blk: i64, w: i64, scale: f64, ws: Option<&Tensor>) -> bool {
+    let (t, h, d) = (q.size()[0], q.size()[1], q.size()[2]);
+    if t != bsz * blk || d != 512 || h > 32 || !q.is_contiguous() || q.kind() != Kind::BFloat16 || !kv.is_contiguous() || kv.kind() != Kind::BFloat16 || !out.is_contiguous() || out.kind() != Kind::BFloat16 {
+        return false;
+    }
+    let sink = sink.to_kind(Kind::Float).contiguous();
+    let wsp = ws.map_or(std::ptr::null_mut(), |w| w.data_ptr());
+    let rc = unsafe { ds41_mtp_window_attn(q.data_ptr(), kv.data_ptr(), desc_dev, sink.data_ptr() as *const f32, out.data_ptr(), bsz as i32, blk as i32, h as i32, w as i32, scale as f32, wsp, rs_current_stream()) };
+    if rc == 2 { return false; }
+    assert_eq!(rc, 0, "ds41_mtp_window_attn");
+    true
+}
 /// The descriptor sparse_attn_multi would pass for these sequences, written into `out` (host bytes for the device copy
 /// a captured sparse_attn_multi_dev reads). None: not supported (as sparse_attn_multi); Some(false): written, but a
 /// fused launch does not take these rows (too many tiles per split).
 pub fn attn_multi_build(seqs: &[(&Tensor, &Tensor, Option<&Tensor>, &Tensor, i64, i64)], w: i64, pos: &Tensor, h: i64, out: &mut [u8]) -> Option<bool> {
     assert!(out.len() >= attn_multi_bytes());
     let desc = attn_descs(seqs, w);
+    match unsafe { ds41_attn_multi_build(desc.as_ptr(), desc.len() as i32, w as i32, pos.data_ptr() as *const i64, h as i32, out.as_mut_ptr().cast()) } {
+        0 => Some(true),
+        1 => Some(false),
+        _ => None,
+    }
+}
+/// Tree-aware `attn_multi_build`: each sequence optionally provides per-row ancestor tables `[n][16]`.
+#[allow(clippy::type_complexity)]
+pub fn attn_multi_build_tree(seqs: &[(&Tensor, &Tensor, Option<&Tensor>, &Tensor, i64, i64, Option<&[[u8; 16]]>)], w: i64, pos: &Tensor, h: i64, out: &mut [u8]) -> Option<bool> {
+    assert!(out.len() >= attn_multi_bytes());
+    let desc = attn_descs_tree(seqs, w);
     match unsafe { ds41_attn_multi_build(desc.as_ptr(), desc.len() as i32, w as i32, pos.data_ptr() as *const i64, h as i32, out.as_mut_ptr().cast()) } {
         0 => Some(true),
         1 => Some(false),
@@ -844,8 +1003,8 @@ pub struct WideScope(bool);
 extern "C" { fn ds41_hc_narrow_max(v: i32); fn ds41_moe_gr16_max(v: i32); }
 impl WideScope {
     pub fn new() -> WideScope {
-        if hc32_on() { unsafe { ds41_hc_narrow_max(32) }; }
-        if inv_moe_on() { unsafe { ds41_moe_gr16_max(32) }; }
+        if hc32_on() { unsafe { ds41_hc_narrow_max(inv_rows() as i32) }; }
+        if inv_moe_on() { unsafe { ds41_moe_gr16_max(inv_rows() as i32) }; }
         WideScope(WIDE.with(|w| w.replace(true)))
     }
 }
@@ -860,12 +1019,34 @@ impl Drop for WideScope {
 /// (Not with DS41_GEMV_PREQ_ROWS above 17, a diagnostic setting: 17..32 rows need the pre-quantized input, the kernel
 /// entry refuses them otherwise.)
 pub fn few_rows() -> i64 { if gemv32_on() && gemv_preq_rows() <= 17 && WIDE.with(|w| w.get()) { 32 } else { 16 } }
+/// DS41_INV_ROWS (with DS41_BATCH_INVARIANT=1; 32 default, or 64): rows of one decode / verify call the batch-invariant
+/// paths cover -- the one limit for serve.rs's verify row cap and the scoped kernel limits (WideScope: the mHC 160-slice
+/// path, the routed experts' 16-row items; wide_rows: the MX GEMV, the shared expert's parallel branch; wo_a's chunks).
+/// 33..64 rows take the <= 32-row invariant paths in pieces (MX GEMV calls of <= 32 rows, the mHC mix as its own
+/// kernels: one CTA per (token, slice) and per token, so the same per row at any count up to the limit), so every row
+/// still gets its c=1 bits (ds41-kernel-test DS41_KT_ONLY=w64). Without the switch: 32 (the diagnostic DS41_GEMV32 /
+/// DS41_HC32 / DS41_INV_* keep their 32-row behaviour).
+pub fn inv_rows() -> i64 {
+    static E: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *E.get_or_init(|| match std::env::var("DS41_INV_ROWS").ok().as_deref() {
+        None | Some("") | Some("32") => 32,
+        Some("64") if batch_inv_on() => 64,
+        Some("64") => 32,
+        Some(v) => { eprintln!("[ds41] DS41_INV_ROWS={v} not supported (32 or 64): 32"); 32 }
+    })
+}
+/// Rows the few-row decode paths take inside a WideScope: inv_rows() when the 32-row paths are open (few_rows() 32),
+/// above 32 in calls of <= 32 rows; else few_rows().
+pub fn wide_rows() -> i64 { let f = few_rows(); if f == 32 { inv_rows() } else { f } }
 /// `hc_mix` of a few rows (1..16, the 160-slice path) as side jobs of the next two MX GEMVs on this stream: the partial
 /// sums in the first one's grid, the finalize in the second's (shim/ds41_hc_job.cuh; the same operations as hc_mix's
 /// kernels, so the same bits). The caller makes sure those two GEMVs come next and that nothing reads the results
 /// before the second. None (nothing queued) when the shape does not take that path.
 pub fn hc_mix_jobs(h: &Tensor, f: &Tensor, scale: &Tensor, base: &Tensor, norm_eps: f64, eps: f64, iters: i64) -> Option<(Tensor, Tensor, Tensor)> {
     let (t, d) = (h.size()[0], h.size()[2]);
+    // 33..64 rows (DS41_INV_ROWS=64) take no jobs: None, the caller runs hc_mix (the 160-slice kernels up to 64 tokens
+    // inside a WideScope). Split job pairs for the two calls of each chunked GEMV were bitwise the same but not faster
+    // (per 33..64-row verify call 207.7 - 209.4 ms vs 205.6 standalone, 2026-11-11, logs/perf-20261110/inv64).
     let lim = if hc32_on() { few_rows() } else { 16 };
     if t < 1 || t > lim || unsafe { ds41_hc_slices(t as i32, d as i32) } != 160 { return None; }
     let h = h.to_kind(Kind::BFloat16).contiguous();
@@ -901,6 +1082,28 @@ fn gemv_mx(x: &Tensor, w: &Tensor, ws: &Tensor, ob16: bool) -> Tensor {
     let (m, k) = (x.size()[0], x.size()[1]);
     let n = w.size()[0];
     let y = Tensor::empty([m, n], (if ob16 { Kind::BFloat16 } else { Kind::Float }, x.device()));
+    if m > 32 {
+        // DS41_INV_ROWS=64 (wide_rows): 33..64 rows as calls of 32 + the rest (the kernel takes <= 32; every row's bits
+        // are its <= 16-row call's in either) into row ranges of y, the input quantized once for all rows (act_quant
+        // is per row: the bytes each call would make). A queued mix job goes to the calls in order, as to separate
+        // GEMVs (hc_mix_jobs queues none above 32 rows; a <= 32-row pair goes to the first two calls).
+        let (q, s) = act_quant_fp8(&x);
+        let mut r = 0;
+        while r < m {
+            let c = 32.min(m - r);
+            let job = GEMV_JOBS.with(|q| q.borrow_mut().pop_front());
+            let (xr, qr, sr, yr) = (x.narrow(0, r, c), q.narrow(0, r, c), s.narrow(0, r, c), y.narrow(0, r, c));
+            let jp = job.as_ref().map(|(j, _)| j);
+            let rc = match jp {
+                Some(j) => unsafe { ds41_fp8_gemv_mx_job(xr.data_ptr(), qr.data_ptr(), sr.data_ptr(), w.data_ptr(), ws.data_ptr(), yr.data_ptr(), c as i32, n as i32, k as i32, ob16 as i32, j, rs_current_stream()) },
+                None => unsafe { ds41_fp8_gemv_mx_q(xr.data_ptr(), qr.data_ptr(), sr.data_ptr(), w.data_ptr(), ws.data_ptr(), yr.data_ptr(), c as i32, n as i32, k as i32, ob16 as i32, rs_current_stream()) },
+            };
+            assert_eq!(rc, 0, "ds41_fp8_gemv_mx (chunk)");
+            if let Some((_, ts)) = job { SIDE_HOLD.with(|h| if let Some(v) = h.borrow_mut().as_mut() { v.extend(ts) }); }
+            r += c;
+        }
+        return y;
+    }
     // the input is act-quantized by every CTA in shared memory when it fits, else by a kernel first; from
     // DS41_GEMV_PREQ_ROWS rows (default 2; 99 off) always by one act_quant_fp8 kernel: the same bytes, so the same result,
     // and each CTA no longer quantizes all m x k inputs itself (wo_b at 8 rows 102 -> 69 us)
@@ -1086,6 +1289,8 @@ pub fn moe_mx_par(x: &Tensor, route: impl FnOnce() -> (Tensor, Tensor), w: [&Ten
     assert_eq!(unsafe { rs_stream_join(1) }, 0, "rs_stream_join");
     drop(hold);
     assert_eq!(unsafe { ds41_moe_mx_combine(ws.data_ptr(), r as i32, i as i32, topk as i32, e as i32, ys.data_ptr() as *const f32, y.data_ptr() as *mut f32, rs_current_stream()) }, 0, "ds41_moe_mx_combine");
+    extern "C" { fn rs_tensor_record_stream(t: *const std::ffi::c_void) -> i32; }
+    assert_eq!(unsafe { rs_tensor_record_stream(ys.as_ptr().cast()) }, 0, "rs_tensor_record_stream");
     y
 }
 
@@ -1558,6 +1763,162 @@ fn w32_test(ck: &super::load::Checkpoint, dev: tch::Device) {
     assert_eq!(bad, 0, "w32: a 17..32-row path differs from the <= 16-row path");
 }
 
+/// ds41-kernel-test (DS41_KT_ONLY=w64; run with DS41_BATCH_INVARIANT=1 DS41_INV_ROWS=64): rows of 33 / 40 / 48 / 56 / 64-row
+/// calls on the paths kern::inv_rows() = 64 opens are bitwise the same rows from the single-stream sized calls: the MX
+/// GEMV (every decode shape, FP32 and BF16 out; chunked) against 16-row chunks and single rows; the router's C12 GEMV in
+/// few_rows() chunks (as Model::moe_route) against 16- and 8-row chunks; the 160-slice mHC mix (standalone; no jobs
+/// above 32 rows; a 16-row job pair taken by one chunked GEMV) against 16-row chunks; the
+/// routed experts (real layer weights, 2-bit scales, 16-row items up to 64) against 8-row calls and single rows, and
+/// the shared-expert parallel branch against the plain call; wo_a's grouped-GEMV chunks (as Model DS41_INV_WOA) against 8-row chunks and single
+/// rows; plus times.
+fn w64_test(ck: &super::load::Checkpoint, dev: tch::Device) {
+    assert!(batch_inv_on() && inv_rows() == 64, "w64 test: set DS41_BATCH_INVARIANT=1 DS41_INV_ROWS=64");
+    let _w = WideScope::new();
+    assert_eq!((few_rows(), wide_rows()), (32, 64));
+    let time = |f: &dyn Fn() -> Tensor| { for _ in 0..3 { let _ = f(); } tch::Cuda::synchronize(0);
+        let t = std::time::Instant::now(); for _ in 0..20 { let _ = f(); } tch::Cuda::synchronize(0); t.elapsed().as_secs_f64() * 1e6 / 20.0 };
+    let chunks = |x: &Tensor, c: i64, f: &dyn Fn(&Tensor) -> Tensor| -> Tensor {
+        let m = x.size()[0];
+        Tensor::cat(&(0..m).step_by(c as usize).map(|r| f(&x.narrow(0, r, c.min(m - r)))).collect::<Vec<_>>(), 0)
+    };
+    let ms = [33i64, 40, 48, 56, 64];
+    let mut bad = 0;
+    // MX GEMV
+    for (name, n, k) in [("qakv/3", 608i64, 5120i64), ("wq_b", 12288, 1280), ("wo_b", 5120, 3072), ("sh w13", 1536, 5120), ("sh w2", 5120, 768), ("idx wq_b", 4096, 1280)] {
+        let q = (Tensor::randn([n, k], (Kind::Float, dev)) * 0.05).to_kind(Kind::Float8e4m3fn).view_dtype(Kind::Uint8);
+        let sc = Tensor::randint_low(118, 126, [n / 32, k / 32], (Kind::Uint8, dev));
+        let mut line = format!("[ds41-kernel-test] w64 MX GEMV {name} [{n}x{k}]:");
+        for m in ms {
+            let x = (Tensor::randn([m, k], (Kind::Float, dev)) * 2.0).to_kind(Kind::BFloat16);
+            let (a, b) = (fp8_gemv_mx(&x, &q, &sc), fp8_gemv_mx_bf16(&x, &q, &sc));
+            let (a16, b16) = (chunks(&x, 16, &|t| fp8_gemv_mx(t, &q, &sc)), chunks(&x, 16, &|t| fp8_gemv_mx_bf16(t, &q, &sc)));
+            let a1 = chunks(&x, 1, &|t| fp8_gemv_mx(t, &q, &sc));
+            let same = a.equal(&a16) && b.equal(&b16) && a.equal(&a1);
+            if !same { bad += 1; }
+            let half = (m + 1) / 2;
+            let (u, u16_, uh) = (time(&|| fp8_gemv_mx_bf16(&x, &q, &sc)), time(&|| chunks(&x, 16, &|t| fp8_gemv_mx_bf16(t, &q, &sc))),
+                                 time(&|| chunks(&x, half, &|t| fp8_gemv_mx_bf16(t, &q, &sc))));
+            line += &format!(" m={m} 32+rest {u:.1} / halves {uh:.1} / 16-row {u16_:.1} us{};", if same { " bitwise" } else { " DIFFERENT" });
+        }
+        eprintln!("{line}");
+    }
+    // router (C12) in few_rows() chunks, as Model::moe_route
+    let wr = ck.get("layers.10.ffn.gate.weight", Kind::BFloat16).contiguous();
+    assert!(c12_register(&wr) > 0, "c12_register router");
+    {
+        let mut line = "[ds41-kernel-test] w64 C12 router (few_rows() chunks):".to_string();
+        for m in ms {
+            let x = (Tensor::randn([m, 5120], (Kind::Float, dev)) * 2.0).to_kind(Kind::BFloat16);
+            let one = chunks(&x, few_rows(), &|t| bf16_gemv(t, &wr));
+            let same = one.equal(&chunks(&x, 16, &|t| bf16_gemv(t, &wr))) && one.equal(&chunks(&x, 8, &|t| bf16_gemv(t, &wr)));
+            if !same { bad += 1; }
+            line += &format!(" m={m}{};", if same { " bitwise" } else { " DIFFERENT" });
+        }
+        eprintln!("{line}");
+    }
+    // mHC mix
+    {
+        let (k, n) = (5120i64, 1792i64);
+        let w = (Tensor::randint(0x7e, [n, k], (Kind::Int64, dev)) + Tensor::randint(2, [n, k], (Kind::Int64, dev)) * 128).to_kind(Kind::Uint8);
+        let ws = (Tensor::randint(6, [n / 32, k / 32], (Kind::Int64, dev)) + 124).to_kind(Kind::Uint8);
+        let f = Tensor::randn([24, 4 * 5120], (Kind::Float, dev)) * 0.01;
+        let (scl, bs) = (Tensor::randn([3], (Kind::Float, dev)), Tensor::randn([24], (Kind::Float, dev)));
+        let mut line = "[ds41-kernel-test] w64 mHC mix:".to_string();
+        for t in ms {
+            let h = (Tensor::randn([t, 4, 5120], (Kind::Float, dev)) * 2.0).to_kind(Kind::BFloat16);
+            let parts: Vec<_> = (0..t).step_by(16).map(|r| hc_mix(&h.narrow(0, r, 16.min(t - r)), &f, &scl, &bs, 1e-6, 1e-6, 20)).collect();
+            let cat = |i: usize| Tensor::cat(&parts.iter().map(|p| match i { 0 => p.0.shallow_clone(), 1 => p.1.shallow_clone(), _ => p.2.shallow_clone() }).collect::<Vec<_>>(), 0);
+            let a = hc_mix(&h, &f, &scl, &bs, 1e-6, 1e-6, 20);
+            // above 32 rows hc_mix_jobs queues nothing
+            let x = Tensor::randn([t, k], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+            let (y1, y2) = (fp8_gemv_mx(&x, &w, &ws), fp8_gemv_mx_bf16(&x, &w, &ws));
+            let jobs = match hc_mix_jobs(&h, &f, &scl, &bs, 1e-6, 1e-6, 20) {
+                Some(j) => {
+                    let (z1, z2) = (fp8_gemv_mx(&x, &w, &ws), fp8_gemv_mx_bf16(&x, &w, &ws));
+                    hc_jobs_done() && y1.equal(&z1) && y2.equal(&z2) && cat(0).equal(&j.0) && cat(1).equal(&j.1) && cat(2).equal(&j.2)
+                }
+                None => hc_jobs_done(),
+            };
+            let same = cat(0).equal(&a.0) && cat(1).equal(&a.1) && cat(2).equal(&a.2) && jobs;
+            if !same { bad += 1; }
+            let us = time(&|| hc_mix(&h, &f, &scl, &bs, 1e-6, 1e-6, 20).0);
+            let (g0, gj) = (time(&|| fp8_gemv_mx_bf16(&x, &w, &ws)),
+                            time(&|| { let _j = hc_mix_jobs(&h, &f, &scl, &bs, 1e-6, 1e-6, 20); let _ = fp8_gemv_mx(&x, &w, &ws); fp8_gemv_mx_bf16(&x, &w, &ws) }));
+            line += &format!(" t={t} standalone {us:.1} us, two GEMVs {:.1} / with the jobs {gj:.1} us{};", 2.0 * g0, if same { " bitwise (standalone, jobs, GEMVs)" } else { " DIFFERENT" });
+        }
+        // a 16-row job pair taken by the two calls of one chunked 48-row GEMV: the mix and the GEMV unchanged
+        let h = (Tensor::randn([16, 4, 5120], (Kind::Float, dev)) * 2.0).to_kind(Kind::BFloat16);
+        let x = Tensor::randn([48, k], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+        let r = hc_mix(&h, &f, &scl, &bs, 1e-6, 1e-6, 20);
+        let y = fp8_gemv_mx(&x, &w, &ws);
+        let j = hc_mix_jobs(&h, &f, &scl, &bs, 1e-6, 1e-6, 20).expect("hc_mix_jobs at 16 rows");
+        let z = fp8_gemv_mx(&x, &w, &ws);
+        let same = hc_jobs_done() && y.equal(&z) && r.0.equal(&j.0) && r.1.equal(&j.1) && r.2.equal(&j.2);
+        if !same { bad += 1; }
+        line += &format!(" 16-row jobs in a chunked 48-row GEMV{}", if same { " bitwise" } else { " DIFFERENT" });
+        eprintln!("{line}");
+    }
+    // routed experts (layer DS41_KT_LAYER, TP3 rank 0 slice, 2-bit coded scales as served)
+    {
+        let layer = std::env::var("DS41_KT_LAYER").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(3);
+        let il = 768i64;
+        let f = format!("layers.{layer}.ffn.experts");
+        let mut st: Vec<Vec<Tensor>> = (0..6).map(|_| Vec::new()).collect();
+        for e in 0..384 {
+            st[0].push(ck.rows(&format!("{f}.{e}.w1.weight"), 0, il, Kind::Uint8));
+            st[1].push(ck.rows(&format!("{f}.{e}.w1.scale"), 0, il, Kind::Uint8));
+            st[2].push(ck.rows(&format!("{f}.{e}.w3.weight"), 0, il, Kind::Uint8));
+            st[3].push(ck.rows(&format!("{f}.{e}.w3.scale"), 0, il, Kind::Uint8));
+            st[4].push(ck.cols(&format!("{f}.{e}.w2.weight"), 0, il / 2, Kind::Uint8));
+            st[5].push(ck.cols(&format!("{f}.{e}.w2.scale"), 0, il / 32, Kind::Uint8));
+        }
+        let st: Vec<Tensor> = st.iter().map(|v| Tensor::stack(v, 0)).collect();
+        let (p1, q1) = moe_pack(&st[0], &st[1]);
+        let (p3, q3) = moe_pack(&st[2], &st[3]);
+        let (p2, q2) = moe_pack(&st[4], &st[5]);
+        let (p1, p3, p2) = (moe_pack_mx(&p1), moe_pack_mx(&p3), moe_pack_mx(&p2));
+        let s2 = moe_s2_on();
+        let (c1, c3, c2) = if s2 { (moe_scales_s2(&q1).0, moe_scales_s2(&q3).0, moe_scales_s2(&q2).0) } else { (q1, q3, q2) };
+        let w = [&p1, &c1, &p3, &c3, &p2, &c2];
+        let mut line = format!("[ds41-kernel-test] w64 routed experts (layer {layer}, s2 {s2}):");
+        for r in ms {
+            let x = (Tensor::randn([r, 5120], (Kind::Float, dev)) * 0.5).to_kind(Kind::BFloat16);
+            // few distinct experts (verify rows of a few sequences share many) and uniform ones
+            let (_, idx) = Tensor::rand([r, if r % 16 == 0 { 48 } else { 384 }], (Kind::Float, dev)).topk(6, -1, true, true);
+            let rw = Tensor::rand([r, 6], (Kind::Float, dev)) * 0.5;
+            let add = Tensor::randn([r, 5120], (Kind::Float, dev));
+            let a = moe_mx(&x, &idx, &rw, w, Some(&add));
+            let c8 = Tensor::cat(&(0..r).step_by(8).map(|o| { let n = 8.min(r - o); moe_mx(&x.narrow(0, o, n), &idx.narrow(0, o, n), &rw.narrow(0, o, n), w, Some(&add.narrow(0, o, n))) }).collect::<Vec<_>>(), 0);
+            let c1 = Tensor::cat(&(0..r).map(|o| moe_mx(&x.narrow(0, o, 1), &idx.narrow(0, o, 1), &rw.narrow(0, o, 1), w, Some(&add.narrow(0, o, 1)))).collect::<Vec<_>>(), 0);
+            let par = moe_mx_par(&x, || (idx.shallow_clone(), rw.shallow_clone()), w, || add.shallow_clone());
+            let bits = |t: &Tensor| t.view_dtype(Kind::Int);
+            let same = bits(&a).equal(&bits(&c8)) && bits(&a).equal(&bits(&c1)) && bits(&a).equal(&bits(&par));
+            if !same { bad += 1; }
+            let us = time(&|| moe_mx(&x, &idx, &rw, w, Some(&add)));
+            line += &format!(" R={r} {us:.1} us{};", if same { " bitwise (8-row, 1-row, parallel branch)" } else { " DIFFERENT" });
+        }
+        eprintln!("{line}");
+    }
+    // wo_a: grouped-GEMV chunks of grouped_max_rows() (Model DS41_INV_WOA)
+    {
+        let (g, rpg, k) = (3i64, 1024i64, 4096i64);
+        let q = (Tensor::randn([g * rpg, k], (Kind::Float, dev)) * 0.05).to_kind(Kind::Float8e4m3fn).view_dtype(Kind::Uint8);
+        let sc = Tensor::randint_low(118, 126, [g * rpg / 32, k / 32], (Kind::Uint8, dev));
+        let gm = grouped_max_rows();
+        let mut line = format!("[ds41-kernel-test] w64 wo_a grouped GEMV [{}x{k}] x {g} groups:", g * rpg);
+        for m in ms {
+            let x = (Tensor::randn([m, g * k], (Kind::Float, dev)) * 2.0).to_kind(Kind::BFloat16);
+            let a = chunks(&x, gm, &|t| fp8_gemv_grouped(t, &q, &sc, rpg));
+            let same = a.equal(&chunks(&x, 8, &|t| fp8_gemv_grouped(t, &q, &sc, rpg))) && a.equal(&chunks(&x, 1, &|t| fp8_gemv_grouped(t, &q, &sc, rpg)));
+            if !same { bad += 1; }
+            line += &format!(" m={m}{};", if same { " bitwise" } else { " DIFFERENT" });
+        }
+        eprintln!("{line}");
+    }
+    eprintln!("[ds41-kernel-test] w64: {bad} mismatching cases");
+    assert_eq!(bad, 0, "w64: a 33..64-row path differs from the single-stream sized calls");
+}
+
 /// ds41-kernel-test (DS41_KT_ONLY=s2): the routed experts with 2-bit coded scales (DS41_MX_S2) against the raw scales,
 /// real weights (layer `DS41_KT_LAYER`, default 3, TP3 rank 0 slice), every kernel path by row count: bitwise; then the
 /// same with a few tiles forced raw (scales spanning > 3); then cold timing of both formats at decode row counts.
@@ -1790,6 +2151,7 @@ pub fn test(ckpt: &std::path::Path) {
         return;
     }
     if std::env::var("DS41_KT_ONLY").as_deref() == Ok("w32") { w32_test(&ck, dev); return; }
+    if std::env::var("DS41_KT_ONLY").as_deref() == Ok("w64") { w64_test(&ck, dev); return; }
     if std::env::var("DS41_KT_ONLY").as_deref() == Ok("c12") {
         // the C12 coding: 9..16 rows in one call are bitwise the 8-row calls (head slice and a router-sized weight)
         {

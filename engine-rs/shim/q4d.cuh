@@ -78,7 +78,7 @@ __global__ void __launch_bounds__(256) skinny_q4d(const float* __restrict__ X,co
 }
 inline int skinny_q4d_launch(const float* X,const Q4View& w,void* Y,int M,int out,int ks,cudaStream_t s){
   const int chunks=w.k>>5;
-  if(M<1||M>32||w.n%16||w.k%128||(chunks/ks)*ks!=chunks||(chunks/ks)%4)return int(cudaErrorInvalidValue);
+  if(M<1||M>32||w.n<=0||w.k<=0||(ks!=2&&ks!=4&&ks!=8)||w.n%16||w.k%128||(chunks/ks)*ks!=chunks||(chunks/ks)%4)return int(cudaErrorInvalidValue);
   auto grid=[&](int KS){int rt=8/KS;return (w.n+16*rt-1)/(16*rt);};
   static const int qu_env=[]{const char* e=std::getenv("GLM53_Q4_QU");return e?std::atoi(e):2;}();
   const bool qu2=qu_env==2&&(chunks/ks/4)%2==0;

@@ -86,7 +86,7 @@ __global__ void rms_norm_vec_kernel(const __nv_bfloat16* __restrict__ x, const _
     for (int j = 0; j < 8; ++j) {
       const float z = live ? __fmul_rn(__bfloat162float(we[j]), __fmul_rn(__bfloat162float(e[j]), r)) : 0.f;
       zf[u][j] = z;
-      if (cl.d) {
+      if (live && cl.d) {
 #pragma unroll
         for (int q = 0; q < SPARK_CLAMP_MAX_K; ++q) if (q < cl.k) acc[q] += z * __ldg(cl.d + (long long)q * n + i * 8 + j);
       }
@@ -288,7 +288,7 @@ __global__ void rms_norm_cl2_kernel(const __nv_bfloat16* __restrict__ x, const _
       const float z1 = live ? __fmul_rn(__bfloat162float(we[j]), __fmul_rn(__bfloat162float(e1[j]), rr1)) : 0.f;
       zf0[u][j] = z0; zf1[u][j] = z1;
 #pragma unroll
-      for (int q = 0; q < KM; ++q) if (q < cl.k) { const float dv = __ldg(cl.d + (long long)q * n + i * 8 + j); acc0[q] += z0 * dv; acc1[q] += z1 * dv; }
+      for (int q = 0; q < KM; ++q) if (live && q < cl.k) { const float dv = __ldg(cl.d + (long long)q * n + i * 8 + j); acc0[q] += z0 * dv; acc1[q] += z1 * dv; }
     }
   }
   float ce0[KM], ce1[KM];
@@ -547,6 +547,7 @@ __global__ void win_commit_rows_kernel(const unsigned long long* __restrict__ ri
   pdl_entry();
   const int i = blockIdx.x;
   __nv_bfloat16* ring = reinterpret_cast<__nv_bfloat16*>(rings[i]);
+  if (!ring) return;
   const long long slot = pos[i] % w;
   for (int c = threadIdx.x * 8; c < d; c += blockDim.x * 8)
     *reinterpret_cast<uint4*>(ring + slot * d + c) = *reinterpret_cast<const uint4*>(kv + (long long)i * d + c);
@@ -673,7 +674,7 @@ int ds41_rms_norm_cl(const void* x, const void* w, void* y, int rows, int n, flo
 }
 int ds41_rope(const void* x, const int64_t* pos, const float* freqs, void* y, int rows, int H, int d, int rd, int inverse, cudaStream_t st) {
   if (rows < 1) return 0;
-  if (rd % 2 || rd > d || (d - rd) % 8 || rd / 2 > 128) return 1;
+  if (rd % 2 || rd > d || d % 8 || (d - rd) % 8 || rd / 2 > 128) return 1;
   pdl_launch(rope_kernel, dim3(dim3(rows, H)), dim3(128), 0, st, (const __nv_bfloat16*)x, pos, freqs, (__nv_bfloat16*)y, H, d, rd, inverse);
   return (int)cudaGetLastError();
 }

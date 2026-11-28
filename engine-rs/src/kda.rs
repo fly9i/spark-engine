@@ -475,7 +475,8 @@ pub(crate) fn chain_recurrent(base:&Tensor,q:&Tensor,k:&Tensor,v:&Tensor,beta:&T
 /// The fused gate kernel takes at most 8 rows; per-row math is independent of the split.
 fn gate_values_split(w:&KdaWeights,x:&Tensor,heads:i64)->(Tensor,Tensor,Tensor) {
     let t=x.size()[0];if t<=8 {return gate_values(w,x,heads);}
-    let split=||{let parts:Vec<_>=(0..t).step_by(8).map(|r|gate_values(w,&x.narrow(0,r,(t-r).min(8)),heads)).collect();
+    let split=||{let mut parts=Vec::new();
+        for (r,n) in crate::forward::invariant_pieces(t) {parts.push(gate_values(w,&x.narrow(0,r,n),heads));}
         (Tensor::cat(&parts.iter().map(|p|&p.0).collect::<Vec<_>>(),0),Tensor::cat(&parts.iter().map(|p|&p.1).collect::<Vec<_>>(),0),
          Tensor::cat(&parts.iter().map(|p|&p.2).collect::<Vec<_>>(),0))};
     if t<=32 && gate_wide() {if let Some(v)=gate_fused_rows(w,x,heads,32){

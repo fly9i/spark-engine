@@ -282,7 +282,7 @@ pub(crate) fn try_run_rows_out(x:&Tensor,ws:&[&Tensor],out:i32)->Option<Tensor> 
     GROUPS.with(|g|{let g=g.borrow();let e=g.get(&keys)?;
         if ws.iter().any(|w|!l0check_ok(x,w.size()[0])) {return None;}
         let x=float_input(x)?;let (m,n)=(x.size()[0],e.m8.size()[0]);
-        let y=Tensor::empty([m,n],(if out==2{Kind::Half}else{Kind::Float},x.device()));e.launch(&x,&y,m,out,launch_ks(n,e.m8.size()[1]));Some(y)})
+        let y=Tensor::empty([m,n],(if out==2{Kind::Half}else{Kind::Float},x.device()));e.launch(&x,&y,m,out,launch_ks(n,ws[0].size()[1]));Some(y)})
 }
 
 // ---- Prefill (GLM53_C12_PREFILL=1): rows above the decode range read the coded weight in a tensor-core GEMM
@@ -335,10 +335,15 @@ pub(crate) fn try_big_cat(x:&Tensor,ws:&[&Tensor])->Option<Tensor> {
 pub(crate) fn prefetch_regions(w:&Tensor,budget:i64)->Vec<(usize,i64)> {
     CACHE.with(|c|{let c=c.borrow();let Some(e)=c.get(&(w.data_ptr() as usize)) else {return Vec::new()};
         if e.source.size()!=w.size() {return Vec::new();}
+        if let Some(t)=&e.t {
+            let bytes=budget.min((t.numel() as i64)*t.kind().elt_size_in_bytes() as i64);
+            return if bytes>0 {vec![(t.data_ptr() as usize,bytes)]} else {Vec::new()};
+        }
+        if !e.m8.is_contiguous() {return Vec::new();}
         let (n,k)=(e.m8.size()[0],e.m8.size()[1]);
         let mut parts:Vec<(usize,i64)>=vec![(e.m8.data_ptr() as usize,k)];
-        if let Some(sm)=&e.q4 {parts.push((sm.data_ptr() as usize,(k*2/64)*4));}
-        else if let Some(s)=&e.s {parts.push((s.data_ptr() as usize,(k/128)*4));}
+        if let Some(sm)=&e.q4 {if sm.is_contiguous() {parts.push((sm.data_ptr() as usize,(k*2/64)*4));}}
+        else if let Some(s)=&e.s {if s.is_contiguous() {parts.push((s.data_ptr() as usize,(k/128)*4));}}
         else {parts.push((e.e4.data_ptr() as usize,k/2));parts.push((e.eb.data_ptr() as usize,1));}
         let per_row:i64=parts.iter().map(|p|p.1).sum();let rows=(budget/per_row.max(1)).clamp(0,n);
         parts.into_iter().map(|(p,b)|(p,b*rows)).filter(|r|r.1>0).collect()})

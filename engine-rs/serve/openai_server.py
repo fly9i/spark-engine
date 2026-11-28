@@ -20,7 +20,7 @@ presence/frequency penalties are accepted and not applied. n must be 1.
 Usage:
   python3 openai_server.py --socket /tmp/glm53-serve.sock --model-dir <snapshot> --port 8888
 """
-import argparse, json, os, queue, re, socket, threading, time, uuid
+import argparse, json, math, os, queue, re, select, socket, threading, time, uuid
 from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -36,6 +36,15 @@ except ImportError as _e:           # text-only front end
 EOS = [154820, 154827, 154829]
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 VERSION = "spark-engine glm-5.3-flash (openai-compatible front end)"
+MAX_BODY_BYTES = int(os.environ.get("SPARK_MAX_BODY_BYTES", str(256 << 20)))
+
+
+def _reject_nonfinite(const):
+    raise ValueError(f"non-finite JSON constant: {const}")
+
+
+def _json_loads(raw):
+    return json.loads(raw, parse_constant=_reject_nonfinite)
 
 
 class ApiError(Exception):
@@ -174,11 +183,12 @@ class Engine:
 
     def _ensure(self):
         if self.sock is not None:
-            return
+            return self.sock
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect(self.path)
         self.sock = s
         threading.Thread(target=self._reader, args=(s,), daemon=True).start()
+        return s
 
     def _reader(self, s):
         f = s.makefile("r", encoding="utf-8")
@@ -189,37 +199,48 @@ class Engine:
                 except ValueError:
                     continue
                 with self.mlock:
-                    q = self.waiters.get(msg.get("id"))
-                if q is not None:
-                    q.put(msg)
+                    entry = self.waiters.get(msg.get("id"))
+                if entry is not None and entry[0] is s:
+                    entry[1].put(msg)
         except OSError:
             pass
         finally:
+            try:
+                f.close()
+            except OSError:
+                pass
+            try:
+                s.close()
+            except OSError:
+                pass
             with self.wlock:
                 if self.sock is s:
                     self.sock = None
             with self.mlock:
-                pending = list(self.waiters.values())
+                pending = [q for sock, q in self.waiters.values() if sock is s]
             for q in pending:
                 q.put({"done": True, "error": "engine connection lost", "lost": True})
 
-    def _send(self, obj):
+    def _send(self, obj, register=None):
+        payload = (json.dumps(obj, allow_nan=False) + "\n").encode()
         with self.wlock:
-            self._ensure()
-            self.sock.sendall((json.dumps(obj) + "\n").encode())
+            s = self._ensure()
+            if register is not None:
+                rid, q = register
+                with self.mlock:
+                    self.waiters[rid] = (s, q)
+            s.sendall(payload)
 
     def stats(self, timeout=2.0):
         """Engine-side monitoring snapshot, or None if the engine does not answer in time (it replies
         between scheduling steps; a long prefill chunk can delay it)."""
         rid = "stats-" + uuid.uuid4().hex
         q = queue.Queue()
-        with self.mlock:
-            self.waiters[rid] = q
         try:
-            self._send({"id": rid, "stats": True})
+            self._send({"id": rid, "stats": True}, register=(rid, q))
             msg = q.get(timeout=timeout)
             return msg.get("stats")
-        except (OSError, queue.Empty):
+        except (OSError, ValueError, queue.Empty):
             return None
         finally:
             with self.mlock:
@@ -230,23 +251,28 @@ class Engine:
         (checked every second, so a client that disconnects during a long prefill is cancelled too)."""
         rid = uuid.uuid4().hex
         q = queue.Queue()
-        with self.mlock:
-            self.waiters[rid] = q
         try:
             try:
                 req = {"id": rid, "prompt_ids": ids, "max_new": max_new, "stop_token_ids": stop_token_ids, **(sampling or {})}
                 if mm:
                     req["mm"] = mm
-                self._send(req)
+                self._send(req, register=(rid, q))
+            except ValueError as e:
+                raise ApiError(400, f"invalid request payload: {e}")
             except OSError as e:
                 raise ApiError(503, f"engine unavailable: {e}", "server_error")
             cancelled = False
+            cancel_at = None
+            seen_ids = []
             while True:
                 try:
                     msg = q.get(timeout=1.0)
                 except queue.Empty:
+                    if cancelled and cancel_at is not None and time.monotonic() - cancel_at > 30.0:
+                        return {"id": rid, "done": True, "cancelled": True, "token_ids": seen_ids}
                     if not cancelled and alive is not None and not alive():
                         cancelled = True
+                        cancel_at = time.monotonic()
                         try:
                             self._send({"cancel": rid})
                         except OSError:
@@ -258,9 +284,11 @@ class Engine:
                     if "error" in msg:
                         raise ApiError(400, msg["error"])
                     return msg
-                if "delta" in msg and on_delta is not None and not cancelled:
-                    if on_delta(msg["delta"]):
+                if "delta" in msg:
+                    seen_ids.extend(msg["delta"])
+                    if on_delta is not None and not cancelled and on_delta(msg["delta"]):
                         cancelled = True
+                        cancel_at = time.monotonic()
                         try:
                             self._send({"cancel": rid})
                         except OSError:
@@ -284,6 +312,8 @@ class TextStreamFull:
         self.stop_ids = set(stop_ids)
         self.hit_stop_id = False
         self.in_reasoning = reasoning
+        self.had_reasoning = bool(reasoning)
+        self._strip_nl = False
         self.stops = [s for s in stops if s]
         self.reasoning, self.content = "", ""
         self.buf = ""                  # decoded but not yet classified
@@ -322,20 +352,28 @@ class TextStreamFull:
             i = self.buf.find(self.think_close)
             if i >= 0:
                 r_out += self.buf[:i]
-                self.buf = self.buf[i + len(self.think_close):].lstrip("\n")
+                self.buf = self.buf[i + len(self.think_close):]
                 self.in_reasoning = False
+                self._strip_nl = True
             else:
                 keep = 0 if final else self._holdback(self.buf, [self.think_close])
                 r_out, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
         if not self.in_reasoning:
+            if self._strip_nl:
+                self.buf = self.buf.lstrip("\n")
+                if self.buf:
+                    self._strip_nl = False
+            hay = self.content + self.buf
+            best = None
             for s in self.stops:
-                j = (self.content + self.buf).find(s)
+                j = hay.find(s)
+                if j >= 0 and (best is None or j < best):
+                    best = j
+            if best is not None:
+                j = best - len(self.content)
                 if j >= 0:
-                    j -= len(self.content)
-                    if j >= 0:
-                        c_out += self.buf[:j]
-                    self.buf, self.stopped = "", True
-                    break
+                    c_out += self.buf[:j]
+                self.buf, self.stopped = "", True
             if not self.stopped:
                 keep = 0 if final else self._holdback(self.buf, self.stops)
                 c_out, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
@@ -367,6 +405,8 @@ class TextStreamIncr:
         self.stop_ids = set(stop_ids)
         self.hit_stop_id = False
         self.in_reasoning = reasoning
+        self.had_reasoning = bool(reasoning)
+        self._strip_nl = False
         self.stops = [s for s in stops if s]
         self._smax = max((len(s) for s in self.stops), default=0)
         self._rparts, self._cparts = [], []
@@ -428,20 +468,28 @@ class TextStreamIncr:
             i = self.buf.find(self.think_close)
             if i >= 0:
                 r_out += self.buf[:i]
-                self.buf = self.buf[i + len(self.think_close):].lstrip("\n")
+                self.buf = self.buf[i + len(self.think_close):]
                 self.in_reasoning = False
+                self._strip_nl = True
             else:
                 keep = 0 if final else self._holdback(self.buf, [self.think_close])
                 r_out, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
         if not self.in_reasoning:
+            if self._strip_nl:
+                self.buf = self.buf.lstrip("\n")
+                if self.buf:
+                    self._strip_nl = False
+            hay = win + self.buf
+            best = None
             for s in self.stops:
-                j = (win + self.buf).find(s)
+                j = hay.find(s)
+                if j >= 0 and (best is None or j < best):
+                    best = j
+            if best is not None:
+                j = best - len(win)
                 if j >= 0:
-                    j -= len(win)
-                    if j >= 0:
-                        c_out += self.buf[:j]
-                    self.buf, self.stopped = "", True
-                    break
+                    c_out += self.buf[:j]
+                self.buf, self.stopped = "", True
             if not self.stopped:
                 keep = 0 if final else self._holdback(self.buf, self.stops)
                 c_out, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
@@ -575,7 +623,7 @@ class App:
                 raise ApiError(400, f"content part type {p.get('type')!r} is not supported (text only)")
         return "".join(parts)
 
-    def _content(self, content, media):
+    def _content(self, content, media, mm_nonce=None):
         """Template content of a message: the joined string for text-only content (rendering unchanged), else
         text/image/video parts in order; media parts are collected into `media`."""
         if isinstance(content, dict):
@@ -596,8 +644,12 @@ class App:
             elif kind in ("image", "video"):
                 if self.media is None:
                     raise ApiError(400, "image/video input is disabled on this server (--vision off)")
+                idx = len(media)
                 media.append(p)
-                parts.append({"type": kind})
+                part = {"type": kind}
+                if mm_nonce is not None:
+                    part["_mm_tag"] = f"\x1fMM:{mm_nonce}:{idx}\x1f"
+                parts.append(part)
             elif kind == "audio":
                 raise ApiError(400, "this model has no audio encoder; audio input is not supported")
             else:
@@ -622,9 +674,12 @@ class App:
         if not isinstance(msgs, list) or not msgs:
             raise ApiError(400, "messages must be a non-empty list", param="messages")
         messages, media = [], []
+        mm_nonce = uuid.uuid4().hex
         for m in msgs:
+            if not isinstance(m, dict):
+                raise ApiError(400, "each message must be an object", param="messages")
             mm = dict(m)
-            mm["content"] = self._content(m.get("content"), media)
+            mm["content"] = self._content(m.get("content"), media, mm_nonce)
             if mm.get("tool_calls"):
                 calls = []
                 for tc in mm["tool_calls"]:
@@ -652,6 +707,14 @@ class App:
             raise ApiError(400, f"chat template error: {e}")
         if thinking is False and text.endswith(THINK_OPEN):
             text += THINK_CLOSE               # this template always opens <think>
+        if media:
+            pat = re.compile(rf"\x1fMM:{mm_nonce}:(\d+)\x1f")
+            order = [int(m.group(1)) for m in pat.finditer(text)]
+            if order:
+                text = pat.sub("", text)
+                if sorted(order) != list(range(len(media))):
+                    raise ApiError(400, "the chat template dropped or duplicated a media part", param="messages")
+                media = [media[i] for i in order]
         reasoning = text.endswith(THINK_OPEN)
         ids = self.tok.encode(text, add_special_tokens=False).ids
         if not media:
@@ -673,44 +736,85 @@ class App:
         return TextStream(self.tok, reasoning, stops, stop_ids)
 
     def limits(self, body, n_prompt):
-        if int(body.get("n", 1) or 1) != 1:
-            raise ApiError(400, "only n=1 is supported", param="n")
+        n_raw = body.get("n")
+        if n_raw is not None:
+            try:
+                if isinstance(n_raw, bool) or int(n_raw) != 1:
+                    raise ApiError(400, "only n=1 is supported", param="n")
+            except (TypeError, ValueError):
+                raise ApiError(400, "n must be an integer", param="n")
         room = self.max_len - n_prompt
         if room <= 0:
             raise ApiError(400, f"prompt has {n_prompt} tokens; maximum context length is {self.max_len}", param="messages")
-        mx = body.get("max_completion_tokens") or body.get("max_tokens")
-        mx = min(room, self.default_max) if mx is None else int(mx)
+        mx = body.get("max_completion_tokens")
+        if mx is None:
+            mx = body.get("max_tokens")
+        if mx is None:
+            mx = min(room, self.default_max)
+        else:
+            try:
+                if isinstance(mx, bool):
+                    raise ValueError("bool")
+                mx = int(mx)
+            except (TypeError, ValueError):
+                raise ApiError(400, "max_tokens must be an integer", param="max_tokens")
         if mx < 1:
             raise ApiError(400, "max_tokens must be at least 1", param="max_tokens")
         if mx > room:
             raise ApiError(400, f"This model's maximum context length is {self.max_len} tokens. However, you requested "
                            f"{n_prompt + mx} tokens ({n_prompt} in the messages, {mx} in the completion).", param="max_tokens")
-        stops = body.get("stop") or []
-        stops = [stops] if isinstance(stops, str) else list(stops)
-        stop_ids = [int(t) for t in (body.get("stop_token_ids") or [])]
+        stops_raw = body.get("stop")
+        if stops_raw is None:
+            stops = []
+        elif isinstance(stops_raw, str):
+            stops = [stops_raw]
+        elif isinstance(stops_raw, list) and all(isinstance(s, str) for s in stops_raw):
+            stops = list(stops_raw)
+        else:
+            raise ApiError(400, "stop must be a string or list of strings", param="stop")
+        stop_ids_raw = body.get("stop_token_ids")
+        if stop_ids_raw is None:
+            stop_ids = []
+        elif isinstance(stop_ids_raw, list):
+            try:
+                stop_ids = [int(t) for t in stop_ids_raw]
+            except (TypeError, ValueError):
+                raise ApiError(400, "stop_token_ids must be a list of integers", param="stop_token_ids")
+        else:
+            raise ApiError(400, "stop_token_ids must be a list of integers", param="stop_token_ids")
         # Sampling: temperature only (exact speculative sampling over the full distribution).
         # top_p / top_k / penalties are accepted and not applied.
         t = body.get("temperature")
-        t = self.default_temperature if t is None else float(t)
-        if t < 0 or t > 100:
-            raise ApiError(400, "temperature must be in [0, 100]", param="temperature")
+        if t is None:
+            t = self.default_temperature
+        else:
+            try:
+                if isinstance(t, bool):
+                    raise ValueError("bool")
+                t = float(t)
+            except (TypeError, ValueError):
+                raise ApiError(400, "temperature must be a number", param="temperature")
+        if not math.isfinite(t) or t < 0 or t > 100:
+            raise ApiError(400, "temperature must be a finite number in [0, 100]", param="temperature")
         seed = body.get("seed")
         samp = {"temperature": t}
         if seed is not None:
-            samp["seed"] = int(seed) & 0xFFFFFF
+            try:
+                if isinstance(seed, bool):
+                    raise ValueError("bool")
+                samp["seed"] = int(seed) & 0xFFFFFF
+            except (TypeError, ValueError):
+                raise ApiError(400, "seed must be an integer", param="seed")
         return mx, stops, stop_ids, samp
 
     def run(self, ids, max_new, stop_ids, stream_text, on_text=None, alive=None, mm=None):
         """Drives one generation; on_text(reasoning_delta, content_delta) may raise to cancel."""
         stop_ids, samp = stop_ids
         mm_items = [s["item"] for s in (mm or [])]
-        engine_mm = [{"path": self.media.store.path(s["item"]), "frames": int(s["item"].canvas.shape[0]),
-                      "height": int(s["item"].canvas.shape[1]), "width": int(s["item"].canvas.shape[2]),
-                      "segments": s["segments"]} for s in (mm or [])] if mm else None
         state = {"n": 0, "t0": time.time(), "last": None}
         mt = self.metrics
-        with mt.lock:
-            mt.inflight += 1
+        acquired = False
+        inflight_inc = False
 
         def on_delta(delta):
             now = time.time()
@@ -729,17 +833,26 @@ class App:
                     return True                # client went away: cancel
             return stop
 
-        if mm_items:
-            self.media.store.acquire(mm_items)
         try:
+            if mm_items:
+                self.media.store.acquire(mm_items)
+                acquired = True
+            engine_mm = [{"path": self.media.store.path(s["item"]), "frames": int(s["item"].canvas.shape[0]),
+                          "height": int(s["item"].canvas.shape[1]), "width": int(s["item"].canvas.shape[2]),
+                          "segments": s["segments"]} for s in (mm or [])] if mm else None
+            with mt.lock:
+                mt.inflight += 1
+                inflight_inc = True
             rec = self.engine.generate(ids, max_new, stop_ids, on_delta, alive, samp, engine_mm)
         except ApiError:
-            mt.finished("abort")
+            if inflight_inc:
+                mt.finished("abort")
             raise
         finally:
-            with mt.lock:
-                mt.inflight -= 1
-            if mm_items:
+            if inflight_inc:
+                with mt.lock:
+                    mt.inflight -= 1
+            if acquired:
                 self.media.store.release(mm_items)
         out = rec["token_ids"]
         # Deltas already streamed; flush whatever remains (held-back text, final partial UTF-8).
@@ -755,11 +868,18 @@ class App:
             finish = "length"
         n_out = len(out)
         if stream_text.stopped and not stream_text.hit_stop_id and stream_text.stops:
-            # Count only the tokens up to the stop string (engine cancels at round granularity).
+            # Count only the tokens up to the stop string in content (engine cancels at round granularity).
+            had_reasoning = getattr(stream_text, "had_reasoning", False)
             lo, hi = 0, len(stream_text.ids)
             while lo < hi:
                 mid = (lo + hi) // 2
-                t = self.tok.decode(stream_text.ids[:mid], skip_special_tokens=False)
+                t = stream_text._decode(stream_text.ids[:mid])
+                if had_reasoning:
+                    k = t.find(stream_text.think_close)
+                    if k < 0:
+                        lo = mid + 1
+                        continue
+                    t = t[k + len(stream_text.think_close):].lstrip("\n")
                 if any(x in t for x in stream_text.stops):
                     hi = mid
                 else:
@@ -861,11 +981,15 @@ def make_handler(app):
 
         def _alive(self):
             """False once the client closed its side (peek returns EOF) or a keepalive write fails."""
-            import select
             try:
-                r, _, _ = select.select([self.connection], [], [], 0)
-                if r and self.connection.recv(1, socket.MSG_PEEK) == b"":
-                    return False
+                p = select.poll()
+                p.register(self.connection.fileno(), select.POLLIN | select.POLLERR | select.POLLHUP)
+                ev = p.poll(0)
+                if ev:
+                    if ev[0][1] & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                        return False
+                    if (ev[0][1] & select.POLLIN) and self.connection.recv(1, socket.MSG_PEEK) == b"":
+                        return False
             except OSError:
                 return False
             if getattr(self, "_sse_open", False) and time.time() - getattr(self, "_last_write", 0) > 5:
@@ -908,11 +1032,21 @@ def make_handler(app):
         def do_POST(self):
             p = self.path.split("?")[0]
             try:
-                n = int(self.headers.get("Content-Length", 0))
+                raw_len = self.headers.get("Content-Length", "0")
                 try:
-                    body = json.loads(self.rfile.read(n) or b"{}")
+                    n = int(raw_len)
+                except ValueError:
+                    raise ApiError(400, f"invalid Content-Length: {raw_len!r}")
+                if n < 0:
+                    raise ApiError(400, f"negative Content-Length: {n}")
+                if n > MAX_BODY_BYTES:
+                    raise ApiError(413, f"request body too large ({n} > {MAX_BODY_BYTES} bytes)")
+                try:
+                    body = _json_loads(self.rfile.read(n) or b"{}")
                 except ValueError as e:
                     raise ApiError(400, f"invalid JSON body: {e}")
+                if not isinstance(body, dict):
+                    raise ApiError(400, "JSON body must be an object")
                 if p == "/v1/chat/completions":
                     return self.chat(body)
                 if p == "/v1/completions":

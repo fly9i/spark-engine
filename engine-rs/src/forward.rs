@@ -426,7 +426,7 @@ impl Engine {
             }
             }
             tick(1,&mut acc);
-            if outs.len()==1{outs.pop().unwrap()}else{Tensor::cat(&outs,0)}
+            if outs.len()==1{outs.pop().unwrap()}else{crate::tp::settle_pending_pub();Tensor::cat(&outs,0)}
             });
             let pending=probe_settle(pending);
             probe_point(i,"attn_out",&attention);
@@ -736,7 +736,7 @@ impl Engine {
     /// two chunks, paired or, when not pairable, one after the other -- never as one larger chunk, which would change
     /// the GEMM shapes)
     fn sp_pair_chunk(&self,t:i64)->Option<i64> {
-        if std::env::var("GLM53_PREFILL_SP_PAIR").as_deref()!=Ok("1") || crate::tp::world().world!=3 {return None;}
+        if std::env::var("GLM53_PREFILL_SP_PAIR").as_deref()!=Ok("1") || crate::tp::world().world!=3 || crate::weights::has_prefill_mm() {return None;}
         let a=std::env::var("GLM53_PREFILL_CHUNK").ok().and_then(|v|v.parse::<i64>().ok()).unwrap_or(4096);
         (t>a).then_some(a)
     }
@@ -879,16 +879,17 @@ impl Engine {
                     let snap=ds.as_ref().map(snapshot);
                     // (2: the reference twice -- how reproducible the plain calls are)
                     let (lp,sp,fp)=if chk=="1" {self.prefill_record_sp_pair(ids,ds,collect,last,ta)} else {
-                        let (_l1,s1,f1)=self.prefill_record_sp(&ids.narrow(0,0,ta),ds,collect,last).expect("SP prefill");
+                        let (l1,s1,f1)=self.prefill_record_sp(&ids.narrow(0,0,ta),ds,collect,last).expect("SP prefill");
                         let (l2,s2,f2)=self.prefill_record_sp(&ids.narrow(0,ta,ids.size()[0]-ta),Some(s1),collect,last).expect("SP prefill");
-                        (l2,s2,f1.into_iter().zip(f2).map(|(a,b)|Tensor::cat(&[a,b],0)).collect())};
-                    let (_l1,s1,f1)=self.prefill_record_sp(&ids.narrow(0,0,ta),snap,collect,last).expect("SP prefill");
+                        (if last {l2} else {Tensor::cat(&[l1,l2],0)},s2,f1.into_iter().zip(f2).map(|(a,b)|Tensor::cat(&[a,b],0)).collect())};
+                    let (l1,s1,f1)=self.prefill_record_sp(&ids.narrow(0,0,ta),snap,collect,last).expect("SP prefill");
                     let (l2,s2,f2)=self.prefill_record_sp(&ids.narrow(0,ta,ids.size()[0]-ta),Some(s1),collect,last).expect("SP prefill");
+                    let lref=if last {l2} else {Tensor::cat(&[l1,l2],0)};
                     let fd:Vec<(f64,f64)>=fp.iter().zip(f1.iter().zip(f2.iter())).map(|(p,(a,b))|{let na=a.size()[0];
                         (f64::try_from((p.narrow(0,0,na)-a).abs().max()).unwrap(),f64::try_from((p.narrow(0,na,p.size()[0]-na)-b).abs().max()).unwrap())}).collect();
                     eprintln!("[sp-pair-check] rows {} (a {ta}): logits {} features {:?} (n {} vs {}+{}) states {}",ids.size()[0],
-                        f64::try_from((&lp-&l2).abs().max()).unwrap(),fd,fp.len(),f1.len(),f2.len(),states_max_diff(&sp,&s2));
-                    return (l2,s2,{let mut f=f1;for (a,b) in f.iter_mut().zip(f2) {*a=Tensor::cat(&[a.shallow_clone(),b],0);} f});
+                        f64::try_from((&lp-&lref).abs().max()).unwrap(),fd,fp.len(),f1.len(),f2.len(),states_max_diff(&sp,&s2));
+                    return (lref,s2,{let mut f=f1;for (a,b) in f.iter_mut().zip(f2) {*a=Tensor::cat(&[a.shallow_clone(),b],0);} f});
                 }
                 return self.prefill_record_sp_pair(ids,ds,collect,last,ta);
             }
@@ -896,9 +897,9 @@ impl Engine {
         if let Some(a)=self.sp_pair_chunk(ids.size()[0]) {
             // not pairable (e.g. B under 128 rows): the two chunks one after the other, as with the server's plain chunk
             let t=ids.size()[0];
-            let (_l1,s1,f1)=self.prefill_record_impl(&ids.narrow(0,0,a),ds,collect,last);
+            let (l1,s1,f1)=self.prefill_record_impl(&ids.narrow(0,0,a),ds,collect,last);
             let (l2,s2,f2)=self.prefill_record_impl(&ids.narrow(0,a,t-a),Some(s1),collect,last);
-            return (l2,s2,{let mut f=f1;for (x,y) in f.iter_mut().zip(f2) {*x=Tensor::cat(&[x.shallow_clone(),y],0);} f});
+            return (if last {l2} else {Tensor::cat(&[l1,l2],0)},s2,{let mut f=f1;for (x,y) in f.iter_mut().zip(f2) {*x=Tensor::cat(&[x.shallow_clone(),y],0);} f});
         }
         if (last || std::env::var("GLM53_PREFILL_SP_ALL").as_deref()==Ok("1")) && self.sp_eligible(ids.size()[0]) {
             return self.prefill_record_sp(ids,ds,collect,last).expect("SP prefill");

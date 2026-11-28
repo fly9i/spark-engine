@@ -509,7 +509,9 @@ pub(crate) fn tree_multi_selected(w:&MlaWeights,x:&Tensor,bases:&[&State],segs:&
     let qb=mm16(&cq,&w.q_b);let q=qb.view([t,heads,256]).transpose(0,1);
     // absorb's Half path takes at most 8 rows; per-row math is independent of the split.
     let absorbed=if t<=8 || (bmm_wide() && t<=32) {absorb(w,&q,&bases[0].wk)} else {
-        Tensor::cat(&(0..t).step_by(8).map(|r|absorb(w,&q.narrow(1,r,(t-r).min(8)),&bases[0].wk)).collect::<Vec<_>>(),1)};
+        let mut parts=Vec::new();
+        for (r,n) in crate::forward::invariant_pieces(t) {parts.push(absorb(w,&q.narrow(1,r,n),&bases[0].wk));}
+        Tensor::cat(&parts,1)};
     let latent=norm(kva_out,&w.kv_a_ln).to_kind(Kind::Half);
     if side_projected.is_some() {assert_eq!(unsafe{rs_stream_join(1)},0);}
     let projected=side_projected.or_else(||selections.contains(&dsa::TreeSelection::Ranked).then(||index.project(x,&cq)));
@@ -690,8 +692,9 @@ fn tree_core(w:&MlaWeights,x:&Tensor,base:&State,parents:&[Option<usize>],select
             }
             if node_fused {
                 let src=parent.map_or(base,|p|&states[p]);
-                // A chain node (parent = previous node, first = base) can share the base storage.
-                let chain=chain_shared_enabled() && parent==i.checked_sub(1);
+                // Only an unbranched prefix from `base` (all nodes 0..=i chained linearly) may alias `base`'s storage;
+                // a node following a branched sibling must keep its own snapshot so sibling rows are not overwritten/mixed.
+                let chain=chain_shared_enabled() && (0..=i).all(|j|parents[j]==j.checked_sub(1));
                 let mut st=if chain{base.chain_child()}else{src.snapshot_for_append()};
                 let pos=batch.position_input(&src.len);
                 let p=projected.unwrap();

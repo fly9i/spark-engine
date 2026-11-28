@@ -159,7 +159,7 @@ __global__ void fp8_large(const float* x,const unsigned char* w,const float* sca
     wmma::fragment<wmma::accumulator,16,16,16,float> accum;wmma::fill_fragment(accum,0.f);
     for(int base=0;base<k;base+=64){
         for(int i=threadIdx.x;i<64*32;i+=512){int row=i/32,col=(i%32)*2;
-            reinterpret_cast<half2*>(a)[i]=m0+row<m?__floats2half2_rn(x[(m0+row)*k+base+col],x[(m0+row)*k+base+col+1]):__float2half2_rn(0.f);
+            reinterpret_cast<half2*>(a)[i]=m0+row<m?__floats2half2_rn(x[(long long)(m0+row)*k+base+col],x[(long long)(m0+row)*k+base+col+1]):__float2half2_rn(0.f);
             auto raw=*reinterpret_cast<const __nv_fp8x2_storage_t*>(w+(long long)(n0+row)*k+base+col);
             reinterpret_cast<__half2_raw*>(b)[i]=__nv_cvt_fp8x2_to_halfraw2(raw,__NV_E4M3);
         }
@@ -174,7 +174,7 @@ __global__ void fp8_large(const float* x,const unsigned char* w,const float* sca
         __syncthreads();
     }
     wmma::store_matrix_sync(c+(warp/4)*16*64+(warp%4)*16,accum,64,wmma::mem_row_major);__syncthreads();
-    for(int i=threadIdx.x;i<64*64;i+=512){int row=m0+i/64,col=n0+i%64;if(row<m){float value=c[i]*scale[col];y[row*n+col]=rounded?__half2float(__float2half_rn(value)):value;}}
+    for(int i=threadIdx.x;i<64*64;i+=512){int row=m0+i/64,col=n0+i%64;if(row<m){float value=c[i]*scale[col];y[(long long)row*n+col]=rounded?__half2float(__float2half_rn(value)):value;}}
 }
 extern "C" int glm53_fp8_large_cuda(const float* x,const void* w,const float* scale,float* y,int m,int n,int k,int rounded,cudaStream_t stream){
     if(m<1||n%64||k%64)return int(cudaErrorInvalidValue);
@@ -195,7 +195,7 @@ __global__ void fp8_large_reuse(const float* x,const unsigned char* w,const floa
     for(int r=0;r<2;++r)for(int c=0;c<2;++c)wmma::fill_fragment(acc[r][c],0.f);
     for(int base=0;base<k;base+=KTile){
         for(int i=threadIdx.x;i<64*KTile/2;i+=256){int row=i/(KTile/2),col=(i%(KTile/2))*2;
-            reinterpret_cast<half2*>(a)[i]=m0+row<m?__floats2half2_rn(x[(m0+row)*k+base+col],x[(m0+row)*k+base+col+1]):__float2half2_rn(0.f);}
+            reinterpret_cast<half2*>(a)[i]=m0+row<m?__floats2half2_rn(x[(long long)(m0+row)*k+base+col],x[(long long)(m0+row)*k+base+col+1]):__float2half2_rn(0.f);}
         for(int i=threadIdx.x;i<128*KTile/2;i+=256){int row=i/(KTile/2),col=(i%(KTile/2))*2;
             auto raw=*reinterpret_cast<const __nv_fp8x2_storage_t*>(w+(long long)(n0+row)*k+base+col);
             reinterpret_cast<__half2_raw*>(b)[i]=__nv_cvt_fp8x2_to_halfraw2(raw,__NV_E4M3);}
@@ -216,7 +216,7 @@ __global__ void fp8_large_reuse(const float* x,const unsigned char* w,const floa
     #pragma unroll
     for(int r=0;r<2;++r)for(int c=0;c<2;++c)wmma::store_matrix_sync(mem.output+((warp/4)*32+r*16)*128+(warp%4)*32+c*16,acc[r][c],128,wmma::mem_row_major);
     __syncthreads();
-    for(int i=threadIdx.x;i<64*128;i+=256){int row=m0+i/128,col=n0+i%128;if(row<m){float value=mem.output[i]*scale[col];y[row*n+col]=rounded?__half2float(__float2half_rn(value)):value;}}
+    for(int i=threadIdx.x;i<64*128;i+=256){int row=m0+i/128,col=n0+i%128;if(row<m){float value=mem.output[i]*scale[col];y[(long long)row*n+col]=rounded?__half2float(__float2half_rn(value)):value;}}
 }
 extern "C" int glm53_fp8_large_reuse_cuda(const float* x,const void* w,const float* scale,float* y,int m,int n,int k,int rounded,int mode,cudaStream_t stream){
     if(m<1||n%128||k%128)return int(cudaErrorInvalidValue);

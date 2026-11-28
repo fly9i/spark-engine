@@ -430,7 +430,8 @@ __global__ void __launch_bounds__(1024) swiglu_rot(const float* __restrict__ Y, 
     #pragma unroll
     for (int i = 0; i < 8; ++i)
     {
-        const float gg = fminf(g[i], L), uu = fminf(fmaxf(u[i], -L), L);
+        const float gi = g[i], ui = u[i];
+        const float gg = gi > L ? L : gi, uu = ui < -L ? -L : (ui > L ? L : ui);
         v[i] = gg / (1.0f + expf(-gg)) * uu;
     }
     *reinterpret_cast<float4*>(act + (long long) m * n + base) = make_float4(v[0], v[1], v[2], v[3]);
@@ -441,10 +442,9 @@ __global__ void __launch_bounds__(1024) swiglu_rot(const float* __restrict__ Y, 
     for (int h = 1; h < 8; h <<= 1)
         #pragma unroll
         for (int i = 0; i < 8; ++i) if (!(i & h)) { const float a = v[i], b = v[i + h]; v[i] = a + b; v[i + h] = a - b; }
-    const unsigned mask = nt >= 32 ? 0xffffffffu : ((1u << nt) - 1u);
     for (int hs = 1; hs < 32 && hs < nt; hs <<= 1)
         #pragma unroll
-        for (int i = 0; i < 8; ++i) { const float o = __shfl_xor_sync(mask, v[i], hs); v[i] = (tid & hs) ? (o - v[i]) : (v[i] + o); }
+        for (int i = 0; i < 8; ++i) { const float o = __shfl_xor_sync(0xffffffffu, v[i], hs); v[i] = (tid & hs) ? (o - v[i]) : (v[i] + o); }
     for (int hs = 32; hs < nt; hs <<= 1)
     {
         #pragma unroll
@@ -523,7 +523,7 @@ extern "C" int glm53_spx_kda_onorm_rot_cuda(const void* o, const void* onorm, in
                                            const void* sign, int bk, void* xr, cudaStream_t s)
 {
     const int W = heads * 128;
-    if (heads < 1 || heads > 32 || bk < 8 || bk > W || (bk & (bk - 1)) || W % bk) return int(cudaErrorInvalidValue);
+    if (heads < 1 || heads > 32 || (heads & 1) || bk < 8 || bk > W || (bk & (bk - 1)) || W % bk) return int(cudaErrorInvalidValue);
     if (rows == 0) return 0;
     kda_onorm_rot<<<rows, heads * 32, (size_t) W * sizeof(float), s>>>((const float*) o, (const float*) onorm, onorm_len, (const float*) sg2, (float*) out,
                                                                       heads, (const int8_t*) sign, bk, (__half*) xr);
@@ -549,7 +549,7 @@ extern "C" int glm53_spx_rot8_cuda(const void* x, long long ldx, int in_kind, co
 extern "C" int glm53_spx_mm8_cuda(const void* q, const void* sx, const void* sumx, const void* t, int m, int n, int k, int bits,
                                   void* y, long long ldy, int out, cudaStream_t s)
 {
-    if (n % 16 || k % 128 || ldy < n || ldy % 4 || (bits < 4 || bits > 6) || out < 0 || out > 2) return int(cudaErrorInvalidValue);
+    if (n <= 0 || k <= 0 || n % 16 || k % 128 || ldy < n || ldy % 4 || (bits < 4 || bits > 6) || out < 0 || out > 2) return int(cudaErrorInvalidValue);
     if (m == 0) return 0;
     static const bool v1 = [] { const char* e = std::getenv("GLM53_SPX_MM8_V"); return e && e[0] == '1'; }();
     if (!v1)

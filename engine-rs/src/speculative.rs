@@ -52,7 +52,7 @@ mod tests {
         for _ in 0..7 {good.push(next);next=toy.step(&mut state,next).0;}
         for reject in 0..=7 {
             let mut proposal=good.clone();if reject<7{proposal[reject]=(proposal[reject]+1)%11;}
-            let v=verify(&mut toy,&base,7,&chain(&proposal),7);
+            let v=verify_until(&mut toy,&base,7,&chain(&proposal),7,&[]);
             assert_eq!(v.tokens,good[..reject]);assert_eq!(v.state,[base.clone(),good[..reject].to_vec()].concat());
             let expected=if reject<7{good[reject]}else{next};assert_eq!(v.next,expected);
             assert_eq!(base,vec![2,3]);
@@ -63,13 +63,13 @@ mod tests {
         let mut toy=Toy;let base=vec![2,3];
         let nodes=vec![Node{parent:None,token:1},Node{parent:None,token:7},
             Node{parent:Some(0),token:9},Node{parent:Some(1),token:4},Node{parent:Some(1),token:0}];
-        let v=verify(&mut toy,&base,7,&nodes,2);
+        let v=verify_until(&mut toy,&base,7,&nodes,2,&[]);
         assert_eq!(v.tokens,vec![7,4]);assert_eq!(v.state,vec![2,3,7,4]);
         assert_eq!(v.aux,vec![vec![2,3,7],vec![2,3,7,4]]);assert_eq!(v.next,9);
     }
     #[test]
     fn zero_budget_and_empty_tree_leave_state_unchanged() {
-        let mut toy=Toy;let v=verify(&mut toy,&vec![3],8,&[],0);
+        let mut toy=Toy;let v=verify_until(&mut toy,&vec![3],8,&[],0,&[]);
         assert_eq!(v.next,8);assert_eq!(v.state,vec![3]);assert!(v.tokens.is_empty());
     }
     #[test]

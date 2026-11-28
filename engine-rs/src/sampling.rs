@@ -43,19 +43,19 @@ fn fill(out:&Tensor,col_offset:i64,temps:&[f32],keys:&[u64]) {
 /// a side stream while the drafter runs on the main stream; set_rows then only joins when its rows are a prefix of the
 /// early rows (same values, same buffer).
 pub fn early_enabled()->bool {std::env::var("GLM53_NOISE_EARLY").as_deref()==Ok("1")}
-extern "C"{fn rs_stream_fork(n:i32)->i32;fn rs_stream_set(i:i32)->i32;fn rs_stream_join(n:i32)->i32;}
-/// Fill `rows` (a superset: the maximum draft depth + 1) on a forked side stream. The fork orders it after every
-/// earlier main-stream reader of the buffer (the previous verifier replay).
+extern "C"{fn rs_side_begin()->i32;fn rs_side_end()->i32;fn rs_side_join()->i32;}
+/// Fill `rows` (a superset: the maximum draft depth + 1) on a dedicated side stream (independent of rs_stream_fork used
+/// by GLM53_COMMIT_SIDE). The begin orders it after every earlier main-stream reader of the buffer.
 pub fn prefill_rows(rows:&[(f32,u64)]) {
     NOISE.with(|n|{
         let mut n=n.borrow_mut();let Some(n)=n.as_mut() else {return};
         if fused_enabled() {return;}
-        if n.early.is_some() {assert_eq!(unsafe{rs_stream_join(1)},0);n.early=None;}
+        if n.early.is_some() {assert_eq!(unsafe{rs_side_join()},0);n.early=None;}
         if rows.is_empty() || rows.len()>MAX_ROWS || rows.iter().enumerate().all(|(i,r)|r.0<=0.&&!n.dirty[i]) {return;}
         let temps:Vec<f32>=rows.iter().map(|r|r.0.max(0.)).collect();let keys:Vec<u64>=rows.iter().map(|r|r.1).collect();
-        assert_eq!(unsafe{rs_stream_fork(1)},0);assert_eq!(unsafe{rs_stream_set(0)},0);
+        assert_eq!(unsafe{rs_side_begin()},0);
         fill(&n.buf.narrow(0,0,rows.len() as i64),n.start,&temps,&keys);
-        assert_eq!(unsafe{rs_stream_set(-1)},0);
+        assert_eq!(unsafe{rs_side_end()},0);
         for (i,t) in temps.iter().enumerate() {n.dirty[i]=*t>0.;}
         n.early=Some(rows.iter().map(|r|(r.0.max(0.),r.1)).collect());
     })
@@ -73,7 +73,7 @@ pub fn set_rows(rows:&[(f32,u64)]) {
             if fused_enabled() {return;}
         }
         if let Some(early)=n.early.take() {
-            assert_eq!(unsafe{rs_stream_join(1)},0);
+            assert_eq!(unsafe{rs_side_join()},0);
             if rows.len()<=early.len() && rows.iter().zip(&early).all(|(a,b)|a.0.max(0.)==b.0&&a.1==b.1) {return;}
         }
         assert!(rows.len()<=MAX_ROWS,"sampling rows {} > {}",rows.len(),MAX_ROWS);

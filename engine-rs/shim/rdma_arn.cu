@@ -63,7 +63,7 @@ struct Host {                    // pinned, host-mapped, registered with every d
 // bit 61: the payload is BF16 (parts are counted in 2-byte elements)
 constexpr unsigned long long MODE_SHIFT=62,MODE_RS=1ull<<MODE_SHIFT,MODE_AG=2ull<<MODE_SHIFT,MODE_BF16=1ull<<61,BYTES_MASK=(1ull<<61)-1;
 __host__ __device__ inline long long part_lo(long long n,int k,int world){return k>=world?n:((n*k/world)/4)*4;}
-struct DevState {unsigned long long seq;unsigned int arrive;unsigned int done;unsigned long long fseq;unsigned int fdone;};
+struct DevState {unsigned long long seq;unsigned int arrive;unsigned int done;unsigned long long fseq;unsigned int fdone;unsigned int dual_mask;};
 
 struct DevInfo {char name[32];uint32_t ip;uint32_t mask;};                   // ip/mask in network order
 struct LinkInfo {uint32_t qpn,psn,rkey,mtu;uint8_t gid[16];};   // mtu: rdma_port_mtu of the sender's device
@@ -92,9 +92,10 @@ __global__ void arn_kernel(float* data,long long n,int rank,int world,Host* h,De
   __threadfence_system();__syncthreads();
   if(threadIdx.x==0){
     if(atomicAdd(&st->arrive,1u)==gridDim.x-1){st->arrive=0;h->ready_bytes[slot]=(unsigned long long)n*4;__threadfence_system();h->ready_seq[slot]=s;__threadfence_system();}
-    const bool two=split&&(unsigned long long)n*4>=split;
+    const bool big=split&&(unsigned long long)n*4>=split;
     for(int r=0;r<world;++r){
       if(r==rank)continue;
+      const bool two=big&&((st->dual_mask>>r)&1u);
       long long spins=0;
       while(h->recv_flag[r][0][slot]!=s||(two&&h->recv_flag[r][1][slot]!=s)){if(++spins>(1ll<<34))__trap();}
     }
@@ -134,9 +135,10 @@ __global__ void arn_b16_kernel(const __nv_bfloat16* in,__nv_bfloat16* out,long l
   __threadfence_system();__syncthreads();
   if(threadIdx.x==0){
     if(atomicAdd(&st->arrive,1u)==gridDim.x-1){st->arrive=0;h->ready_bytes[slot]=(unsigned long long)n*2;__threadfence_system();h->ready_seq[slot]=s;__threadfence_system();}
-    const bool two=split&&(unsigned long long)n*2>=split;
+    const bool big=split&&(unsigned long long)n*2>=split;
     for(int r=0;r<world;++r){
       if(r==rank)continue;
+      const bool two=big&&((st->dual_mask>>r)&1u);
       long long spins=0;
       while(h->recv_flag[r][0][slot]!=s||(two&&h->recv_flag[r][1][slot]!=s)){if(++spins>(1ll<<34))__trap();}
     }
@@ -171,7 +173,7 @@ __global__ void arn_send_kernel(const float* data,long long n,Host* h,DevState* 
   float* snd=reinterpret_cast<float*>(h->send[slot]);
   const long long stride=(long long)gridDim.x*blockDim.x,first=(long long)blockIdx.x*blockDim.x+threadIdx.x;
   // float4 copies (data and slots are 16-byte aligned: every chunk starts at a multiple of the slot size), tail by element
-  const long long n4=n/4;
+  const long long n4=((size_t)data&15)?0:n/4;
   for(long long i=first;i<n4;i+=stride)reinterpret_cast<float4*>(snd)[i]=reinterpret_cast<const float4*>(data)[i];
   for(long long i=n4*4+first;i<n;i+=stride)snd[i]=data[i];
   __threadfence_system();__syncthreads();
@@ -183,16 +185,17 @@ __global__ void arn_send_kernel(const float* data,long long n,Host* h,DevState* 
 __global__ void arn_finish_kernel(float* data,long long n,int rank,int world,const Host* h,DevState* st,unsigned long long split){
   const unsigned long long s=st->fseq+1;const int slot=(int)(s%NSLOT);
   if(threadIdx.x==0){
-    const bool two=split&&(unsigned long long)n*4>=split;
+    const bool big=split&&(unsigned long long)n*4>=split;
     for(int r=0;r<world;++r){
       if(r==rank)continue;
+      const bool two=big&&((st->dual_mask>>r)&1u);
       long long spins=0;
       while(h->recv_flag[r][0][slot]!=s||(two&&h->recv_flag[r][1][slot]!=s)){if(++spins>(1ll<<34))__trap();}
     }
   }
   __syncthreads();
   const long long stride=(long long)gridDim.x*blockDim.x,first=(long long)blockIdx.x*blockDim.x+threadIdx.x;
-  const long long n4=n/4;
+  const long long n4=((size_t)data&15)?0:n/4;
   for(long long i=first;i<n4;i+=stride){
     float4 acc=make_float4(0.f,0.f,0.f,0.f);
     for(int r=0;r<world;++r){
@@ -220,11 +223,11 @@ __global__ void arn_finish_kernel(float* data,long long n,int rank,int world,con
 //     all-gather (every peer receives this rank's summed part);
 //   ag_finish: wait for every peer's summed part and copy it into the data.
 // Each rank sends 4/3 of the buffer instead of twice the buffer.
-__device__ inline void wait_peers(const Host* h,int rank,int world,int slot,unsigned long long s,unsigned long long split,long long n,bool own){
+__device__ inline void wait_peers(const Host* h,int rank,int world,int slot,unsigned long long s,unsigned long long split,unsigned int dual_mask,long long n,bool own){
   for(int r=0;r<world;++r){
     if(r==rank)continue;
     const int k=own?rank:r;   // the part the sender r wrote: ours (reduce-scatter) or its own (all-gather)
-    const bool two=split&&(unsigned long long)(part_lo(n,k+1,world)-part_lo(n,k,world))*4>=split;
+    const bool two=split&&((dual_mask>>r)&1u)&&(unsigned long long)(part_lo(n,k+1,world)-part_lo(n,k,world))*4>=split;
     long long spins=0;
     while(h->recv_flag[r][0][slot]!=s||(two&&h->recv_flag[r][1][slot]!=s)){if(++spins>(1ll<<34))__trap();}
   }
@@ -233,7 +236,7 @@ __global__ void arn_rs_send_kernel(const float* data,long long n,Host* h,DevStat
   const unsigned long long s=st->seq+1;const int slot=(int)(s%NSLOT);
   float* snd=reinterpret_cast<float*>(h->send[slot]);
   const long long stride=(long long)gridDim.x*blockDim.x,first=(long long)blockIdx.x*blockDim.x+threadIdx.x;
-  const long long n4=n/4;
+  const long long n4=((size_t)data&15)?0:n/4;
   for(long long i=first;i<n4;i+=stride)reinterpret_cast<float4*>(snd)[i]=reinterpret_cast<const float4*>(data)[i];
   for(long long i=n4*4+first;i<n;i+=stride)snd[i]=data[i];
   __threadfence_system();__syncthreads();
@@ -244,12 +247,14 @@ __global__ void arn_rs_send_kernel(const float* data,long long n,Host* h,DevStat
 }
 __global__ void arn_rs_finish_kernel(float* data,long long n,int rank,int world,Host* h,DevState* st,unsigned long long split){
   const unsigned long long sf=st->fseq+1,sp=st->seq+1;const int slot=(int)(sf%NSLOT),pslot=(int)(sp%NSLOT);
-  if(threadIdx.x==0)wait_peers(h,rank,world,slot,sf,split,n,true);
+  if(threadIdx.x==0)wait_peers(h,rank,world,slot,sf,split,st->dual_mask,n,true);
   __syncthreads();
   const long long lo=part_lo(n,rank,world),hi=part_lo(n,rank+1,world);
   float* snd=reinterpret_cast<float*>(h->send[pslot]);
   const long long stride=(long long)gridDim.x*blockDim.x,first=(long long)blockIdx.x*blockDim.x+threadIdx.x;
-  for(long long i=lo/4+first;i<hi/4;i+=stride){
+  const bool aligned=((size_t)data&15)==0;
+  const long long vec_hi=aligned?(hi/4)*4:lo;
+  for(long long i=lo/4+first;i<vec_hi/4;i+=stride){
     float4 acc=make_float4(0.f,0.f,0.f,0.f);
     for(int r=0;r<world;++r){
       const float4 x=r==rank?reinterpret_cast<const float4*>(data)[i]:__ldcv(reinterpret_cast<const float4*>(h->recv[r][slot])+i);
@@ -257,7 +262,7 @@ __global__ void arn_rs_finish_kernel(float* data,long long n,int rank,int world,
     }
     reinterpret_cast<float4*>(data)[i]=acc;reinterpret_cast<float4*>(snd)[i]=acc;
   }
-  for(long long i=(hi/4)*4+first;i<hi;i+=stride){   // the last part's tail (n not a multiple of 4)
+  for(long long i=vec_hi+first;i<hi;i+=stride){   // tail or unaligned
     float acc=0.f;
     for(int r=0;r<world;++r){const float x=r==rank?data[i]:__ldcv(reinterpret_cast<const float*>(h->recv[r][slot])+i);acc=r==0?x:__fadd_rn(acc,x);}
     data[i]=acc;snd[i]=acc;
@@ -270,14 +275,16 @@ __global__ void arn_rs_finish_kernel(float* data,long long n,int rank,int world,
 }
 __global__ void arn_ag_finish_kernel(float* data,long long n,int rank,int world,const Host* h,DevState* st,unsigned long long split){
   const unsigned long long s=st->fseq+1;const int slot=(int)(s%NSLOT);
-  if(threadIdx.x==0)wait_peers(h,rank,world,slot,s,split,n,false);
+  if(threadIdx.x==0)wait_peers(h,rank,world,slot,s,split,st->dual_mask,n,false);
   __syncthreads();
   const long long stride=(long long)gridDim.x*blockDim.x,first=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+  const bool aligned=((size_t)data&15)==0;
   for(int r=0;r<world;++r){
     if(r==rank)continue;
     const long long lo=part_lo(n,r,world),hi=part_lo(n,r+1,world);
-    for(long long i=lo/4+first;i<hi/4;i+=stride)reinterpret_cast<float4*>(data)[i]=__ldcv(reinterpret_cast<const float4*>(h->recv[r][slot])+i);
-    for(long long i=(hi/4)*4+first;i<hi;i+=stride)data[i]=__ldcv(reinterpret_cast<const float*>(h->recv[r][slot])+i);
+    const long long vec_hi=aligned?(hi/4)*4:lo;
+    for(long long i=lo/4+first;i<vec_hi/4;i+=stride)reinterpret_cast<float4*>(data)[i]=__ldcv(reinterpret_cast<const float4*>(h->recv[r][slot])+i);
+    for(long long i=vec_hi+first;i<hi;i+=stride)data[i]=__ldcv(reinterpret_cast<const float*>(h->recv[r][slot])+i);
   }
   __threadfence();__syncthreads();
   if(threadIdx.x==0&&atomicAdd(&st->fdone,1u)==gridDim.x-1){st->fdone=0;st->fseq=s;}
@@ -290,26 +297,27 @@ __global__ void arn_rs_send_bf16_kernel(const float* data,long long n,Host* h,De
   const unsigned long long s=st->seq+1;const int slot=(int)(s%NSLOT);
   __nv_bfloat16* snd=reinterpret_cast<__nv_bfloat16*>(h->send[slot]);
   const long long stride=(long long)gridDim.x*blockDim.x,first=(long long)blockIdx.x*blockDim.x+threadIdx.x;
-  for(long long i=first;i<n/2;i+=stride){const float2 v=reinterpret_cast<const float2*>(data)[i];reinterpret_cast<__nv_bfloat162*>(snd)[i]=__floats2bfloat162_rn(v.x,v.y);}
-  if(first==0&&(n&1))snd[n-1]=__float2bfloat16(data[n-1]);
+  const long long n2=((size_t)data&7)?0:n/2;
+  for(long long i=first;i<n2;i+=stride){const float2 v=reinterpret_cast<const float2*>(data)[i];reinterpret_cast<__nv_bfloat162*>(snd)[i]=__floats2bfloat162_rn(v.x,v.y);}
+  for(long long i=n2*2+first;i<n;i+=stride)snd[i]=__float2bfloat16(data[i]);
   __threadfence_system();__syncthreads();
   if(threadIdx.x==0){
     if(atomicAdd(&st->arrive,1u)==gridDim.x-1){st->arrive=0;h->ready_bytes[slot]=((unsigned long long)n*2)|MODE_RS|MODE_BF16;__threadfence_system();h->ready_seq[slot]=s;__threadfence_system();}
     if(atomicAdd(&st->done,1u)==gridDim.x-1){st->done=0;st->seq=s;}
   }
 }
-__device__ inline void wait_peers_e(const Host* h,int rank,int world,int slot,unsigned long long s,unsigned long long split,long long n,bool own,int esz){
+__device__ inline void wait_peers_e(const Host* h,int rank,int world,int slot,unsigned long long s,unsigned long long split,unsigned int dual_mask,long long n,bool own,int esz){
   for(int r=0;r<world;++r){
     if(r==rank)continue;
     const int k=own?rank:r;
-    const bool two=split&&(unsigned long long)(part_lo(n,k+1,world)-part_lo(n,k,world))*esz>=split;
+    const bool two=split&&((dual_mask>>r)&1u)&&(unsigned long long)(part_lo(n,k+1,world)-part_lo(n,k,world))*esz>=split;
     long long spins=0;
     while(h->recv_flag[r][0][slot]!=s||(two&&h->recv_flag[r][1][slot]!=s)){if(++spins>(1ll<<34))__trap();}
   }
 }
 __global__ void arn_rs_finish_bf16_kernel(float* data,long long n,int rank,int world,Host* h,DevState* st,unsigned long long split){
   const unsigned long long sf=st->fseq+1,sp=st->seq+1;const int slot=(int)(sf%NSLOT),pslot=(int)(sp%NSLOT);
-  if(threadIdx.x==0)wait_peers_e(h,rank,world,slot,sf,split,n,true,2);
+  if(threadIdx.x==0)wait_peers_e(h,rank,world,slot,sf,split,st->dual_mask,n,true,2);
   __syncthreads();
   const long long lo=part_lo(n,rank,world),hi=part_lo(n,rank+1,world);
   const __nv_bfloat16* own=reinterpret_cast<const __nv_bfloat16*>(h->send[slot]);   // this rank's rounded partial
@@ -318,7 +326,8 @@ __global__ void arn_rs_finish_bf16_kernel(float* data,long long n,int rank,int w
   for(long long i=lo+first;i<hi;i+=stride){
     float acc=0.f;
     for(int r=0;r<world;++r){
-      const float x=__bfloat162float(r==rank?own[i]:reinterpret_cast<const volatile __nv_bfloat16*>(h->recv[r][slot])[i]);
+      const __nv_bfloat16 b=r==rank?own[i]:__ushort_as_bfloat16(__ldcv(reinterpret_cast<const unsigned short*>(h->recv[r][slot])+i));
+      const float x=__bfloat162float(b);
       acc=r==0?x:__fadd_rn(acc,x);
     }
     const __nv_bfloat16 b=__float2bfloat16(acc);
@@ -332,13 +341,13 @@ __global__ void arn_rs_finish_bf16_kernel(float* data,long long n,int rank,int w
 }
 __global__ void arn_ag_finish_bf16_kernel(float* data,long long n,int rank,int world,const Host* h,DevState* st,unsigned long long split){
   const unsigned long long s=st->fseq+1;const int slot=(int)(s%NSLOT);
-  if(threadIdx.x==0)wait_peers_e(h,rank,world,slot,s,split,n,false,2);
+  if(threadIdx.x==0)wait_peers_e(h,rank,world,slot,s,split,st->dual_mask,n,false,2);
   __syncthreads();
   const long long stride=(long long)gridDim.x*blockDim.x,first=(long long)blockIdx.x*blockDim.x+threadIdx.x;
   for(int r=0;r<world;++r){
     if(r==rank)continue;
-    const volatile __nv_bfloat16* src=reinterpret_cast<const volatile __nv_bfloat16*>(h->recv[r][slot]);
-    for(long long i=part_lo(n,r,world)+first;i<part_lo(n,r+1,world);i+=stride)data[i]=__bfloat162float(const_cast<const __nv_bfloat16&>(src[i]));
+    const unsigned short* src=reinterpret_cast<const unsigned short*>(h->recv[r][slot]);
+    for(long long i=part_lo(n,r,world)+first;i<part_lo(n,r+1,world);i+=stride)data[i]=__bfloat162float(__ushort_as_bfloat16(__ldcv(src+i)));
   }
   __threadfence();__syncthreads();
   if(threadIdx.x==0&&atomicAdd(&st->fdone,1u)==gridDim.x-1){st->fdone=0;st->fseq=s;}
@@ -389,9 +398,10 @@ __global__ void arn_rows_finish_bf16_kernel(float* out,const float* own,long lon
                                             const Host* h,DevState* st,unsigned long long split,int wait=1){
   const unsigned long long s=st->fseq+1;const int slot=(int)(s%NSLOT);
   if(wait&&threadIdx.x==0){
-    const bool two=split&&(unsigned long long)m_f*2>=split;
+    const bool big=split&&(unsigned long long)m_f*2>=split;
     for(int r=0;r<world;++r){
       if(r==rank)continue;
+      const bool two=big&&((st->dual_mask>>r)&1u);
       long long spins=0;
       while(h->recv_flag[r][0][slot]!=s||(two&&h->recv_flag[r][1][slot]!=s)){if(++spins>(1ll<<34))__trap();}
     }
@@ -481,9 +491,10 @@ __global__ void arn_rows_finish_bf16r_kernel(__nv_bfloat16* out,long long m_f,lo
                                              const Host* h,DevState* st,unsigned long long split,int wait=1){
   const unsigned long long s=st->fseq+1;const int slot=(int)(s%NSLOT);
   if(wait&&threadIdx.x==0){
-    const bool two=split&&(unsigned long long)m_f*2>=split;
+    const bool big=split&&(unsigned long long)m_f*2>=split;
     for(int r=0;r<world;++r){
       if(r==rank)continue;
+      const bool two=big&&((st->dual_mask>>r)&1u);
       long long spins=0;
       while(h->recv_flag[r][0][slot]!=s||(two&&h->recv_flag[r][1][slot]!=s)){if(++spins>(1ll<<34))__trap();}
     }
@@ -511,9 +522,10 @@ __global__ void arn_rows_finish_bf16r_kernel(__nv_bfloat16* out,long long m_f,lo
 __global__ void arn_rows_wait_kernel(int rank,int world,unsigned long long two_at,const Host* h,const DevState* st,unsigned long long split){
   const unsigned long long s=st->fseq+1;const int slot=(int)(s%NSLOT);
   if(threadIdx.x!=0)return;
-  const bool two=split&&two_at>=split;
+  const bool big=split&&two_at>=split;
   for(int r=0;r<world;++r){
     if(r==rank)continue;
+    const bool two=big&&((st->dual_mask>>r)&1u);
     long long spins=0;
     while(h->recv_flag[r][0][slot]!=s||(two&&h->recv_flag[r][1][slot]!=s)){if(++spins>(1ll<<34))__trap();}
   }
@@ -523,9 +535,10 @@ __global__ void arn_rows_finish_kernel(unsigned char* out,const unsigned char* o
                                        int ag,const Host* h,DevState* st,unsigned long long split,int wait=1){
   const unsigned long long s=st->fseq+1;const int slot=(int)(s%NSLOT);
   if(wait&&threadIdx.x==0){
-    const bool two=split&&(unsigned long long)m>=split;
+    const bool big=split&&(unsigned long long)m>=split;
     for(int r=0;r<world;++r){
       if(r==rank)continue;
+      const bool two=big&&((st->dual_mask>>r)&1u);
       long long spins=0;
       while(h->recv_flag[r][0][slot]!=s||(two&&h->recv_flag[r][1][slot]!=s)){if(++spins>(1ll<<34))__trap();}
     }
@@ -729,13 +742,17 @@ extern "C" int glm53_rdma_arn_init(int rank,int world,KvSet kv_set,KvGet kv_get)
     if(!kv_put(kv_set,"arn/qp/"+std::to_string(rank)+"/"+std::to_string(j),&pi,sizeof pi))return 12;
   }
   // 3. connect
+  unsigned int dual_mask=0;
   for(int j=0;j<world;++j){
     if(j==rank)continue;Peer& P=g_peers[j];PeerInfo pi{};
     if(!kv_take(kv_get,"arn/qp/"+std::to_string(j)+"/"+std::to_string(rank),&pi,sizeof pi))return 13;
     if((int)pi.nlink!=P.nlink){fprintf(stderr,"[rdma_arn] link count with rank%d differs (%d vs %u)\n",j,P.nlink,pi.nlink);return 14;}
     P.addr=pi.addr;
+    if(P.nlink==2)dual_mask|=(1u<<j);
     for(int l=0;l<P.nlink;++l){P.link[l].remote=pi.link[l];if(!qp_to_rts(P.link[l],j,l))return 15;}
   }
+  if(!dual_mask)g_split=0;
+  if(cudaMemcpy(&g_state->dual_mask,&dual_mask,sizeof(dual_mask),cudaMemcpyHostToDevice)!=cudaSuccess)return 18;
   // 4. barrier: every QP of every rank is RTS before anyone writes
   {const char ok='1';if(!kv_put(kv_set,"arn/ready/"+std::to_string(rank),&ok,1))return 16;
    for(int r=0;r<world;++r){char c;if(!kv_take(kv_get,"arn/ready/"+std::to_string(r),&c,1))return 17;}}

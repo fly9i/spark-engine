@@ -111,7 +111,7 @@ __global__ void __launch_bounds__(256) skinny_c12(const float* __restrict__ X,co
         else reinterpret_cast<float*>(Y)[(size_t)tok*N+row]=OUT==1?__half2float(__float2half_rn(s)):s;}}
   }
 }
-inline bool c12_shape_ok(int n,int k,int ks){const int chunks=k>>5;return n%16==0&&k%128==0&&(chunks/ks)*ks==chunks&&(chunks/ks)%4==0;}
+inline bool c12_shape_ok(int n,int k,int ks){if(n<=0||k<=0||(ks!=2&&ks!=4&&ks!=8))return false;const int chunks=k>>5;return n%16==0&&k%128==0&&(chunks/ks)*ks==chunks&&(chunks/ks)%4==0;}
 inline int skinny_c12_launch(const float* X,const C12View& w,void* Y,int M,int out,int ks,cudaStream_t s,bool xhalf=false){
   if(M<1||M>32||!c12_shape_ok(w.n,w.k,ks))return int(cudaErrorInvalidValue);
   auto grid=[&](int KS){int rt=8/KS;return (w.n+16*rt-1)/(16*rt);};

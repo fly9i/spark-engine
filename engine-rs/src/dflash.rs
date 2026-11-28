@@ -361,8 +361,8 @@ impl Drafter {
             let (start,total,weight)=if let Some((start,total))=self.head_shard {
                 (start,total,self.lm_head.shallow_clone())
             } else {
-                let total=self.lm_head.size()[0];assert_eq!(total%tp.world as i64,0);
-                let count=total/tp.world as i64;let start=count*tp.rank as i64;
+                let total=self.lm_head.size()[0];
+                let (start,count)=crate::weights::vocab_part(total,tp.rank,tp.world).range(total);
                 (start,total,self.lm_head.narrow(0,start,count))
             };
             let local=linear(hidden,&weight).to_kind(Kind::Float);
@@ -376,7 +376,7 @@ impl Drafter {
         if std::env::var("GLM53_DRAFT_HEAD_INT4").as_deref()!=Ok("1") {return None;}
         let tp=crate::tp::world();
         let (start,total,weight)=if let Some((start,total))=self.head_shard {(start,total,self.lm_head.shallow_clone())} else {
-            let total=self.lm_head.size()[0];let count=total/tp.world as i64;let start=count*tp.rank as i64;(start,total,self.lm_head.narrow(0,start,count))};
+            let total=self.lm_head.size()[0];let (start,count)=crate::weights::vocab_part(total,tp.rank,tp.world).range(total);(start,total,self.lm_head.narrow(0,start,count))};
         let (q,s)=crate::dense_fp8::quant_of_bf16(&weight)?;
         let (n,k)=(q.size()[0],q.size()[1]);let m=hidden.size()[0];
         if !(1..=32).contains(&m) || k%1024!=0 || hidden.size()[1]!=k || (m>8 && n%8!=0) {return None;}
@@ -411,7 +411,7 @@ impl Drafter {
         if std::env::var("GLM53_DRAFT_HEAD_INT4").as_deref()!=Ok("1") || !topk_tp() {return;}
         let tp=crate::tp::world();
         let weight=if self.head_shard.is_some() {self.lm_head.shallow_clone()} else {
-            let count=self.lm_head.size()[0]/tp.world as i64;self.lm_head.narrow(0,count*tp.rank as i64,count)};
+            let total=self.lm_head.size()[0];let (start,count)=crate::weights::vocab_part(total,tp.rank,tp.world).range(total);self.lm_head.narrow(0,start,count)};
         if let Some((q,s))=crate::dense_fp8::quant_of_bf16(&weight) {let _=head4_of(&q,&s);eprintln!("[draft] INT4 head copy ready: {:?}",q.size());}
     }
 }

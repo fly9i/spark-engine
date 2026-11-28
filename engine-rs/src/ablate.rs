@@ -204,7 +204,12 @@ impl Clamp {
     pub fn norm_args(&self, ln: &Tensor, rows: i64) -> Option<ClampArgs> { self.norm_args_off(ln, rows, 0) }
     pub fn norm_args_off(&self, ln: &Tensor, rows: i64, off: i64) -> Option<ClampArgs> {
         let mut a = self.mhc_args(ln, rows)?;
-        if !a.count.is_null() { a.count = unsafe { a.count.add(off.max(0) as usize) }; }
+        if !a.count.is_null() {
+            let off = off.max(0);
+            let base = ROW_BASE.with(|b| b.get());
+            assert!(base + off + rows <= CLAMP_COUNT_ROWS, "SPARK_ABLATE_CLAMP_MIN: {rows} rows at off {off} (base {base})");
+            a.count = unsafe { a.count.add(off as usize) };
+        }
         Some(a)
     }
     /// The count gate's per-row counters (None without the gate): DS41's sequence-parallel encoder gathers each rank's

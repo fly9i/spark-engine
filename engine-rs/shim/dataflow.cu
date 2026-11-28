@@ -491,7 +491,7 @@ __global__ void router_select_fast(const float* __restrict__ partial,const float
 #pragma unroll
     for(int j=0;j<10;++j){const int e=lane+32*j;
         if(e<experts){const float l=router_logit<S>(partial+((long long)r*experts+e)*S);
-            score[j]=1.f/(1.f+expf(-l));key[j]=router_key(score[j]+bias[e]);}else{score[j]=0.f;key[j]=0u;}}
+            score[j]=1.f/(1.f+expf(-l));float sel=score[j]+bias[e];if(sel!=sel)sel=-INFINITY;key[j]=router_key(sel);}else{score[j]=0.f;key[j]=0u;}}
     float chosen[8];int chosen_id[8];
 #pragma unroll
     for(int n=0;n<8;++n){

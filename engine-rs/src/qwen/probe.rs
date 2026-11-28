@@ -348,22 +348,25 @@ pub fn pcache_selftest(dir: &Path) {
     let mut slot: Option<Ckpt> = None;
     m.ckpt_save(&seq, &pend, &mut slot);
     let c_mem = slot.unwrap();
-    super::pcache::save(&c_mem.ids, c_mem.tensors(), 0);
+    let qsa_mem = m.pcache_qsa_slices(&seq, n);
+    let yarn = Model::yarn_mode(&seq);
+    super::pcache::save(&c_mem.ids, c_mem.tensors(), &qsa_mem, yarn, 0);
     super::pcache::fence(0);
-    let (idx, len) = super::pcache::lookup(&prefix, 0, 16).expect("selftest: entry not found on disk");
+    let (idx, len) = super::pcache::lookup(&prefix, 0, 16, yarn, true).expect("selftest: entry not found on disk");
     assert_eq!(len, prefix.len(), "selftest: cached length");
-    let (ids, t) = super::pcache::restore(idx, &prefix, Device::Cuda(0)).expect("selftest: restore failed");
+    let (ids, t, qsa) = super::pcache::restore(idx, &prefix, Device::Cuda(0)).expect("selftest: restore failed");
     assert_eq!(ids, c_mem.ids, "selftest: ids differ");
     let mem = c_mem.tensors();
     assert_eq!(mem.len(), t.len(), "selftest: tensor count {} vs {}", mem.len(), t.len());
+    assert_eq!(qsa_mem.len(), qsa.len(), "selftest: QSA KV tensor count {} vs {}", qsa_mem.len(), qsa.len());
     let mut bad = 0;
-    for (i, (a, b)) in mem.iter().zip(&t).enumerate() {
+    for (i, (a, b)) in mem.iter().chain(&qsa_mem).zip(t.iter().chain(&qsa)).enumerate() {
         assert_eq!(a.size(), b.size(), "selftest: tensor {i} shape {:?} vs {:?}", a.size(), b.size());
         if !a.equal(b) { bad += 1;
             let d = (a.to_kind(tch::Kind::Float) - b.to_kind(tch::Kind::Float)).abs().max().double_value(&[]);
             eprintln!("[selftest] tensor {i} {:?} DIFFERS (max abs {d})", a.size()); }
     }
-    assert_eq!(bad, 0, "selftest: {bad} of {} state tensors differ", mem.len());
+    assert_eq!(bad, 0, "selftest: {bad} of {} state tensors differ", mem.len() + qsa_mem.len());
     let _ = std::fs::remove_dir_all(&tmp);
-    println!("PCACHE-SELFTEST OK: {} tokens, ids + {} state tensors bitwise identical disk<->memory", prefix.len(), mem.len());
+    println!("PCACHE-SELFTEST OK: {} tokens, ids + {} ckpt + {} QSA KV tensors bitwise identical disk<->memory", prefix.len(), mem.len(), qsa_mem.len());
 }

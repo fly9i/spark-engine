@@ -148,7 +148,7 @@ pub(crate) fn swiglu_rot(y:&Tensor,n:i64,w_down:&Tensor,limit:f64)->Option<Tenso
 pub(crate) fn kda_onorm_rot(o:&Tensor,onorm:&Tensor,sg2:&Tensor,heads:i64,wo:&Tensor)->Option<Tensor> {
     if !any() || std::env::var("GLM53_SPX_ONORM_ROT").as_deref()==Ok("0") {return None;}
     let t=o.size()[0];
-    if t==0 || t>max_rows() || heads>32 || !o.is_contiguous() || !sg2.is_contiguous() || o.kind()!=Kind::Float || sg2.kind()!=Kind::Float {return None;}
+    if t==0 || t>max_rows() || heads<=0 || heads>32 || heads%2!=0 || !o.is_contiguous() || !sg2.is_contiguous() || o.kind()!=Kind::Float || sg2.kind()!=Kind::Float {return None;}
     CACHE.with(|c|{let c=c.borrow();let e=c.get(&(wo.data_ptr() as usize))?;
         if e.key.size()!=wo.size() || e.k!=heads*128 || e.rot>heads*128 {return None;}
         let out=Tensor::empty([t,heads,128],(Kind::Float,o.device()));let xr=Tensor::empty([t,heads*128],(Kind::Half,o.device()));

@@ -77,7 +77,16 @@ struct Active {
 }
 
 /// A speculative verify in flight on this rank (between the `sverify` and `scommit` steps).
-struct SpecPending { sidx: Vec<usize>, rbs: Vec<super::spec::Rollback>, hid: Tensor, offs: Vec<i64>, p0: Vec<i64>, hlen: Vec<usize> }
+struct SpecPending {
+    sidx: Vec<usize>,
+    rbs: Vec<super::spec::Rollback>,
+    hid: Tensor,
+    offs: Vec<i64>,
+    p0: Vec<i64>,
+    hlen: Vec<usize>,
+    trees: Vec<super::tree::VerifyTree>,
+    tstates: Vec<Option<super::model::TreeState>>,
+}
 
 /// The stores' sequences in ascending store order (the listed ones).
 fn seqs_of<'a>(stores: &'a mut [Store], sidx: &[usize]) -> Vec<&'a mut Seq> {
@@ -90,25 +99,74 @@ fn spec_draft(m: &Model, stores: &mut [Store], sidx: &[usize], toks: &[i64], tem
     m.engram_early(&seqs, toks);
     m.mtp_draft(&seqs, toks, temps, seeds)
 }
+fn spec_draft_branches(
+    m: &Model, stores: &mut [Store], sidx: &[usize], toks: &[i64], temps: &[f32], seeds: &[u64],
+) -> (Vec<Vec<i64>>, Vec<Vec<f32>>, Vec<Option<super::tree::DraftBranch>>) {
+    let seqs = seqs_of(stores, sidx);
+    m.engram_early(&seqs, toks);
+    m.mtp_draft_branches(&seqs, toks, temps, seeds)
+}
+/// Apply deterministic Prompt Lookup extension/override (identical on every rank) and build verification trees.
+#[allow(clippy::too_many_arguments)]
+fn plan_verify_trees(
+    stores: &[Store], sidx: &[usize], toks: &[i64],
+    drafts: &mut [Vec<i64>], confs: &mut [Vec<f32>], branches: &mut [Option<super::tree::DraftBranch>],
+    rooms: &[usize], temps: &[f32],
+) -> Vec<super::tree::VerifyTree> {
+    let diag = super::spec::rs_on() || super::spec::stats_on() || super::spec::ranks_on();
+    if !diag {
+        // Keep total rows within pre-warmed row graphs (1..=24) to avoid mid-request CUDA graph capture stalls at c4.
+        let lcap = match sidx.len() { 1 => 12, 2 => 10, 3 => 7, _ => 5 };
+        for b in 0..sidx.len() {
+            let orig_prefix = drafts[b].clone();
+            super::lookup::apply_lookup_capped(&stores[sidx[b]].history, toks[b], &mut drafts[b], &mut confs[b], rooms[b], lcap, temps[b]);
+            // If lookup overrode inside DSpark's original prefix, drop DSpark's stale alt candidates for this sequence.
+            let kept_orig = drafts[b].len() >= orig_prefix.len() && drafts[b][..orig_prefix.len()] == orig_prefix[..];
+            if !kept_orig { branches[b] = None; }
+            if stores[sidx[b]].seq.pos + 32 > stores[sidx[b]].seq.cap { branches[b] = None; }
+        }
+    } else {
+        for br in branches.iter_mut() { *br = None; }
+    }
+    static FIXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FIXED.get_or_init(|| std::env::var("DS41_SPEC_MIN_P").is_ok()) || diag {
+        let maxd: Vec<usize> = (0..sidx.len()).map(|b| drafts[b].len().min(rooms[b])).collect();
+        let rows = verify_rows(toks, drafts, &choose_drafts(confs, &maxd, temps));
+        return rows.into_iter().map(super::tree::VerifyTree::chain).collect();
+    }
+    super::tree::build_trees(toks, drafts, confs, branches, rooms, temps, spec_max_rows(), spec_cost(), spec_calib)
+}
 fn spec_verify(m: &Model, stores: &mut [Store], sidx: &[usize], rows: &[Vec<i64>]) -> (Tensor, SpecPending) {
-    let rbs: Vec<_> = sidx.iter().zip(rows).map(|(&i, r)| m.spec_checkpoint(&stores[i].seq, r.len() as i64)).collect();
+    let trees: Vec<super::tree::VerifyTree> = rows.iter().cloned().map(super::tree::VerifyTree::chain).collect();
+    spec_verify_trees(m, stores, sidx, &trees)
+}
+fn spec_verify_trees(m: &Model, stores: &mut [Store], sidx: &[usize], trees: &[super::tree::VerifyTree]) -> (Tensor, SpecPending) {
+    let rbs: Vec<_> = sidx.iter().zip(trees).map(|(&i, t)| {
+        let n = if t.is_chain() { t.len() as i64 } else { (t.max_depth() + 1) as i64 };
+        m.spec_checkpoint(&stores[i].seq, n)
+    }).collect();
     let p0: Vec<i64> = sidx.iter().map(|&i| stores[i].seq.pos).collect();
     let hlen: Vec<usize> = sidx.iter().map(|&i| stores[i].history.len()).collect();
-    let (lg, hid) = { let mut seqs = seqs_of(stores, sidx); m.forward_rows_local(&mut seqs, rows) };
-    for (&i, r) in sidx.iter().zip(rows) { stores[i].history.extend_from_slice(r); }
-    let offs: Vec<i64> = rows.iter().scan(0i64, |a, r| { let o = *a; *a += r.len() as i64; Some(o) }).collect();
-    (lg, SpecPending { sidx: sidx.to_vec(), rbs, hid: hid.expect("no target hidden"), offs, p0, hlen })
+    let (lg, hid, tstates) = { let mut seqs = seqs_of(stores, sidx); m.forward_trees_local(&mut seqs, trees) };
+    for (&i, t) in sidx.iter().zip(trees) {
+        if t.is_chain() { stores[i].history.extend_from_slice(&t.ids); }
+    }
+    let offs: Vec<i64> = trees.iter().scan(0i64, |a, t| { let o = *a; *a += t.len() as i64; Some(o) }).collect();
+    (lg, SpecPending { sidx: sidx.to_vec(), rbs, hid: hid.expect("no target hidden"), offs, p0, hlen, trees: trees.to_vec(), tstates })
 }
 /// DS41_VERIFY_SPLIT (default on; 0: rank 0 samples each row from the full logits): every verified row's token from
 /// the vocabulary slices (Model::sample_rows: packets, one host copy; every rank calls it). The full logits are
 /// assembled only for rejection sampling / acceptance statistics (DS41_SPEC_RS / DS41_RS_STATS, same on every rank).
 fn verify_split_on() -> bool { static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *E.get_or_init(|| std::env::var("DS41_VERIFY_SPLIT").map_or(true, |v| v != "0")) }
 fn verify_need_full() -> bool { !verify_split_on() || super::spec::rs_on() || super::spec::stats_on() || super::spec::ranks_on() }
-/// The tokens of every verified row (row k of sequence b: temperature temps[b], key of position p0[b] + k + 1).
-fn verify_tokens(m: &Model, local: &Tensor, sp: &SpecPending, nrows: &[usize], temps: &[f32], seeds: &[u64]) -> Vec<i64> {
+/// The tokens of every verified node (node u of sequence b: temperature temps[b], key of position p0[b] + depth[u] + 1).
+fn verify_tokens(m: &Model, local: &Tensor, sp: &SpecPending, _nrows: &[usize], temps: &[f32], seeds: &[u64]) -> Vec<i64> {
     let (mut t, mut k) = (Vec::new(), Vec::new());
-    for b in 0..nrows.len() {
-        for j in 0..nrows[b] { t.push(temps[b]); k.push(crate::sampling::key(seeds[b], (sp.p0[b] + j as i64 + 1) as u64)); }
+    for b in 0..sp.trees.len() {
+        for &d in &sp.trees[b].depths {
+            t.push(temps[b]);
+            k.push(crate::sampling::key(seeds[b], (sp.p0[b] + d as i64 + 1) as u64));
+        }
     }
     m.sample_rows(local, &t, &k)
 }
@@ -127,6 +185,7 @@ fn verify_rows(toks: &[i64], drafts: &[Vec<i64>], chosen: &[usize]) -> Vec<Vec<i
     (0..toks.len()).map(|b| { let mut r = vec![toks[b]]; r.extend(&drafts[b][..chosen[b].min(drafts[b].len())]); r }).collect()
 }
 /// Accepted drafts of one sequence: row tokens ys (ys[k] follows row k) agree with the drafts row[1..] while not a stop.
+#[allow(dead_code)]
 fn accept_len(row: &[i64], ys: &[i64], stops: &[i64]) -> usize {
     let d = row.len() - 1;
     let mut k = 0;
@@ -134,10 +193,25 @@ fn accept_len(row: &[i64], ys: &[i64], stops: &[i64]) -> usize {
     k
 }
 fn spec_commit(m: &Model, stores: &mut [Store], sp: SpecPending, keep: &[i64]) {
-    for (((b, &i), rb), &k) in sp.sidx.iter().enumerate().zip(sp.rbs).zip(keep) {
-        m.spec_rollback(&mut stores[i].seq, rb, k);
-        stores[i].history.truncate(sp.hlen[b] + k as usize);
-        m.mtp_seed(&mut stores[i].seq, &sp.hid.narrow(0, sp.offs[b], k), sp.p0[b]);
+    let paths: Vec<Vec<usize>> = keep.iter().map(|&k| (0..k as usize).collect()).collect();
+    spec_commit_paths(m, stores, sp, &paths);
+}
+fn spec_commit_paths(m: &Model, stores: &mut [Store], sp: SpecPending, paths: &[Vec<usize>]) {
+    for ((((b, &i), rb), ts), path) in sp.sidx.iter().enumerate().zip(sp.rbs).zip(sp.tstates).zip(paths) {
+        if let Some(ts) = ts {
+            let acc_ids: Vec<i64> = path.iter().map(|&u| ts.tree.ids[u]).collect();
+            m.commit_tree(&mut stores[i].seq, rb, ts, path);
+            stores[i].history.truncate(sp.hlen[b]);
+            stores[i].history.extend_from_slice(&acc_ids);
+            let g_rows: Vec<i64> = path.iter().map(|&u| sp.offs[b] + u as i64).collect();
+            let hid_sel = sp.hid.index_select(0, &super::kern::upload_i64(&g_rows, m.dev));
+            m.mtp_seed(&mut stores[i].seq, &hid_sel, sp.p0[b]);
+        } else {
+            let k = path.len() as i64;
+            m.spec_rollback(&mut stores[i].seq, rb, k);
+            stores[i].history.truncate(sp.hlen[b] + k as usize);
+            m.mtp_seed(&mut stores[i].seq, &sp.hid.narrow(0, sp.offs[b], k), sp.p0[b]);
+        }
     }
 }
 /// DS41_STEP_STATS=1: every 100 decode steps, the mean time of a scheduler iteration before the decode step
@@ -202,13 +276,61 @@ fn spec_calib(temp: f32) -> (f64, f64) {
     });
     c[(temp > 0.0) as usize]
 }
+/// Rows of one decode / verify call the DS41_BATCH_INVARIANT paths cover: kern::inv_rows() (DS41_INV_ROWS, 32 or 64;
+/// the one limit of the scoped kernel paths, kern::WideScope / wide_rows); a larger call silently takes the
+/// row-count-dependent paths.
+fn inv_rows() -> usize { super::kern::inv_rows() as usize }
+/// The cap on a speculative round's verify rows in all (choose_drafts; the warm-up's row graphs): DS41_SPEC_MAX_ROWS
+/// (default: none), with DS41_BATCH_INVARIANT=1 default inv_rows() and an explicit value above it clamped to it. Rank 0's
+/// value, set once at startup on every rank (spec_rows_agree), so the ranks' local draft choices cannot differ.
+static SPEC_ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn spec_max_rows() -> usize { *SPEC_ROWS.get().expect("spec_rows_agree not run") }
+/// Every rank at startup (one small allreduce): this rank's cap from its environment, then rank 0's adopted. The
+/// kernel limit inv_rows() must be the same on every rank (else the ranks' shards of a call take different paths):
+/// a rank whose DS41_INV_ROWS differs from rank 0's stops here.
+/// Returns (cap, the explicit DS41_SPEC_MAX_ROWS when it was clamped).
+fn spec_rows_agree(rank: usize, dev: Device) -> (usize, Option<usize>) {
+    let req: Option<usize> = std::env::var("DS41_SPEC_MAX_ROWS").ok().and_then(|v| v.parse().ok());
+    let lim = inv_rows();
+    let (own, clamped) = match (super::kern::batch_inv_on(), req) {
+        (false, r) => (r.unwrap_or(usize::MAX), None),
+        (true, None) => (lim, None),
+        (true, Some(r)) => (r.min(lim), (r > lim).then_some(r)),
+    };
+    const NONE: usize = 1 << 20;   // "no cap" on the wire (f32-exact)
+    let t = Tensor::from_slice(&(if rank == 0 { [own.min(NONE) as f32, lim as f32] } else { [0.0, 0.0] })).to_device(dev);
+    crate::tp::allreduce(&t);
+    let r0 = t.double_value(&[0]) as usize;
+    let lim0 = t.double_value(&[1]) as usize;
+    assert_eq!(lim, lim0, "rank{rank}: batch-invariant row limit {lim} (DS41_INV_ROWS) differs from rank 0's {lim0}");
+    let cap = if r0 >= NONE { usize::MAX } else { r0 };
+    if cap != own { eprintln!("[ds41-serve] rank{rank}: verify row cap {own} from this rank's environment differs from rank 0's; rank 0's used"); }
+    SPEC_ROWS.set(cap).expect("spec_rows_agree twice");
+    (cap, clamped)
+}
+/// Decode / verify calls of more than inv_rows() rows with DS41_BATCH_INVARIANT=1 (rank 0; `stats` inv_over_calls, with
+/// the limit as inv_rows).
+static INV_OVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn inv_rows_check(rows: usize) {
+    if rows > inv_rows() && super::kern::batch_inv_on() && INV_OVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        eprintln!("[ds41-serve] batch invariance: a decode call of {rows} rows exceeds {}, row-count-dependent paths used", inv_rows());
+    }
+}
 fn choose_drafts(confs: &[Vec<f32>], maxd: &[usize], temps: &[f32]) -> Vec<usize> {
+    let b = confs.len();
+    let max_rows = spec_max_rows();
     static FIXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *FIXED.get_or_init(|| std::env::var("DS41_SPEC_MIN_P").is_ok()) {   // the fixed-threshold rule (comparison)
-        return confs.iter().zip(maxd).map(|(c, &m)| super::spec::spec_len(c, m)).collect();
+        let mut d: Vec<usize> = confs.iter().zip(maxd).map(|(c, &m)| super::spec::spec_len(c, m)).collect();
+        // within the row cap: drafts off the sequence with the most (the first of equals)
+        while b + d.iter().sum::<usize>() > max_rows {
+            let s = (0..b).rev().max_by_key(|&s| d[s]).unwrap();
+            if d[s] == 0 { break; }
+            d[s] -= 1;
+        }
+        return d;
     }
     let (base, seq, row) = spec_cost();
-    let b = confs.len();
     // P[s][i]: probability that the first i + 1 drafts of sequence s are all accepted
     let p: Vec<Vec<f64>> = confs.iter().zip(maxd).zip(temps).map(|((c, &m), &t)| {
         let (a, bb) = spec_calib(t);
@@ -217,11 +339,9 @@ fn choose_drafts(confs: &[Vec<f32>], maxd: &[usize], temps: &[f32]) -> Vec<usize
     }).collect();
     // every sequence its own count: rows are added (the most likely next draft first) while a row's expected gain beats
     // the round's current rate (the verify graphs depend on the total row count only)
-    // DS41_SPEC_MAX_ROWS (default: no cap): at most this many rows in all. Above 16 rows a round takes the paths tuned
-    // for prefill (~+40 ms at c4), but a cap of 16 measured worse (10-28, c4 structured 202 -> 181 tok/s: the dropped
-    // drafts were worth more than the time), so it stays off.
-    static MR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let max_rows = *MR.get_or_init(|| std::env::var("DS41_SPEC_MAX_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX));
+    // max_rows (spec_max_rows: DS41_SPEC_MAX_ROWS, default none; 32 with DS41_BATCH_INVARIANT=1): at most this many
+    // rows in all (b alone when b >= max_rows). Without the switch it stays off: a cap of 16 measured worse (10-28, c4
+    // structured 202 -> 181 tok/s: the dropped drafts were worth more than the time).
     let mut d = vec![0usize; b];
     let (mut gain, mut cost) = (b as f64, base + (seq + row) * b as f64);
     loop {
@@ -474,6 +594,12 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
     eprintln!("[ds41-serve] rank{} loaded in {:.0}s; {n_stores} stores; CUDA allocated {:.1} GiB, reserved {:.1} GiB",
               tp.rank, t0.elapsed().as_secs_f64(), al as f64 / (1u64 << 30) as f64, rs as f64 / (1u64 << 30) as f64);
     let spec = spec_on() && m.mtp.is_some();
+    super::spec::agree_flags(tp.rank, dev);
+    let (max_rows, clamped) = spec_rows_agree(tp.rank, dev);
+    if tp.rank == 0 && super::kern::batch_inv_on() {
+        if let Some(r) = clamped { eprintln!("[ds41-serve] warning: DS41_SPEC_MAX_ROWS={r} clamped to {} (DS41_BATCH_INVARIANT=1 covers calls of up to {} rows)", inv_rows(), inv_rows()); }
+        eprintln!("[ds41-serve] batch invariance on: decode / verify calls of up to {} rows are bit-identical to single-stream; draft rows capped at {max_rows} per call", inv_rows());
+    }
     // memory budget (ds41/mem.rs): cap, warm up within it, then occupy the rest of the budget; every rank runs the
     // same steps. First the row graphs serving uses (DS41_WARM_GRAPHS, default on; captured now instead of in the first
     // requests): one store with 1..8 rows (prompt tails, verify), B stores with the same 1..drafts+1 rows each (batched
@@ -505,8 +631,8 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
             if b == 1 {
                 for k in 2..=8 { v.push(Warm::Rows(vec![k])); }
             } else if spec_b {
-                // totals b + 1 ..= b (nd + 1): the extra rows spread over the stores
-                for extra in 1..=b * nd { v.push(Warm::Rows((0..b).map(|i| 1 + extra / b + usize::from(i < extra % b)).collect())); }
+                // totals b + 1 ..= b (nd + 1), at most max_rows (choose_drafts): the extra rows spread over the stores
+                for extra in 1..=(b * nd).min(max_rows.saturating_sub(b)) { v.push(Warm::Rows((0..b).map(|i| 1 + extra / b + usize::from(i < extra % b)).collect())); }
             }
             v
         };
@@ -618,44 +744,61 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
                     let toks: Vec<i64> = v["toks"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect();
                     let temps: Vec<f32> = v["temps"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
                     let seeds: Vec<u64> = v["seeds"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect();
-                    let (drafts, confs) = spec_draft(&m, &mut stores, &sidx, &toks, &temps, &seeds);
+                    let (mut drafts, mut confs, mut branches) = spec_draft_branches(&m, &mut stores, &sidx, &toks, &temps, &seeds);
                     if let Some(rooms) = v["rooms"].as_array() {
                         // DS41_CTRL_LOCAL: the rest of the round here, as rank 0 does it
                         let rooms: Vec<usize> = rooms.iter().map(|x| x.as_u64().unwrap() as usize).collect();
                         let stops: Vec<Vec<i64>> = v["stops"].as_array().unwrap().iter().map(|r| r.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect()).collect();
-                        let maxd: Vec<usize> = (0..sidx.len()).map(|b| drafts[b].len().min(rooms[b])).collect();
-                        let rows = verify_rows(&toks, &drafts, &choose_drafts(&confs, &maxd, &temps));
+                        let trees = plan_verify_trees(&stores, &sidx, &toks, &mut drafts, &mut confs, &mut branches, &rooms, &temps);
                         if ctrl_check_on() {
                             let w = ctrl.recv();
                             let theirs: Vec<Vec<i64>> = w["rows"].as_array().unwrap().iter().map(|r| r.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect()).collect();
-                            assert_eq!(rows, theirs, "DS41_CTRL_CHECK: rank {} chose other verify rows", tp.rank);
+                            let mine: Vec<Vec<i64>> = trees.iter().map(|t| t.ids.clone()).collect();
+                            assert_eq!(mine, theirs, "DS41_CTRL_CHECK: rank {} chose other verify rows", tp.rank);
                         }
-                        let (lg, sp) = spec_verify(&m, &mut stores, &sidx, &rows);
+                        let (lg, sp) = spec_verify_trees(&m, &mut stores, &sidx, &trees);
                         if verify_need_full() { let _ = m.logits_full(&lg); }
-                        let nr: Vec<usize> = rows.iter().map(|r| r.len()).collect();
+                        let nr: Vec<usize> = trees.iter().map(|t| t.len()).collect();
                         let ys = verify_tokens(&m, &lg, &sp, &nr, &temps, &seeds);
-                        let keep: Vec<i64> = (0..sidx.len()).map(|b| accept_len(&rows[b], &ys[sp.offs[b] as usize..], &stops[b]) as i64 + 1).collect();
+                        let paths: Vec<Vec<usize>> = (0..sidx.len()).map(|b| {
+                            super::tree::accept_tree_path(&trees[b], &ys[sp.offs[b] as usize..], &stops[b]).0
+                        }).collect();
                         if ctrl_check_on() {
                             let w = ctrl.recv();
                             let theirs: Vec<i64> = w["keep"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect();
-                            assert_eq!(keep, theirs, "DS41_CTRL_CHECK: rank {} accepted other counts", tp.rank);
+                            let mine: Vec<i64> = paths.iter().map(|p| p.len() as i64).collect();
+                            assert_eq!(mine, theirs, "DS41_CTRL_CHECK: rank {} accepted other counts", tp.rank);
                         }
-                        spec_commit(&m, &mut stores, sp, &keep);
+                        spec_commit_paths(&m, &mut stores, sp, &paths);
                     }
                     round_ts = (temps, seeds);
                 }
                 Some("sverify") => {
                     let sidx: Vec<usize> = v["stores"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as usize).collect();
                     let rows: Vec<Vec<i64>> = v["rows"].as_array().unwrap().iter().map(|r| r.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect()).collect();
-                    let (lg, sp) = spec_verify(&m, &mut stores, &sidx, &rows);
+                    let trees: Vec<super::tree::VerifyTree> = if let (Some(ps), Some(ds)) = (v["parents"].as_array(), v["depths"].as_array()) {
+                        rows.into_iter().zip(ps).zip(ds).map(|((ids, p), d)| super::tree::VerifyTree {
+                            ids,
+                            parents: p.as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect(),
+                            depths: d.as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect(),
+                        }).collect()
+                    } else {
+                        rows.into_iter().map(super::tree::VerifyTree::chain).collect()
+                    };
+                    let (lg, sp) = spec_verify_trees(&m, &mut stores, &sidx, &trees);
                     // the same collectives as rank 0 after its verify
                     if verify_need_full() { let _ = m.logits_full(&lg); }
-                    if verify_split_on() { let _ = verify_tokens(&m, &lg, &sp, &rows.iter().map(|r| r.len()).collect::<Vec<_>>(), &round_ts.0, &round_ts.1); }
+                    if verify_split_on() { let _ = verify_tokens(&m, &lg, &sp, &trees.iter().map(|t| t.len()).collect::<Vec<_>>(), &round_ts.0, &round_ts.1); }
                     pending = Some(sp);
                 }
                 Some("scommit") => {
-                    let keep: Vec<i64> = v["keep"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect();
-                    spec_commit(&m, &mut stores, pending.take().expect("scommit without sverify"), &keep);
+                    if let Some(ps) = v["paths"].as_array() {
+                        let paths: Vec<Vec<usize>> = ps.iter().map(|p| p.as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as usize).collect()).collect();
+                        spec_commit_paths(&m, &mut stores, pending.take().expect("scommit without sverify"), &paths);
+                    } else {
+                        let keep: Vec<i64> = v["keep"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect();
+                        spec_commit(&m, &mut stores, pending.take().expect("scommit without sverify"), &keep);
+                    }
                 }
                 Some("restore") => {
                     let ids: Vec<i64> = v["ids"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect();
@@ -771,7 +914,8 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
                 let alloc: i64 = stores.iter().map(|s| s.lease.as_ref().map_or(0, |l| l.len)).sum();
                 write_line(&mut conn, &json!({"id": v["id"], "stats": {"running": active.len(), "waiting": queue.len(), "decoding": decoding,
                     "max_seqs": n_stores, "stores": n_stores, "max_stores": n_stores, "kv_allocated_tokens": alloc,
-                    "kv_active_tokens": held, "kv_budget_tokens": rows, "batch": false, "pcache": pc.as_ref().map_or(Value::Null, |p| p.stats())}}));
+                    "kv_active_tokens": held, "kv_budget_tokens": rows, "batch": false, "pcache": pc.as_ref().map_or(Value::Null, |p| p.stats()),
+                    "inv_over_calls": INV_OVER.load(std::sync::atomic::Ordering::Relaxed), "inv_rows": inv_rows()}}));
                 continue;
             }
             let ids: Vec<i64> = v["prompt_ids"].as_array().map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default();
@@ -946,65 +1090,73 @@ pub fn serve(ckpt: &Path, socket: &Path, hash: &Path) {
             } else {
                 ctrl.send(&json!({"op": "sdraft", "stores": sidx, "toks": toks, "temps": temps, "seeds": seeds}));
             }
-            let (drafts, confs) = spec_draft(&m, &mut stores, &sidx, &toks, &temps, &seeds);
-            // draft counts: each sequence its own, by the cost model (choose_drafts)
-            let maxd: Vec<usize> = (0..dec.len()).map(|b| drafts[b].len().min(rooms[b])).collect();
-            let rows = verify_rows(&toks, &drafts, &choose_drafts(&confs, &maxd, &temps));
-            if !local || ctrl_check_on() { ctrl.send(&json!({"op": "sverify", "stores": sidx, "rows": rows})); }
-            let (lg_loc, sp) = spec_verify(&m, &mut stores, &sidx, &rows);
+            let (mut drafts, mut confs, mut branches) = spec_draft_branches(&m, &mut stores, &sidx, &toks, &temps, &seeds);
+            let trees = plan_verify_trees(&stores, &sidx, &toks, &mut drafts, &mut confs, &mut branches, &rooms, &temps);
+            if !local || ctrl_check_on() {
+                let rows: Vec<&Vec<i64>> = trees.iter().map(|t| &t.ids).collect();
+                let parents: Vec<&Vec<i32>> = trees.iter().map(|t| &t.parents).collect();
+                let depths: Vec<&Vec<i32>> = trees.iter().map(|t| &t.depths).collect();
+                ctrl.send(&json!({"op": "sverify", "stores": sidx, "rows": rows, "parents": parents, "depths": depths}));
+            }
+            let (lg_loc, sp) = spec_verify_trees(&m, &mut stores, &sidx, &trees);
             // (lg: the full logits when needed, else the slice, which only verify_tokens reads)
             let lg = if verify_need_full() { m.logits_full(&lg_loc) } else { lg_loc.shallow_clone() };
-            let yv = verify_split_on().then(|| verify_tokens(&m, &lg_loc, &sp, &rows.iter().map(|r| r.len()).collect::<Vec<_>>(), &temps, &seeds));
+            let nr: Vec<usize> = trees.iter().map(|t| t.len()).collect();
+            let yv = verify_split_on().then(|| verify_tokens(&m, &lg_loc, &sp, &nr, &temps, &seeds));
             let round_ms = t_round.elapsed().as_secs_f64() * 1e3;
-            let nrows: usize = rows.iter().map(|r| r.len()).sum();
+            let nrows: usize = nr.iter().sum();
+            inv_rows_check(nrows);
             let mut keep = Vec::new();
+            let mut paths = Vec::new();
             let dq = m.draft_q.borrow_mut().take();
             for (b, &(_, i)) in dec.iter().enumerate() {
                 let a = &mut active[i];
-                let (off, d) = (sp.offs[b], rows[b].len() - 1);
+                let tree = &trees[b];
+                let (off, d) = (sp.offs[b], tree.len() - 1);
                 // sampled sequences under DS41_SPEC_RS: the rejection-sampling verdict of every row (spec::rs_tokens)
                 let ys = match &dq {
-                    Some(q) if a.temp > 0.0 && super::spec::rs_on() => Some(m.rs_tokens(&lg.narrow(0, off, d as i64 + 1), &q.select(1, b as i64), &rows[b][1..], a.temp, a.seed, sp.p0[b])),
+                    Some(q) if a.temp > 0.0 && super::spec::rs_on() => Some(m.rs_tokens(&lg.narrow(0, off, d as i64 + 1), &q.select(1, b as i64), &tree.ids[1..], a.temp, a.seed, sp.p0[b])),
                     _ => None,
                 };
-                let mut k = 0;
-                let mut emit = Vec::new();
-                if let (None, Some(v)) = (&ys, &yv) {
+                let (path, emit) = if let (None, Some(v)) = (&ys, &yv) {
                     // (the rule the other ranks apply under DS41_CTRL_LOCAL)
                     let stops: Vec<i64> = eos.iter().chain(&a.stop_ids).copied().collect();
-                    k = accept_len(&rows[b], &v[off as usize..], &stops);
-                    emit.extend(&v[off as usize..off as usize + k + 1]);
+                    super::tree::accept_tree_path(tree, &v[off as usize..], &stops)
                 } else {
-                    loop {
-                        let y = match &ys { Some(v) => v[k], None => sample(&lg.narrow(0, off + k as i64, 1), a.temp, a.seed, sp.p0[b] + k as i64 + 1) };
-                        emit.push(y);
-                        if k < d && rows[b][k + 1] == y && !eos.contains(&y) && !a.stop_ids.contains(&y) { k += 1; } else { break; }
-                    }
-                }
+                    let stops: Vec<i64> = eos.iter().chain(&a.stop_ids).copied().collect();
+                    let row_ys: Vec<i64> = (0..tree.len()).map(|u| match &ys {
+                        Some(v) if u < v.len() => v[u],
+                        _ => sample(&lg.narrow(0, off + u as i64, 1), a.temp, a.seed, sp.p0[b] + tree.depths[u] as i64 + 1),
+                    }).collect();
+                    super::tree::accept_tree_path(tree, &row_ys, &stops)
+                };
+                let k = path.len() - 1;
                 a.rounds += 1;
                 a.drafted += d;
                 a.accepted += k;
                 spec_log(a.temp, &confs[b], d, k, dec.len(), nrows, round_ms);
                 if let (Some(q), Some(v)) = (&dq, &yv) {
                     if super::spec::ranks_on() {
-                        super::spec::spec_ranks(&lg.narrow(0, off, d as i64 + 1), &q.select(1, b as i64), &rows[b][1..], &v[off as usize..off as usize + d], a.temp,
+                        super::spec::spec_ranks(&lg.narrow(0, off, d as i64 + 1), &q.select(1, b as i64), &tree.ids[1..], &v[off as usize..off as usize + d], a.temp,
                                                 super::spec::rs_draft_seed(a.seed, a.temp, sp.p0[b]), sp.p0[b], k);
                     }
                 }
                 if let Some(q) = &dq {
-                    super::spec::spec_stats(&lg.narrow(0, off, d as i64 + 1), &q.select(1, b as i64), &rows[b][1..], a.temp,
+                    super::spec::spec_stats(&lg.narrow(0, off, d as i64 + 1), &q.select(1, b as i64), &tree.ids[1..], a.temp,
                                             super::spec::rs_draft_seed(a.seed, a.temp, sp.p0[b]), sp.p0[b], k);
                 }
                 a.out.extend(emit);
                 keep.push(k as i64 + 1);
+                paths.push(path);
             }
-            if !local || ctrl_check_on() { ctrl.send(&json!({"op": "scommit", "keep": keep})); }
-            spec_commit(&m, &mut stores, sp, &keep);
+            if !local || ctrl_check_on() { ctrl.send(&json!({"op": "scommit", "keep": keep, "paths": paths})); }
+            spec_commit_paths(&m, &mut stores, sp, &paths);
         } else if !dec.is_empty() {
             dec.sort();
             let sidx: Vec<usize> = dec.iter().map(|d| d.0).collect();
             let ids: Vec<i64> = dec.iter().map(|d| *active[d.1].out.last().unwrap()).collect();
             ctrl.send(&json!({"op": "dec", "stores": sidx, "ids": ids}));
+            inv_rows_check(sidx.len());
             let lg = step_batch(&m, &mut stores, &sidx, &ids);
             for (k, &(st, i)) in dec.iter().enumerate() {
                 let pos = stores[st].seq.pos;

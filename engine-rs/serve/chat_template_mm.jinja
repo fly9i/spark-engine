@@ -57,9 +57,9 @@ For each function call, output the function name and arguments within the follow
             {%- elif item is string -%}
                 {{- item }}
             {%- elif item is mapping and item.type in ['image', 'image_url', 'input_image'] -%}
-                {{- '<|begin_of_image|><|image|><|end_of_image|>' -}}
+                {{- (item._mm_tag | default('')) ~ '<|begin_of_image|><|image|><|end_of_image|>' -}}
             {%- elif item is mapping and item.type in ['video', 'video_url', 'input_video'] -%}
-                {{- '<|begin_of_video|><|video|><|end_of_video|>' -}}
+                {{- (item._mm_tag | default('')) ~ '<|begin_of_video|><|video|><|end_of_video|>' -}}
             {%- elif item is mapping and item.type in ['audio', 'audio_url', 'input_audio'] -%}
                 {%- set media_type = item.type | replace('_url', '') | replace('input_', '') -%}
                 {{- "<reminder>You are unable to process this " ~ media_type ~ " because you don't have multi-modal input ability. Try different methods.</reminder>" }}

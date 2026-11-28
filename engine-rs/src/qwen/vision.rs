@@ -226,8 +226,10 @@ pub fn parse_items(v: &serde_json::Value) -> Result<Vec<MmItem>, String> {
             return Err(format!("mm item has a bad canvas {frames}x{height}x{width}"));
         }
         let meta = std::fs::metadata(&path).map_err(|e| format!("mm canvas {}: {e}", path.display()))?;
-        if meta.len() as i64 != frames * height * width * 3 {
-            return Err(format!("mm canvas {} has {} bytes, expected {}", path.display(), meta.len(), frames * height * width * 3));
+        let want = frames.checked_mul(height).and_then(|v| v.checked_mul(width)).and_then(|v| v.checked_mul(3))
+            .ok_or_else(|| format!("mm canvas {frames}x{height}x{width} overflows byte size"))?;
+        if meta.len() != want as u64 {
+            return Err(format!("mm canvas {} has {} bytes, expected {want}", path.display(), meta.len()));
         }
         let tokens_per = (height / 32) * (width / 32);
         let mut segments = Vec::new();
@@ -305,7 +307,7 @@ impl MmState {
             if !need.is_empty() {
                 // video groups share one grid: up to ~16K patches per forward (bounded activations)
                 let per = (it.height / 16) * (it.width / 16);
-                let batch = ((16384 / per).max(1)) as usize;
+                let batch = if it.video { ((16384 / per).max(1)) as usize } else { 1 };
                 for group in need.chunks(batch) {
                     let canvas = read_frames(it, &group.iter().map(|&si| it.segments[si].2).collect::<Vec<_>>(), vision.dev);
                     let (px, g, gh, gw) = vision.pixels(&canvas);

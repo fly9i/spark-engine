@@ -49,6 +49,24 @@ clock sampled every second, no throttling recorded); GLM's column is older (DGX 
 "Prose" = a long explanation (lower draft acceptance); "structured" = counting 1–200 (high acceptance). Decode speed depends on the text
 because of speculation.
 
+### DeepSeek-V4.1-Flash on v0.3.15 (2026-11-28)
+
+Release measurement of v0.3.15 on three DGX Sparks (TP3, default GPU clocks, `DS41_BATCH_INVARIANT=1`, greedy, thinking
+off) compared against the v0.3.13 / v0.3.14 baseline (`bench/ds41_decode_bench.py --types prose,structured,code --conc 1,2,4`,
+256 tokens per stream, median of 3 vs. v0.3.14 median of 6):
+
+| Decode, aggregate tok/s (v0.3.14 → **v0.3.15**) | Prose | Structured | Code |
+| --- | --- | --- | --- |
+| 1 stream | 69.3 → **69.7** (+0.6%) | 127.1 → **127.6** (+0.4%) | 112.5 → **112.1** (−0.4%) |
+| 2 streams | 95.9 → **95.8** (−0.1%) | 188.1 → **188.2** (+0.1%) | 147.2 → **149.7** (+1.7%) |
+| 4 streams | 128.3 → **128.3** (0.0%) | 242.9 → **247.8** (+2.0%) | 184.1 → **184.1** (0.0%) |
+
+On single-stream context-reuse workloads (greedy, same cluster, v0.3.14 → **v0.3.15**): Python code refactoring
+93.9 → **110.1 tok/s** (+17.3%), repeated structured JSON 105.6 → **122.5 tok/s** (+16.0%), verbatim code/doc RAG copy
+100.6 → **127.3 tok/s** (+26.5%). All five optimizations (fused Markov sampling, single-graph MTP body, 32-row
+single-read `wo_a`, prompt-lookup draft extension, and DSpark confidence tree verification) are L0 bit-exact and on by
+default. Details: [docs/release-notes.md](docs/release-notes.md), [docs/ds41.md](docs/ds41.md#5-settings).
+
 ### DeepSeek-V4.1-Flash on v0.3.13 (2026-11-11)
 
 Release measurement of v0.3.13 on 2026-11-11: three DGX Sparks (TP3, the [test system](#test-system-and-gpu-clock) below,

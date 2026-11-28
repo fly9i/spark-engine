@@ -171,7 +171,7 @@ __global__ void __launch_bounds__(256) skinny_half(const float* __restrict__ X,c
   }
 }
 inline int skinny_half_launch(const float* X,const void* W,void* Y,int M,int N,int K,int out,int ks,cudaStream_t s){
-  if(M<1||M>8||N%16||K%32)return int(cudaErrorInvalidValue);
+  if(M<1||M>8||N<=0||K<=0||(ks!=2&&ks!=4&&ks!=8)||N%16||K%32)return int(cudaErrorInvalidValue);
   auto grid=[&](int KS){int rt=8/KS;return (N+16*rt-1)/(16*rt);};
 #define L(KS,O) skinny_half<KS,4,O><<<grid(KS),256,0,s>>>(X,(const __half*)W,Y,M,N,K)
 #define LO(KS) do{if(out==0)L(KS,0);else if(out==1)L(KS,1);else L(KS,2);}while(0)

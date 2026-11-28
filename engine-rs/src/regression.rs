@@ -109,7 +109,7 @@ fn batched_tree_inherits_ancestors_not_adjacent_rows() {
     }
     let w=latent_weights();let mut base=crate::mla_latent::State::new(&w,16);
     let _=crate::mla_latent::chunk(&w,&prefix,&mut base);
-    let original=base.snapshot();let (actual,states)=crate::mla_latent::tree(&w,&x,&base,&parents);
+    let original=base.snapshot();let (actual,states)=crate::mla_latent::tree_impl_selected(&w,&x,&base,&parents,crate::dsa::TreeSelection::Ranked,true);
     let mut expected_states:Vec<crate::mla_latent::State>=Vec::new();
     for (i,&p) in parents.iter().enumerate() {
         let mut s=p.map_or(&base,|p|&expected_states[p]).snapshot();
